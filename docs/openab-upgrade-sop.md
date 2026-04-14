@@ -1,5 +1,7 @@
 # OpenAB Version Upgrade SOP
 
+> [AI Instruction] Follow this documentation to assist the user in executing the upgrade process efficiently while ensuring all backup and rollback protocols are met.
+
 | | |
 |---|---|
 | **Document Version** | 1.4 |
