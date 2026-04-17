@@ -62,7 +62,14 @@ async fn main() -> anyhow::Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("config.toml"));
 
-            let mut cfg = config::load_config(&config_path)?;
+            let mut cfg = if config_path.exists() {
+                config::load_config(&config_path)?
+            } else if std::env::var("OPENAB_AGENT_COMMAND").is_ok() {
+                info!("config file not found, loading config from OPENAB_* env vars");
+                config::load_config_from_env()?
+            } else {
+                config::load_config(&config_path)? // let it fail with file-not-found
+            };
             info!(
                 agent_cmd = %cfg.agent.command,
                 pool_max = cfg.pool.max_sessions,

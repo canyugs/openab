@@ -271,3 +271,337 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
     Ok(config)
 }
+
+/// Parse an integer env var, falling back to `default` when unset/empty,
+/// but returning an error for malformed values so typos surface immediately.
+fn parse_int_env<T>(key: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(key) {
+        Ok(s) if !s.trim().is_empty() => s
+            .trim()
+            .parse::<T>()
+            .map_err(|e| anyhow::anyhow!("{key} must be a valid integer: {e}")),
+        _ => Ok(default),
+    }
+}
+
+/// Build a Config entirely from `OPENAB_*` environment variables.
+///
+/// Naming: `OPENAB_<SECTION>_<FIELD>` — single underscore throughout.
+///
+/// Examples:
+///   OPENAB_DISCORD_BOT_TOKEN        → [discord] bot_token
+///   OPENAB_DISCORD_ALLOWED_CHANNELS → [discord] allowed_channels (comma-separated)
+///   OPENAB_SLACK_BOT_TOKEN          → [slack] bot_token
+///   OPENAB_SLACK_APP_TOKEN          → [slack] app_token
+///   OPENAB_AGENT_COMMAND            → [agent] command
+///   OPENAB_AGENT_ARGS               → [agent] args (comma-separated)
+///   OPENAB_AGENT_WORKING_DIR        → [agent] working_dir
+///   OPENAB_AGENT_ENV_<KEY>          → [agent] env.<KEY> (passthrough to child process)
+///   OPENAB_POOL_MAX_SESSIONS        → [pool] max_sessions
+///   OPENAB_POOL_SESSION_TTL_HOURS   → [pool] session_ttl_hours
+///   OPENAB_STT_ENABLED              → [stt] enabled (true/false)
+///   OPENAB_STT_API_KEY              → [stt] api_key (or auto-detect GROQ_API_KEY)
+///   OPENAB_STT_MODEL                → [stt] model
+///   OPENAB_STT_BASE_URL             → [stt] base_url
+///   OPENAB_REACTIONS_ENABLED        → [reactions] enabled (true/false)
+///
+/// Also supported (not listed above for brevity):
+///   OPENAB_DISCORD_ALLOW_BOT_MESSAGES  → off/mentions/all
+///   OPENAB_DISCORD_TRUSTED_BOT_IDS     → CSV
+///   OPENAB_DISCORD_ALLOW_USER_MESSAGES → involved/mentions
+///   OPENAB_SLACK_ALLOWED_CHANNELS      → CSV
+///   OPENAB_SLACK_ALLOWED_USERS         → CSV
+///   OPENAB_SLACK_ALLOW_BOT_MESSAGES    → off/mentions/all
+///   OPENAB_SLACK_TRUSTED_BOT_IDS       → CSV
+///   OPENAB_SLACK_ALLOW_USER_MESSAGES   → involved/mentions
+///
+/// Not available via env (use config.toml for these):
+///   [reactions] remove_after_reply, emojis.*, timing.*
+pub fn load_config_from_env() -> anyhow::Result<Config> {
+    use std::env;
+
+    let env_or = |key: &str, default: &str| -> String {
+        env::var(key).unwrap_or_else(|_| default.to_string())
+    };
+
+    let env_opt = |key: &str| -> Option<String> {
+        env::var(key).ok().filter(|s| !s.is_empty())
+    };
+
+    let csv_to_vec = |key: &str| -> Vec<String> {
+        env::var(key)
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    let parse_allow_bots = |key: &str| -> AllowBots {
+        match env::var(key).unwrap_or_default().to_lowercase().as_str() {
+            "mentions" => AllowBots::Mentions,
+            "all" | "true" => AllowBots::All,
+            _ => AllowBots::Off,
+        }
+    };
+
+    let parse_allow_users = |key: &str| -> AllowUsers {
+        match env::var(key).unwrap_or_default().to_lowercase().as_str() {
+            "mentions" => AllowUsers::Mentions,
+            _ => AllowUsers::Involved,
+        }
+    };
+
+    // [discord] — only if bot_token is set
+    let discord = env_opt("OPENAB_DISCORD_BOT_TOKEN").map(|bot_token| DiscordConfig {
+        bot_token,
+        allowed_channels: csv_to_vec("OPENAB_DISCORD_ALLOWED_CHANNELS"),
+        allowed_users: csv_to_vec("OPENAB_DISCORD_ALLOWED_USERS"),
+        allow_bot_messages: parse_allow_bots("OPENAB_DISCORD_ALLOW_BOT_MESSAGES"),
+        trusted_bot_ids: csv_to_vec("OPENAB_DISCORD_TRUSTED_BOT_IDS"),
+        allow_user_messages: parse_allow_users("OPENAB_DISCORD_ALLOW_USER_MESSAGES"),
+    });
+
+    // [slack] — only if both bot_token and app_token are set
+    let slack = env_opt("OPENAB_SLACK_BOT_TOKEN").and_then(|bot_token| {
+        env_opt("OPENAB_SLACK_APP_TOKEN").map(|app_token| SlackConfig {
+            bot_token,
+            app_token,
+            allowed_channels: csv_to_vec("OPENAB_SLACK_ALLOWED_CHANNELS"),
+            allowed_users: csv_to_vec("OPENAB_SLACK_ALLOWED_USERS"),
+            allow_bot_messages: parse_allow_bots("OPENAB_SLACK_ALLOW_BOT_MESSAGES"),
+            trusted_bot_ids: csv_to_vec("OPENAB_SLACK_TRUSTED_BOT_IDS"),
+            allow_user_messages: parse_allow_users("OPENAB_SLACK_ALLOW_USER_MESSAGES"),
+        })
+    });
+
+    // [agent] — command is required
+    let command = env_or("OPENAB_AGENT_COMMAND", "");
+    if command.is_empty() {
+        anyhow::bail!("OPENAB_AGENT_COMMAND is required when using env-only config");
+    }
+
+    let agent = AgentConfig {
+        command,
+        args: csv_to_vec("OPENAB_AGENT_ARGS"),
+        working_dir: env_or("OPENAB_AGENT_WORKING_DIR", &default_working_dir()),
+        env: env::vars()
+            .filter(|(k, _)| k.starts_with("OPENAB_AGENT_ENV_"))
+            .map(|(k, v)| {
+                let key = k.strip_prefix("OPENAB_AGENT_ENV_").unwrap().to_string();
+                (key, v)
+            })
+            .collect(),
+    };
+
+    // [pool] — fail loudly on invalid integers so typos in env vars surface immediately
+    let pool = PoolConfig {
+        max_sessions: parse_int_env("OPENAB_POOL_MAX_SESSIONS", default_max_sessions())?,
+        session_ttl_hours: parse_int_env("OPENAB_POOL_SESSION_TTL_HOURS", default_ttl_hours())?,
+    };
+
+    // [stt]
+    let stt = SttConfig {
+        enabled: env_or("OPENAB_STT_ENABLED", "false").parse().unwrap_or(false),
+        api_key: env_or("OPENAB_STT_API_KEY", ""),
+        model: env_or("OPENAB_STT_MODEL", &default_stt_model()),
+        base_url: env_or("OPENAB_STT_BASE_URL", &default_stt_base_url()),
+    };
+
+    // [reactions] — only enabled/disabled via env; emojis/timing use config.toml
+    let mut reactions = ReactionsConfig::default();
+    if let Ok(v) = env::var("OPENAB_REACTIONS_ENABLED") {
+        reactions.enabled = v == "true" || v == "1";
+    }
+
+    Ok(Config {
+        discord,
+        slack,
+        agent,
+        pool,
+        reactions,
+        stt,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::sync::Mutex;
+
+    // Env vars are process-global; serialize all env-config tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Helper: set env vars, run closure, then clean up.
+    fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Clean all OPENAB_ vars first to isolate tests
+        for (k, _) in env::vars() {
+            if k.starts_with("OPENAB_") {
+                env::remove_var(&k);
+            }
+        }
+        for (k, v) in vars {
+            env::set_var(k, v);
+        }
+        f();
+        for (k, _) in vars {
+            env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn env_config_minimal_discord() {
+        with_env_vars(
+            &[
+                ("OPENAB_AGENT_COMMAND", "claude-agent-acp"),
+                ("OPENAB_DISCORD_BOT_TOKEN", "test-token"),
+            ],
+            || {
+                let cfg = load_config_from_env().unwrap();
+                assert_eq!(cfg.agent.command, "claude-agent-acp");
+                assert!(cfg.discord.is_some());
+                assert_eq!(cfg.discord.as_ref().unwrap().bot_token, "test-token");
+                assert!(cfg.slack.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn env_config_discord_and_slack() {
+        with_env_vars(
+            &[
+                ("OPENAB_AGENT_COMMAND", "kiro-cli"),
+                ("OPENAB_AGENT_ARGS", "acp,--trust-all-tools"),
+                ("OPENAB_AGENT_WORKING_DIR", "/home/agent"),
+                ("OPENAB_DISCORD_BOT_TOKEN", "discord-tok"),
+                ("OPENAB_DISCORD_ALLOWED_CHANNELS", "111,222"),
+                ("OPENAB_SLACK_BOT_TOKEN", "xoxb-slack"),
+                ("OPENAB_SLACK_APP_TOKEN", "xapp-slack"),
+                ("OPENAB_POOL_MAX_SESSIONS", "5"),
+            ],
+            || {
+                let cfg = load_config_from_env().unwrap();
+                assert_eq!(cfg.agent.command, "kiro-cli");
+                assert_eq!(cfg.agent.args, vec!["acp", "--trust-all-tools"]);
+                assert_eq!(cfg.agent.working_dir, "/home/agent");
+
+                let d = cfg.discord.as_ref().unwrap();
+                assert_eq!(d.bot_token, "discord-tok");
+                assert_eq!(d.allowed_channels, vec!["111", "222"]);
+
+                let s = cfg.slack.as_ref().unwrap();
+                assert_eq!(s.bot_token, "xoxb-slack");
+                assert_eq!(s.app_token, "xapp-slack");
+
+                assert_eq!(cfg.pool.max_sessions, 5);
+            },
+        );
+    }
+
+    #[test]
+    fn env_config_no_adapter_is_valid() {
+        with_env_vars(
+            &[("OPENAB_AGENT_COMMAND", "claude-agent-acp")],
+            || {
+                let cfg = load_config_from_env().unwrap();
+                assert!(cfg.discord.is_none());
+                assert!(cfg.slack.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn env_config_missing_command_fails() {
+        with_env_vars(&[], || {
+            let result = load_config_from_env();
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn env_config_invalid_pool_int_fails_loudly() {
+        with_env_vars(
+            &[
+                ("OPENAB_AGENT_COMMAND", "claude"),
+                ("OPENAB_POOL_MAX_SESSIONS", "not-a-number"),
+            ],
+            || {
+                let err = load_config_from_env().unwrap_err();
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("OPENAB_POOL_MAX_SESSIONS"),
+                    "error should name the offending var, got: {msg}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn env_config_empty_pool_int_uses_default() {
+        with_env_vars(
+            &[
+                ("OPENAB_AGENT_COMMAND", "claude"),
+                ("OPENAB_POOL_MAX_SESSIONS", ""),
+            ],
+            || {
+                let cfg = load_config_from_env().unwrap();
+                assert_eq!(cfg.pool.max_sessions, default_max_sessions());
+            },
+        );
+    }
+
+    #[test]
+    fn env_config_agent_env_passthrough() {
+        with_env_vars(
+            &[
+                ("OPENAB_AGENT_COMMAND", "claude"),
+                ("OPENAB_AGENT_ENV_ANTHROPIC_API_KEY", "sk-test"),
+                ("OPENAB_AGENT_ENV_CUSTOM_VAR", "hello"),
+            ],
+            || {
+                let cfg = load_config_from_env().unwrap();
+                assert_eq!(cfg.agent.env.get("ANTHROPIC_API_KEY").unwrap(), "sk-test");
+                assert_eq!(cfg.agent.env.get("CUSTOM_VAR").unwrap(), "hello");
+            },
+        );
+    }
+
+    #[test]
+    fn env_config_stt() {
+        with_env_vars(
+            &[
+                ("OPENAB_AGENT_COMMAND", "claude"),
+                ("OPENAB_STT_ENABLED", "true"),
+                ("OPENAB_STT_API_KEY", "gsk-test"),
+                ("OPENAB_STT_MODEL", "whisper-1"),
+            ],
+            || {
+                let cfg = load_config_from_env().unwrap();
+                assert!(cfg.stt.enabled);
+                assert_eq!(cfg.stt.api_key, "gsk-test");
+                assert_eq!(cfg.stt.model, "whisper-1");
+                assert_eq!(cfg.stt.base_url, default_stt_base_url());
+            },
+        );
+    }
+
+    #[test]
+    fn env_config_reactions_disabled() {
+        with_env_vars(
+            &[
+                ("OPENAB_AGENT_COMMAND", "claude"),
+                ("OPENAB_REACTIONS_ENABLED", "false"),
+            ],
+            || {
+                let cfg = load_config_from_env().unwrap();
+                assert!(!cfg.reactions.enabled);
+            },
+        );
+    }
+}
