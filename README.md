@@ -165,6 +165,43 @@ error_hold_ms = 2500
 
 </details>
 
+## Environment Variable Configuration
+
+For PaaS deployments (Zeabur, Railway, Fly.io, etc.) where mounting a `config.toml` is awkward, OpenAB can run with **zero config file** — just set `OPENAB_*` env vars. The file-based path is unchanged; env-only mode activates only when no config file is found and `OPENAB_AGENT_COMMAND` is set.
+
+**Required:** `OPENAB_AGENT_COMMAND`
+
+| Variable | Maps to | Notes |
+|----------|---------|-------|
+| `OPENAB_AGENT_COMMAND` | `[agent] command` | **Required.** e.g. `kiro-cli`, `claude-agent-acp` |
+| `OPENAB_AGENT_ARGS` | `[agent] args` | Comma-separated, e.g. `acp,--trust-all-tools`. Values cannot contain literal commas. |
+| `OPENAB_AGENT_WORKING_DIR` | `[agent] working_dir` | Defaults to `/tmp` |
+| `OPENAB_AGENT_ENV_<KEY>` | `[agent] env.<KEY>` | Passed through to the child CLI, e.g. `OPENAB_AGENT_ENV_ANTHROPIC_API_KEY` |
+| `OPENAB_DISCORD_BOT_TOKEN` | `[discord] bot_token` | Presence activates the Discord adapter |
+| `OPENAB_DISCORD_ALLOWED_CHANNELS` | `[discord] allowed_channels` | Comma-separated channel IDs |
+| `OPENAB_DISCORD_ALLOWED_USERS` | `[discord] allowed_users` | Comma-separated user IDs |
+| `OPENAB_DISCORD_ALLOW_BOT_MESSAGES` | `[discord] allow_bot_messages` | `off` \| `mentions` \| `all` |
+| `OPENAB_DISCORD_TRUSTED_BOT_IDS` | `[discord] trusted_bot_ids` | Comma-separated |
+| `OPENAB_DISCORD_ALLOW_USER_MESSAGES` | `[discord] allow_user_messages` | `involved` (default) \| `mentions` |
+| `OPENAB_SLACK_BOT_TOKEN` | `[slack] bot_token` | Slack adapter activates only when both Slack tokens are set |
+| `OPENAB_SLACK_APP_TOKEN` | `[slack] app_token` | App-Level Token (`xapp-...`) for Socket Mode |
+| `OPENAB_SLACK_ALLOWED_CHANNELS` / `ALLOWED_USERS` / `ALLOW_BOT_MESSAGES` / `TRUSTED_BOT_IDS` / `ALLOW_USER_MESSAGES` | `[slack] ...` | Same shape as Discord |
+| `OPENAB_POOL_MAX_SESSIONS` | `[pool] max_sessions` | Integer. Defaults to `10`. Invalid values fail at startup. |
+| `OPENAB_POOL_SESSION_TTL_HOURS` | `[pool] session_ttl_hours` | Integer. Defaults to `4`. Invalid values fail at startup. |
+
+Reactions and STT cannot be configured via env vars yet — if you need those, use a `config.toml`.
+
+**Precedence:** when a config file exists, file-based config is used (env-var mode does not merge on top). Env-var mode is a fallback for file-less deployments, not an override layer.
+
+**Example (Zeabur / Railway):**
+
+```bash
+OPENAB_AGENT_COMMAND=kiro-cli
+OPENAB_AGENT_ARGS=acp,--trust-all-tools
+OPENAB_DISCORD_BOT_TOKEN=...
+OPENAB_DISCORD_ALLOWED_CHANNELS=111222333,444555666
+```
+
 ## Kubernetes Deployment
 
 The Docker image bundles both `openab` and `kiro-cli` in a single container.
