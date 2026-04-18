@@ -51,6 +51,12 @@ jobs:
                 continue;
               }
 
+              // Skip if closing-soon — contributor has incomplete work
+              if (labels.includes('closing-soon')) {
+                console.log(`#${prNumber} — closing-soon, skipping`);
+                continue;
+              }
+
               // Skip if has merge conflicts — ball is on contributor
               if (pr.mergeable === false) {
                 console.log(`#${prNumber} — has conflicts, skipping`);
