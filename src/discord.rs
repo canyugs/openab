@@ -342,43 +342,32 @@ impl EventHandler for Handler {
             }
         }
 
-        // Thread detection: check if the message is in a thread whose parent
-        // is an allowed channel, and whether the bot owns that thread.
-        // When in_allowed_channel is true, we still need to detect threads
-        // so that MultibotMentions/Involved modes work correctly (#504).
-        let (in_thread, bot_owns_thread) = if !in_allowed_channel {
-            match msg.channel_id.to_channel(&ctx.http).await {
-                Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                    let parent_allowed = self.allow_all_channels || gc
-                        .parent_id
-                        .is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
-                    let owned = gc.owner_id.is_some_and(|oid| oid == bot_id);
-                    tracing::debug!(
-                        channel_id = %msg.channel_id,
-                        parent_id = ?gc.parent_id,
-                        owner_id = ?gc.owner_id,
-                        parent_allowed,
-                        bot_owns = owned,
-                        "thread check"
-                    );
-                    (parent_allowed, owned)
-                }
-                Ok(other) => {
-                    tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild channel");
-                    (false, false)
-                }
-                Err(e) => {
-                    tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                    (false, false)
-                }
+        // Thread detection: single to_channel() call for both allowed and
+        // non-allowed channels. A message is "in a thread" when the channel
+        // has a parent_id AND the parent is in the allowlist (or allow_all).
+        let (in_thread, bot_owns_thread) = match msg.channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(gc)) if gc.parent_id.is_some() => {
+                let parent_allowed = in_allowed_channel
+                    || self.allow_all_channels
+                    || gc.parent_id.is_some_and(|pid| self.allowed_channels.contains(&pid.get()));
+                let owned = gc.owner_id.is_some_and(|oid| oid == bot_id);
+                tracing::debug!(
+                    channel_id = %msg.channel_id,
+                    parent_id = ?gc.parent_id,
+                    owner_id = ?gc.owner_id,
+                    parent_allowed,
+                    bot_owns = owned,
+                    "thread check"
+                );
+                (parent_allowed, owned)
             }
-        } else {
-            match msg.channel_id.to_channel(&ctx.http).await {
-                Ok(serenity::model::channel::Channel::Guild(gc)) if gc.parent_id.is_some() => {
-                    let owned = gc.owner_id.is_some_and(|oid| oid == bot_id);
-                    (true, owned)
-                }
-                _ => (false, false),
+            Ok(other) => {
+                tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
+                (false, false)
+            }
+            Err(e) => {
+                tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
+                (false, false)
             }
         };
 
