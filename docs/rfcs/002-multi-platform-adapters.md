@@ -1,8 +1,9 @@
 # RFC 002: Multi-Platform Adapter Architecture
 
 **Tracking issues:** #86, #93
-**Status:** Draft
+**Status:** Partially Implemented — Phase 1+3 landed via #259 (Slack adapter)
 **Author:** @chaodu-agent
+**Reviewers:** @dogzzdogzz, @antigenius0910
 
 ---
 
@@ -10,29 +11,20 @@
 
 Define a platform-agnostic adapter layer for agent-broker so it can serve Discord, Telegram, Slack, and future chat platforms through a single unified architecture. The ACP session pool and agent backend remain unchanged — only the "front door" becomes pluggable.
 
+**Primary contract: simultaneous multi-platform (Contract B).** A single running instance can serve Discord + Slack (+ future adapters) concurrently, sharing one `SessionPool` with platform-namespaced session keys. This was validated by #259 which merged the Slack adapter with Discord + Slack running in one process.
+
+> Contract A (pluggable single-platform per deployment) is a subset of B and works automatically — deploy with only one `[platform]` section in config.
+
 ## Motivation
 
-- agent-broker is currently hard-wired to Discord via `serenity`
+- agent-broker was originally hard-wired to Discord via `serenity`
 - #86 proposes a Telegram adapter, #93 proposes Slack — both require similar abstractions
 - Without a shared trait, each adapter will duplicate session routing, message splitting, reaction handling, and streaming logic
-- A clean adapter boundary also enables running multiple adapters simultaneously (e.g. Discord + Telegram in one deployment)
+- A clean adapter boundary enables running multiple adapters simultaneously (e.g. Discord + Slack in one deployment, validated by #259)
 
 ---
 
-## Current Architecture
-
-```
-┌──────────────┐  Gateway WS   ┌──────────────────────────────────────┐  ACP stdio   ┌───────────┐
-│   Discord    │◄──────────────►│            agent-broker              │─────────────►│ coding CLI│
-│   User       │                │  discord.rs → pool.rs → connection.rs│◄── JSON-RPC ─│ (acp mode)│
-└──────────────┘                └──────────────────────────────────────┘              └───────────┘
-```
-
-Everything in `discord.rs` — message handling, thread creation, edit-streaming, reactions — is Discord-specific. The session pool and ACP layer are already platform-agnostic.
-
----
-
-## Proposed Architecture
+## Current Architecture (post-#259)
 
 ```
                     ┌─────────────────┐
@@ -45,22 +37,19 @@ Everything in `discord.rs` — message handling, thread creation, edit-streaming
                     └─────────────────┘  │
                                          │  impl ChatAdapter
 ┌─────────────────┐                      │
-│ Telegram Users  │                      ▼
+│  Slack Users    │                      ▼
 └────────┬────────┘             ┌─────────────────┐     ┌──────────────┐
-         │ Bot API (teloxide)   │   AdapterRouter  │────►│ SessionPool  │
-         ▼                      │                  │     │  (unchanged) │
+         │ Socket Mode (WS)     │   AdapterRouter  │────►│ SessionPool  │
+         ▼                      │                  │     │              │
 ┌─────────────────┐             │  - route message │     └──────┬───────┘
-│ TelegramAdapter │────────────►│  - manage threads│            │ ACP stdio
+│  SlackAdapter   │────────────►│  - manage threads│            │ ACP stdio
 └─────────────────┘             │  - stream edits  │     ┌──────▼───────┐
-                                └─────────────────┘     │  AcpConnection│
-┌─────────────────┐                      ▲              │  (unchanged)  │
-│  Slack Users    │                      │              └───────────────┘
-└────────┬────────┘             ┌─────────────────┐
-         │ Socket Mode          │  SlackAdapter   │──┘
-         ▼                      └─────────────────┘
-┌─────────────────┐
-│  SlackAdapter   │
-└─────────────────┘
+                                └─────────────────┘     │ AcpConnection │
+                                         ▲              └───────────────┘
+                                         │
+                                ┌─────────────────┐
+                                │ TelegramAdapter  │  (future — Phase 2)
+                                └─────────────────┘
 ```
 
 ---
@@ -74,6 +63,9 @@ The core abstraction. Each platform implements this trait.
 pub trait ChatAdapter: Send + Sync + 'static {
     /// Platform name for logging and config ("discord", "telegram", "slack")
     fn platform(&self) -> &'static str;
+
+    /// Maximum message length for this platform
+    fn message_limit(&self) -> usize;
 
     /// Start listening for events. Blocks until shutdown.
     async fn run(&self, router: Arc<AdapterRouter>) -> Result<()>;
@@ -95,17 +87,35 @@ pub trait ChatAdapter: Send + Sync + 'static {
 }
 ```
 
+**Design decisions:**
+- `message_limit()` is on the trait (not hardcoded in router) so `AdapterRouter` can call `adapter.message_limit()` for `split_message` without matching on platform strings. (Feedback: @dogzzdogzz #1)
+- Emoji handling: config stores Unicode emoji, each adapter converts internally to platform-specific format (e.g. Slack short names). (Feedback: @dogzzdogzz #6)
+
 ### Platform-Agnostic References
 
 ```rust
 /// Identifies a channel/thread/topic across platforms
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct ChannelRef {
-    pub platform: String,      // "discord", "telegram", "slack"
-    pub channel_id: String,    // platform-native ID
-    pub parent_id: Option<String>,  // parent channel if this is a thread
+    pub platform: String,           // "discord", "telegram", "slack"
+    pub channel_id: String,         // platform-native channel ID
+    pub thread_id: Option<String>,  // thread within channel (Slack thread_ts, Telegram topic_id)
+    pub parent_id: Option<String>,  // parent channel if thread-as-channel (Discord threads)
 }
 
+impl ChannelRef {
+    /// Whether this ref points to a thread (either model)
+    pub fn is_thread(&self) -> bool {
+        self.thread_id.is_some() || self.parent_id.is_some()
+    }
+}
+```
+
+`ChannelRef` supports two threading models (Feedback: @dogzzdogzz #2):
+- **Thread-as-reply-chain** (Slack, Telegram): same `channel_id`, identified by `thread_id`
+- **Thread-as-child-channel** (Discord): separate `channel_id` with `parent_id` pointing to parent
+
+```rust
 /// Identifies a message across platforms
 #[derive(Clone, Debug)]
 pub struct MessageRef {
@@ -114,10 +124,10 @@ pub struct MessageRef {
     pub message_id: String,
 }
 
-/// Sender identity (already exists as sender_context JSON)
+/// Sender identity
 #[derive(Clone, Debug, Serialize)]
 pub struct SenderContext {
-    pub schema: String,        // "agent-broker.sender.v1"
+    pub schema: String,        // "openab.sender.v1"
     pub sender_id: String,
     pub sender_name: String,
     pub display_name: String,
@@ -131,7 +141,7 @@ pub struct SenderContext {
 
 ## 2. AdapterRouter
 
-Shared logic extracted from current `discord.rs` that is platform-independent:
+Shared logic extracted from `discord.rs` that is platform-independent:
 
 ```rust
 pub struct AdapterRouter {
@@ -144,7 +154,7 @@ impl AdapterRouter {
     /// Handles: session creation, prompt injection, streaming, reactions.
     pub async fn handle_message(
         &self,
-        adapter: &dyn ChatAdapter,
+        adapter: Arc<dyn ChatAdapter>,
         channel: &ChannelRef,
         sender: &SenderContext,
         prompt: &str,
@@ -153,10 +163,15 @@ impl AdapterRouter {
 }
 ```
 
+**Key design decisions:**
+- `adapter` parameter is `Arc<dyn ChatAdapter>` (not `&dyn`) so it can be moved into `tokio::spawn` for the edit-streaming background task. (Feedback: @dogzzdogzz #5)
+- Thread creation decision ("already in a thread?") lives in the router, using `ChannelRef::is_thread()`. Each adapter provides enough info in `ChannelRef` for the router to decide. (Feedback: @dogzzdogzz #3)
+- `StatusReactionController` is decoupled from Serenity types — it receives `Arc<dyn ChatAdapter>` and calls `add_reaction()` / `remove_reaction()` through the trait. (Feedback: @dogzzdogzz #4)
+
 The router owns:
 - Session pool interaction (`get_or_create`, `with_connection`)
 - Sender context injection (`<sender_context>` XML wrapping)
-- Edit-streaming loop (1.5s interval, message splitting at 2000/4096 chars depending on platform)
+- Edit-streaming loop (1.5s interval, message splitting via `adapter.message_limit()`)
 - Reaction state machine (queued → thinking → tool → done/error)
 - Thread creation decision (new thread vs. existing thread)
 
@@ -172,10 +187,10 @@ Each adapter only needs to:
 | Feature | Discord | Telegram | Slack |
 |---------|---------|----------|-------|
 | Connection | Gateway WebSocket (`serenity`) | Bot API polling / webhook (`teloxide`) | Socket Mode WebSocket / Events API |
-| Threading | Discord threads | Forum topics | Slack threads |
+| Threading model | Thread-as-child-channel | Forum topics (thread-as-reply) | Thread-as-reply-chain (`thread_ts`) |
 | Message limit | 2000 chars | 4096 chars | 4000 chars (blocks: 3000) |
 | Edit support | ✅ Full | ✅ Full | ✅ Full |
-| Reactions | ✅ Unicode + custom emoji | ✅ Unicode emoji | ✅ Unicode + custom emoji |
+| Reactions | ✅ Unicode + custom emoji | ✅ Unicode emoji | ✅ Unicode + custom emoji (short names) |
 | Trigger | `@mention` | `@mention` or any message (configurable) | `@mention` or app_mention event |
 | Bot message filtering | `msg.author.bot` | `msg.from.is_bot` | `event.bot_id` present |
 | Auth | Bot token | Bot token | Bot token + App token (Socket Mode) |
@@ -223,30 +238,33 @@ session_ttl_hours = 24
 
 ## 5. Message Size Handling
 
-Each platform has different message limits. The `format::split_message` function should accept a configurable limit:
+Each platform has different message limits. The `format::split_message` function accepts a configurable limit, sourced from `adapter.message_limit()`:
 
 ```rust
 pub fn split_message(content: &str, max_len: usize) -> Vec<String>;
 ```
 
-| Platform | Max chars | Current |
-|----------|-----------|---------|
-| Discord  | 2000      | ✅ Hardcoded 1900 |
-| Telegram | 4096      | New |
-| Slack    | 4000      | New |
+| Platform | Max chars | `message_limit()` |
+|----------|-----------|-------------------|
+| Discord  | 2000      | 1900 (safety margin) |
+| Telegram | 4096      | 4000 |
+| Slack    | 4000      | 3900 |
 
 ---
 
 ## 6. Reaction Mapping
 
-The `StatusReactionController` currently uses Unicode emoji which work across all three platforms. No changes needed for the emoji set, but the underlying API calls differ:
+The `StatusReactionController` uses `Arc<dyn ChatAdapter>` to call `add_reaction()` / `remove_reaction()`, fully decoupled from any platform SDK.
+
+Config stores Unicode emoji. Each adapter converts internally:
+- Discord: Unicode passthrough
+- Slack: Unicode → short name mapping (e.g. `👀` → `eyes`)
+- Telegram: Unicode passthrough
 
 | Action | Discord | Telegram | Slack |
 |--------|---------|----------|-------|
 | Add reaction | `create_reaction()` | `set_message_reaction()` | `reactions.add` |
 | Remove reaction | `delete_reaction()` | `set_message_reaction()` (empty) | `reactions.remove` |
-
-The `ChatAdapter` trait's `add_reaction` / `remove_reaction` methods abstract this.
 
 ---
 
@@ -262,15 +280,13 @@ The `ChatAdapter` trait's `add_reaction` / `remove_reaction` methods abstract th
 
 ## 8. Implementation Phases
 
-| Phase | Scope | Complexity | Depends on |
-|-------|-------|------------|------------|
-| **Phase 1** | Extract `ChatAdapter` trait + `AdapterRouter` from `discord.rs`, refactor Discord to implement trait | Medium | — |
-| **Phase 2** | Telegram adapter (`teloxide`), personal + team modes | Medium | Phase 1, #86 |
-| **Phase 3** | Slack adapter (Socket Mode), channel threading | Medium | Phase 1, #93 |
-| **Phase 4** | Multi-adapter simultaneous mode (Discord + Telegram + Slack in one process) | Low | Phase 1-3 |
-| **Phase 5** | Platform-specific features: Slack blocks, Telegram inline keyboards, Discord embeds | Low | Phase 1-3 |
-
-Each phase is independently shippable. Phase 1 is a pure refactor with no behavior change.
+| Phase | Scope | Status | Notes |
+|-------|-------|--------|-------|
+| **Phase 1** | Extract `ChatAdapter` trait + `AdapterRouter`, refactor Discord to implement trait | ✅ Merged (#259) | Pure refactor + Slack adapter landed together |
+| **Phase 2** | Telegram adapter (`teloxide`), personal + team modes | Not started | Depends on #86 |
+| **Phase 3** | Slack adapter (Socket Mode), channel threading | ✅ Merged (#259) | Includes simultaneous Discord + Slack |
+| **Phase 4** | Per-adapter session soft limits, streaming timeout | Not started | See Known Limitations |
+| **Phase 5** | Platform-specific features: Slack blocks, Telegram inline keyboards, Discord embeds | Not started | Text-only for v1; extend via `PlatformExt` traits later |
 
 ---
 
@@ -283,14 +299,99 @@ Each phase is independently shippable. Phase 1 is a pure refactor with no behavi
 
 ---
 
-## Open Questions
+## 10. Testing Strategy
 
-1. Should adapters share a single `SessionPool` or have separate pools? (Shared is simpler, separate gives better isolation)
-2. Should session keys include platform prefix (`discord:123`) or rely on ID uniqueness? (Prefix is safer)
-3. Multi-adapter mode: should there be a global `max_sessions` or per-adapter limits?
-4. Should the `ChatAdapter` trait support rich messages (embeds, blocks, inline keyboards) or keep it text-only for v1?
-5. How to handle platform-specific features like Slack's `reply_broadcast` or Telegram's `parse_mode`?
+(Feedback: @dogzzdogzz #8)
+
+### MockAdapter
+
+Define a `MockAdapter` (in-memory, no network) that implements `ChatAdapter`:
+
+```rust
+pub struct MockAdapter {
+    pub sent_messages: Arc<Mutex<Vec<(ChannelRef, String)>>>,
+    pub edited_messages: Arc<Mutex<Vec<(MessageRef, String)>>>,
+    pub reactions: Arc<Mutex<Vec<(MessageRef, String)>>>,
+}
+
+impl ChatAdapter for MockAdapter {
+    fn platform(&self) -> &'static str { "mock" }
+    fn message_limit(&self) -> usize { 2000 }
+    // ... record calls for assertion
+}
+```
+
+### Test coverage
+
+| Layer | What to test | How |
+|-------|-------------|-----|
+| `AdapterRouter` | Session routing, streaming, reactions, thread creation | Unit tests with `MockAdapter` |
+| `ChatAdapter` impls | Platform-specific API calls, emoji mapping, error handling | Integration tests per adapter (can mock HTTP) |
+| `ChannelRef` | `is_thread()` logic for both threading models | Unit tests |
+| End-to-end | Full message flow through router → pool → ACP | Integration test with `MockAdapter` + real `SessionPool` |
+
+### Phase 1 acceptance criteria (validated by #259)
+
+- ✅ Existing Discord behavior passes through the new trait boundary
+- ✅ `MockAdapter` can drive `AdapterRouter` in tests
+- ✅ No behavior change for Discord-only deployments
 
 ---
 
-_Comments and feedback welcome._
+## 11. Resolved Questions
+
+(Feedback: @dogzzdogzz #7, @antigenius0910)
+
+| # | Question | Decision | Rationale |
+|---|----------|----------|-----------|
+| 1 | Shared vs separate `SessionPool` | **Shared** | Already namespaced by platform prefix; separate pools add complexity with no isolation benefit |
+| 2 | Platform prefix in session keys | **Yes, always prefix** | IDs from different platforms can collide; prefix cost is negligible. Format: `{platform}:{thread_id}` |
+| 3 | Global vs per-adapter `max_sessions` | **Global hard cap + per-adapter soft limit** | Prevents one noisy platform from starving others. Global cap in `[pool]`, soft limits in each `[platform]` section |
+| 4 | Rich messages in v1 | **Text-only** | Ship the abstraction first; rich messages are additive and platform-divergent |
+| 5 | Platform-specific features | **Defer to Phase 5** | Keep `ChatAdapter` minimal for v1; extend via `PlatformExt` traits or feature flags later |
+| 6 | Primary contract: A (single) vs B (simultaneous) | **B — simultaneous multi-platform** | Validated by #259. Contract A is a subset that works automatically |
+
+---
+
+## 12. Known Limitations
+
+(Feedback: @antigenius0910)
+
+### Resolved: SessionPool lock contention
+
+@antigenius0910 raised that `SessionPool::with_connection()` held a write lock for the full prompt duration, which would serialize all sessions across platforms under Contract B.
+
+**Status: Resolved.** The current implementation uses read lock + `Arc` clone + drop lock, then locks only the individual connection:
+
+```rust
+pub async fn with_connection<F, R>(&self, thread_id: &str, f: F) -> Result<R> {
+    let conn = {
+        let state = self.state.read().await;  // read lock, not write
+        state.active.get(thread_id).cloned()   // clone Arc
+            .ok_or_else(|| anyhow!("no connection"))?
+    };  // state lock dropped here
+    let mut conn = conn.lock().await;  // lock individual connection
+    f(&mut conn).await
+}
+```
+
+Multiple adapters' sessions can now execute concurrently without blocking each other.
+
+### Open: No streaming timeout
+
+A hung ACP session (e.g. agent process stuck, infinite tool loop) will hold its connection `Mutex` indefinitely. Under Contract B, this doesn't block other sessions (each has its own `Mutex`), but it does permanently consume one session slot from the pool.
+
+**Suggested fix (follow-up issue):** Add a configurable timeout to `with_connection`:
+
+```rust
+let mut conn = tokio::time::timeout(
+    Duration::from_secs(config.streaming_timeout_secs),
+    conn.lock()
+).await.map_err(|_| anyhow!("session timeout"))??;
+```
+
+This would allow the pool to reclaim hung sessions and is especially important as the number of simultaneous adapters grows.
+
+---
+
+_This RFC was updated on 2026-04-21 to integrate review feedback from @dogzzdogzz (8 architectural points) and @antigenius0910 (Contract A vs B question), and to reflect the merge of #259 (Slack adapter implementing Phase 1+3)._
