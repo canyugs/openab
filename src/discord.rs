@@ -29,11 +29,12 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 
 pub struct DiscordAdapter {
     http: Arc<Http>,
+    allow_bot_messages: AllowBots,
 }
 
 impl DiscordAdapter {
-    pub fn new(http: Arc<Http>) -> Self {
-        Self { http }
+    pub fn new(http: Arc<Http>, allow_bot_messages: AllowBots) -> Self {
+        Self { http, allow_bot_messages }
     }
 }
 
@@ -70,7 +71,7 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     fn use_streaming(&self) -> bool {
-        true
+        discord_should_stream(self.allow_bot_messages)
     }
 
     async fn create_thread(
@@ -321,7 +322,7 @@ impl EventHandler for Handler {
         }
 
         let adapter = self.adapter.get_or_init(|| {
-            Arc::new(DiscordAdapter::new(ctx.http.clone()))
+            Arc::new(DiscordAdapter::new(ctx.http.clone(), self.allow_bot_messages))
         }).clone();
 
         let channel_id = msg.channel_id.get();
@@ -899,6 +900,14 @@ fn resolve_mentions(content: &str, bot_id: UserId) -> String {
     out.trim().to_string()
 }
 
+/// Whether the Discord adapter should use streaming edit.
+/// Streaming is disabled when bots can post (Mentions/All) to avoid
+/// placeholder message interference in bot-to-bot threads.
+/// Mirrors the Slack adapter logic from commit 4eed3fc.
+fn discord_should_stream(allow_bot_messages: AllowBots) -> bool {
+    allow_bot_messages == AllowBots::Off
+}
+
 /// Pure thread detection: determines whether a channel is a Discord thread
 /// in an allowed parent, and whether the bot owns it.
 ///
@@ -1336,5 +1345,28 @@ mod tests {
             );
             assert_eq!(result, c.expect, "FAILED: {}", c.name);
         }
+    }
+
+    // --- use_streaming parity tests (regression for #533) ---
+    // Discord must mirror Slack: streaming only when allow_bot_messages=Off.
+    // When bots can post (Mentions/All), send-once avoids placeholder interference
+    // in bot-to-bot threads. See Slack fix in 4eed3fc and discord regression in 27b9e58.
+
+    /// Default (Off): streaming enabled for smooth human UX.
+    #[test]
+    fn discord_streams_when_bots_off() {
+        assert!(super::discord_should_stream(AllowBots::Off));
+    }
+
+    /// Mentions: send-once to avoid placeholder interference in bot-to-bot threads.
+    #[test]
+    fn discord_no_stream_when_bots_mentions() {
+        assert!(!super::discord_should_stream(AllowBots::Mentions));
+    }
+
+    /// All: send-once.
+    #[test]
+    fn discord_no_stream_when_bots_all() {
+        assert!(!super::discord_should_stream(AllowBots::All));
     }
 }
