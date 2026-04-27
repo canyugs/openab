@@ -46,6 +46,8 @@ pub struct Config {
     pub stt: SttConfig,
     #[serde(default)]
     pub markdown: MarkdownConfig,
+    #[serde(default)]
+    pub cronjobs: Vec<CronJobConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -198,6 +200,34 @@ pub struct PoolConfig {
     #[serde(default = "default_ttl_hours")]
     pub session_ttl_hours: u64,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CronJobConfig {
+    /// Whether this cronjob is active (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Cron expression (5-field POSIX format)
+    pub schedule: String,
+    /// Target channel ID
+    pub channel: String,
+    /// Message to send to the agent
+    pub message: String,
+    /// Target platform (default: "discord")
+    #[serde(default = "default_cron_platform")]
+    pub platform: String,
+    /// Sender name for attribution (default: "openab-cron")
+    #[serde(default = "default_cron_sender")]
+    pub sender_name: String,
+    /// Optional thread ID (post to existing thread)
+    pub thread_id: Option<String>,
+    /// Timezone (default: "UTC")
+    #[serde(default = "default_cron_timezone")]
+    pub timezone: String,
+}
+
+fn default_cron_platform() -> String { "discord".into() }
+fn default_cron_sender() -> String { "openab-cron".into() }
+fn default_cron_timezone() -> String { "UTC".into() }
 
 #[derive(Debug, Deserialize)]
 pub struct ReactionsConfig {
