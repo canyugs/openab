@@ -47,7 +47,19 @@ pub struct Config {
     #[serde(default)]
     pub markdown: MarkdownConfig,
     #[serde(default)]
-    pub cronjobs: Vec<CronJobConfig>,
+    pub cron: CronConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CronConfig {
+    /// Enable usercron hot-reload (default: false). Must be explicitly set to true.
+    #[serde(default)]
+    pub usercron_enabled: bool,
+    /// Path to an external cronjob.toml for hot-reloadable user-managed schedules.
+    pub usercron_path: Option<String>,
+    /// Baseline cronjob definitions: `[[cron.jobs]]`
+    #[serde(default)]
+    pub jobs: Vec<CronJobConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

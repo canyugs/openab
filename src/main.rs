@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let mut configured_platforms: Vec<&str> = Vec::new();
     if cfg.discord.is_some() { configured_platforms.push("discord"); }
     if cfg.slack.is_some() { configured_platforms.push("slack"); }
-    cron::validate_cronjobs(&cfg.cronjobs, &configured_platforms)?;
+    cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
     // Spawn Slack adapter (background task)
     let slack_handle = if let Some(slack_cfg) = cfg.slack {
@@ -227,9 +227,26 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Spawn cron scheduler (background task) — reuses shared adapters
-    let cron_handle = if !cfg.cronjobs.is_empty() {
+    let usercron_path = if cfg.cron.usercron_enabled {
+        cfg.cron.usercron_path.as_ref().map(|p| {
+            let path = std::path::PathBuf::from(p);
+            if path.is_absolute() {
+                path
+            } else {
+                // Relative paths resolve from $HOME (e.g. "cronjob.toml" → "$HOME/cronjob.toml")
+                std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default()
+                    .join(path)
+            }
+        })
+    } else {
+        None
+    };
+    let has_cron_work = !cfg.cron.jobs.is_empty() || usercron_path.is_some();
+    let cron_handle = if has_cron_work {
         let shutdown_rx = shutdown_rx.clone();
-        let cronjobs = cfg.cronjobs.clone();
+        let cronjobs = cfg.cron.jobs.clone();
         let cron_router = router.clone();
         let mut cron_adapters: std::collections::HashMap<String, Arc<dyn adapter::ChatAdapter>> =
             std::collections::HashMap::new();
@@ -239,9 +256,10 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref a) = shared_slack_adapter {
             cron_adapters.insert("slack".into(), a.clone() as Arc<dyn adapter::ChatAdapter>);
         }
-        info!(count = cronjobs.len(), "starting cron scheduler");
+        let cron_platforms: Vec<String> = configured_platforms.iter().map(|s| s.to_string()).collect();
+        info!(baseline = cronjobs.len(), usercron = ?usercron_path, "starting cron scheduler");
         Some(tokio::spawn(async move {
-            cron::run_scheduler(cronjobs, cron_router, cron_adapters, shutdown_rx).await;
+            cron::run_scheduler(cronjobs, usercron_path, cron_platforms, cron_router, cron_adapters, shutdown_rx).await;
         }))
     } else {
         None

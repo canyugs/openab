@@ -185,28 +185,41 @@ Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/aud
 
 ---
 
-## `[[cronjobs]]`
+## `[cron]`
 
-Scheduled messages — config-driven cron. Each entry sends a message to the agent at the specified schedule, as if a user typed it. The agent processes the message and replies to the target channel.
+Everything cron-related lives under `[cron]`.
 
 ```toml
-[[cronjobs]]
+[cron]
+usercron_enabled = true                      # enable hot-reload (default: false)
+usercron_path = "cronjob.toml"               # relative to $HOME, or absolute
+
+[[cron.jobs]]
 enabled = true                               # optional, default: true
 schedule = "0 9 * * 1-5"                    # cron expression (5-field POSIX)
 channel = "123456789"                        # target channel/thread ID
 message = "summarize yesterday's merged PRs" # message sent to agent
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
-timezone = "America/New_York"                     # optional, default: "UTC"
+timezone = "America/New_York"                # optional, default: "UTC"
 thread_id = ""                               # optional, post to existing thread
 
-[[cronjobs]]
+[[cron.jobs]]
 schedule = "0 0 * * 0"
 channel = "123456789"
 message = "generate weekly status report"
 platform = "discord"
 timezone = "UTC"
 ```
+
+### `[cron]` fields
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `usercron_enabled` | bool | `false` | Enable usercron hot-reload. Must be explicitly set to `true`. |
+| `usercron_path` | string | — | Path to the external `cronjob.toml`. Relative paths resolve from `$HOME`. |
+
+### `[[cron.jobs]]` fields
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -218,6 +231,8 @@ timezone = "UTC"
 | `sender_name` | string | `"openab-cron"` | Sender attribution shown in the prompt context. |
 | `timezone` | string | `"UTC"` | IANA timezone for schedule evaluation (e.g. `"America/New_York"`, `"Europe/Berlin"`). |
 | `thread_id` | string | `""` | Optional thread ID to post into an existing thread. |
+
+The external `cronjob.toml` uses `[[jobs]]` (same fields). See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
 
 **Cron expression format:**
 
@@ -276,14 +291,14 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
 | `agents.<name>.reactions.enabled` | `[reactions] enabled` |
 | `agents.<name>.stt.apiKey` | `[stt] api_key` |
-| `agents.<name>.cronjobs[].enabled` | `[[cronjobs]] enabled` |
-| `agents.<name>.cronjobs[].schedule` | `[[cronjobs]] schedule` |
-| `agents.<name>.cronjobs[].channel` | `[[cronjobs]] channel` |
-| `agents.<name>.cronjobs[].message` | `[[cronjobs]] message` |
-| `agents.<name>.cronjobs[].platform` | `[[cronjobs]] platform` |
-| `agents.<name>.cronjobs[].senderName` | `[[cronjobs]] sender_name` |
-| `agents.<name>.cronjobs[].timezone` | `[[cronjobs]] timezone` |
-| `agents.<name>.cronjobs[].threadId` | `[[cronjobs]] thread_id` |
+| `agents.<name>.cronjobs[].enabled` | `[[cron.jobs]] enabled` |
+| `agents.<name>.cronjobs[].schedule` | `[[cron.jobs]] schedule` |
+| `agents.<name>.cronjobs[].channel` | `[[cron.jobs]] channel` |
+| `agents.<name>.cronjobs[].message` | `[[cron.jobs]] message` |
+| `agents.<name>.cronjobs[].platform` | `[[cron.jobs]] platform` |
+| `agents.<name>.cronjobs[].senderName` | `[[cron.jobs]] sender_name` |
+| `agents.<name>.cronjobs[].timezone` | `[[cron.jobs]] timezone` |
+| `agents.<name>.cronjobs[].threadId` | `[[cron.jobs]] thread_id` |
 
 > ⚠️ Use `--set-string` (not `--set`) for Discord/Slack IDs to avoid float64 precision loss:
 > ```bash
