@@ -193,6 +193,7 @@ pub struct GoogleChatAdapter {
     pub access_token: Option<String>,
     pub jwt_verifier: Option<GoogleChatJwtVerifier>,
     pub client: reqwest::Client,
+    pub api_base: String,
 }
 
 impl GoogleChatAdapter {
@@ -206,6 +207,7 @@ impl GoogleChatAdapter {
             access_token,
             jwt_verifier,
             client: reqwest::Client::new(),
+            api_base: GOOGLE_CHAT_API_BASE.into(),
         }
     }
 
@@ -231,11 +233,11 @@ impl GoogleChatAdapter {
         let formatted = markdown_to_gchat(text);
         let url = format!(
             "{}/{}?updateMask=text",
-            GOOGLE_CHAT_API_BASE, message_name
+            self.api_base, message_name
         );
         let body = serde_json::json!({ "text": formatted });
 
-        match self.client.put(&url).bearer_auth(&token).json(&body).send().await {
+        match self.client.patch(&url).bearer_auth(&token).json(&body).send().await {
             Ok(r) if r.status().is_success() => {
                 tracing::trace!(message_name = %message_name, "googlechat message edited");
             }
@@ -276,6 +278,19 @@ impl GoogleChatAdapter {
                 text = %reply.content.text,
                 "googlechat reply (dry-run, no credentials configured)"
             );
+            if let Some(ref req_id) = reply.request_id {
+                let resp = crate::schema::GatewayResponse {
+                    schema: "openab.gateway.response.v1".into(),
+                    request_id: req_id.clone(),
+                    success: false,
+                    thread_id: None,
+                    message_id: None,
+                    error: Some("no credentials configured".into()),
+                };
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    let _ = event_tx.send(json);
+                }
+            }
             return;
         };
 
@@ -289,6 +304,7 @@ impl GoogleChatAdapter {
                 &reply.channel.id,
                 reply.channel.thread_id.as_deref(),
                 text,
+                &self.api_base,
             )
             .await;
 
@@ -311,15 +327,33 @@ impl GoogleChatAdapter {
                 }
             }
         } else {
+            let mut first_msg_name = None;
             for chunk in chunks {
-                send_message(
+                let msg_name = send_message(
                     &self.client,
                     &token,
                     &reply.channel.id,
                     reply.channel.thread_id.as_deref(),
                     chunk,
+                    &self.api_base,
                 )
                 .await;
+                if first_msg_name.is_none() {
+                    first_msg_name = msg_name;
+                }
+            }
+            if let Some(ref req_id) = reply.request_id {
+                let resp = crate::schema::GatewayResponse {
+                    schema: "openab.gateway.response.v1".into(),
+                    request_id: req_id.clone(),
+                    success: first_msg_name.is_some(),
+                    thread_id: None,
+                    message_id: first_msg_name,
+                    error: None,
+                };
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    let _ = event_tx.send(json);
+                }
             }
         }
     }
@@ -718,8 +752,9 @@ async fn send_message(
     space: &str,
     thread_id: Option<&str>,
     text: &str,
+    api_base: &str,
 ) -> Option<String> {
-    let mut url = format!("{}/{}/messages", GOOGLE_CHAT_API_BASE, space);
+    let mut url = format!("{}/{}/messages", api_base, space);
 
     let formatted = markdown_to_gchat(text);
     let mut body = serde_json::json!({
@@ -1185,9 +1220,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_reply_sends_gateway_response_with_request_id() {
+    async fn handle_reply_sends_gateway_response_success() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/TEST/messages/msg_abc"}),
+            ))
+            .mount(&mock_server)
+            .await;
+
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
@@ -1207,19 +1255,104 @@ mod tests {
 
         adapter.handle_reply(&reply, &event_tx).await;
 
-        // Should have sent a GatewayResponse (even if API call failed)
         let received = event_rx.try_recv();
         assert!(received.is_ok(), "expected GatewayResponse on event_tx");
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_123");
-        // API call will fail (fake URL) so success=false
-        assert!(!resp.success || resp.message_id.is_some());
+        assert!(resp.success);
+        assert_eq!(resp.message_id, Some("spaces/TEST/messages/msg_abc".into()));
+    }
+
+    #[tokio::test]
+    async fn handle_reply_sends_failure_response_on_api_error() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig_msg".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+            },
+            command: None,
+            request_id: Some("req_fail".into()),
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let received = event_rx.try_recv();
+        assert!(received.is_ok(), "expected GatewayResponse on event_tx");
+        let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
+        assert_eq!(resp.request_id, "req_fail");
+        assert!(!resp.success);
+        assert!(resp.message_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_reply_token_failure_sends_error_response() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let adapter = GoogleChatAdapter::new(None, None, None);
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig_msg".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+            },
+            command: None,
+            request_id: Some("req_notoken".into()),
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let received = event_rx.try_recv();
+        assert!(received.is_ok(), "expected failure GatewayResponse");
+        let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
+        assert_eq!(resp.request_id, "req_notoken");
+        assert!(!resp.success);
+        assert_eq!(resp.error, Some("no credentials configured".into()));
     }
 
     #[tokio::test]
     async fn handle_reply_edit_message_does_not_send_response() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path_regex("/spaces/.*/messages/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/SP/messages/msg1"}),
+            ))
+            .mount(&mock_server)
+            .await;
+
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
@@ -1239,8 +1372,52 @@ mod tests {
 
         adapter.handle_reply(&reply, &event_tx).await;
 
-        // edit_message should NOT produce a GatewayResponse
         let received = event_rx.try_recv();
         assert!(received.is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_reply_multi_chunk_sends_gateway_response() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/TEST/messages/first_chunk"}),
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+
+        let long_text = "x".repeat(5000);
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig_msg".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: long_text,
+            },
+            command: None,
+            request_id: Some("req_multi".into()),
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let received = event_rx.try_recv();
+        assert!(received.is_ok(), "expected GatewayResponse for multi-chunk");
+        let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
+        assert_eq!(resp.request_id, "req_multi");
+        assert!(resp.success);
+        assert_eq!(resp.message_id, Some("spaces/TEST/messages/first_chunk".into()));
     }
 }
