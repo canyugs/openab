@@ -24,6 +24,8 @@ aes = "0.8"
 cbc = "0.1"
 prost = "0.13"
 subtle = "2"
+sha1 = "0.10"
+quick-xml = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 [dev-dependencies]

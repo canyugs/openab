@@ -50,6 +50,7 @@ pub struct AppState {
     pub feishu: Option<adapters::feishu::FeishuAdapter>,
     /// Google Chat adapter (None if Google Chat disabled)
     pub google_chat: Option<adapters::googlechat::GoogleChatAdapter>,
+    pub wecom: Option<adapters::wecom::WecomAdapter>,
     /// WebSocket authentication token
     pub ws_token: Option<String>,
     /// Broadcast channel: gateway → OAB (events from all platforms)
@@ -169,6 +170,13 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                     gc.handle_reply(&reply).await;
                                 } else {
                                     warn!("reply for googlechat but adapter not configured");
+                                }
+                            }
+                            "wecom" => {
+                                if let Some(ref wecom) = state_for_recv.wecom {
+                                    wecom.handle_reply(&reply, &state_for_recv.event_tx).await;
+                                } else {
+                                    warn!("reply for wecom but adapter not configured");
                                 }
                             }
                             other => warn!(platform = other, "unknown reply platform"),
@@ -314,11 +322,24 @@ async fn main() -> Result<()> {
         None
     };
 
+    // WeCom adapter
+    let wecom = adapters::wecom::WecomConfig::from_env().map(|config| {
+        let path = config.webhook_path.clone();
+        info!(path = %path, "wecom adapter enabled");
+        adapters::wecom::WecomAdapter::new(config)
+    });
+    if let Some(ref w) = wecom {
+        app = app
+            .route(&w.config.webhook_path, axum::routing::get(adapters::wecom::verify))
+            .route(&w.config.webhook_path, post(adapters::wecom::webhook));
+    }
+
     if telegram_bot_token.is_none()
         && line_access_token.is_none()
         && teams.is_none()
         && feishu.is_none()
         && google_chat.is_none()
+        && wecom.is_none()
     {
         warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, TEAMS_APP_ID + TEAMS_APP_SECRET, FEISHU_APP_ID + FEISHU_APP_SECRET, and/or GOOGLE_CHAT_ENABLED=true");
     }
@@ -332,6 +353,7 @@ async fn main() -> Result<()> {
         teams_service_urls: Mutex::new(HashMap::new()),
         feishu,
         google_chat,
+        wecom,
         ws_token,
         event_tx,
         reply_token_cache,

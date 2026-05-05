@@ -264,6 +264,15 @@ agents:
         saKeyJson: ""          # Service account key JSON string → GOOGLE_CHAT_SA_KEY_JSON (recommended, auto-refresh)
         accessToken: ""        # Static OAuth2 access token → GOOGLE_CHAT_ACCESS_TOKEN (fallback, 1-hour TTL)
         webhookPath: ""        # Gateway default: /webhook/googlechat → GOOGLE_CHAT_WEBHOOK_PATH
+      # WeCom (企业微信) adapter config (gateway-side env vars)
+      # See docs/wecom.md for full setup guide
+      wecom:
+        corpId: ""             # Enterprise Corp ID → WECOM_CORP_ID
+        secret: ""             # App Secret → WECOM_SECRET (use --set-literal or external secret mgmt)
+        token: ""              # Callback verification token → WECOM_TOKEN
+        encodingAesKey: ""     # 43-char AES key → WECOM_ENCODING_AES_KEY
+        agentId: ""            # Agent ID → WECOM_AGENT_ID (default: 0)
+        webhookPath: ""        # Gateway default: /webhook/wecom → WECOM_WEBHOOK_PATH
     # Scheduled messages — config-driven cron (ADR: basic-cronjob)
     # Each entry sends a message to the agent at the specified schedule.
     # Example:
