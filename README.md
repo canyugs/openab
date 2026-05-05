@@ -111,6 +111,13 @@ See [docs/google-chat.md](docs/google-chat.md) for the full setup guide. Require
 
 </details>
 
+<details>
+<summary><strong>WeCom (企业微信)</strong> (via Custom Gateway)</summary>
+
+See [docs/wecom.md](docs/wecom.md) for the full setup guide. Requires the standalone [Custom Gateway](gateway/) service.
+
+</details>
+
 ### 2. Install with Helm (Kiro CLI — default)
 
 ```bash

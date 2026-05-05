@@ -67,6 +67,13 @@ url = "ws://gateway:8080/ws"
 | `GOOGLE_CHAT_SA_KEY_FILE` | (optional) | Path to service account key JSON file (alternative to `SA_KEY_JSON`) |
 | `GOOGLE_CHAT_ACCESS_TOKEN` | (optional) | Static OAuth2 access token (fallback, expires in 1 hour) |
 | `GOOGLE_CHAT_WEBHOOK_PATH` | `/webhook/googlechat` | Webhook endpoint path |
+| `WECOM_CORP_ID` | (optional) | WeCom Corp ID — enables wecom adapter |
+| `WECOM_AGENT_ID` | (optional) | WeCom App Agent ID |
+| `WECOM_SECRET` | (optional) | WeCom App Secret |
+| `WECOM_TOKEN` | (optional) | Callback verification Token |
+| `WECOM_ENCODING_AES_KEY` | (optional) | Callback EncodingAESKey (43 chars) |
+| `WECOM_WEBHOOK_PATH` | `/webhook/wecom` | Webhook endpoint path |
+| `WECOM_GROUP_REQUIRE_MENTION` | `true` | Require @mention in group chats |
 
 ### Endpoints
 
@@ -76,6 +83,8 @@ url = "ws://gateway:8080/ws"
 | `POST /webhook/line` | LINE webhook receiver |
 | `POST /webhook/feishu` | Feishu webhook receiver (when `FEISHU_CONNECTION_MODE=webhook`) |
 | `POST /webhook/googlechat` | Google Chat webhook receiver |
+| `GET /webhook/wecom` | WeCom callback URL verification |
+| `POST /webhook/wecom` | WeCom message callback receiver |
 | `GET /ws` | WebSocket server (OAB connects here) |
 | `GET /health` | Health check |
 
@@ -116,6 +125,10 @@ See [docs/feishu.md](../docs/feishu.md) for the full setup guide.
 ### Google Chat
 
 See [docs/google-chat.md](../docs/google-chat.md) for the full setup guide.
+
+### WeCom (企业微信)
+
+See [docs/wecom.md](../docs/wecom.md) for the full setup guide.
 
 ### Other Platforms
 
