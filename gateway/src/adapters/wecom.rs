@@ -276,6 +276,7 @@ pub struct WecomAdapter {
     pub token_cache: WecomTokenCache,
     client: reqwest::Client,
     dedupe: DedupeCache,
+    msg_id_map: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl WecomAdapter {
@@ -284,8 +285,19 @@ impl WecomAdapter {
             token_cache: WecomTokenCache::new(),
             client: reqwest::Client::new(),
             dedupe: DedupeCache::new(),
+            msg_id_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             config,
         }
+    }
+
+    fn resolve_msg_id(&self, original_id: &str) -> String {
+        let map = self.msg_id_map.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(original_id).cloned().unwrap_or_else(|| original_id.to_string())
+    }
+
+    fn update_msg_id(&self, original_id: &str, new_id: &str) {
+        let mut map = self.msg_id_map.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(original_id.to_string(), new_id.to_string());
     }
 
     pub async fn handle_reply(
@@ -295,8 +307,12 @@ impl WecomAdapter {
     ) {
         if let Some(cmd) = reply.command.as_deref() {
             match cmd {
-                "add_reaction" | "remove_reaction" | "create_topic" | "edit_message" => {
+                "add_reaction" | "remove_reaction" | "create_topic" => {
                     info!(command = cmd, "wecom: ignoring unsupported command");
+                    return;
+                }
+                "edit_message" => {
+                    self.handle_edit_message(reply).await;
                     return;
                 }
                 _ => {}
@@ -343,6 +359,68 @@ impl WecomAdapter {
                 let _ = event_tx.send(json);
             }
         }
+    }
+
+    async fn handle_edit_message(&self, reply: &crate::schema::GatewayReply) {
+        let text = &reply.content.text;
+        if text.is_empty() {
+            return;
+        }
+        let to_user = reply
+            .channel
+            .id
+            .rsplit(':')
+            .next()
+            .unwrap_or(&reply.channel.id);
+
+        let original_id = &reply.reply_to;
+
+        if !original_id.is_empty() {
+            let current_id = self.resolve_msg_id(original_id);
+            if let Err(e) = self.recall_message(&current_id).await {
+                info!(err = %e, msg_id = %current_id, "wecom: recall failed (may already be recalled)");
+            }
+        }
+
+        let clean = text.trim();
+        if clean.is_empty() {
+            return;
+        }
+        let parts = split_text_lines(clean, 2048);
+
+        for part in &parts {
+            match self.send_text(to_user, part).await {
+                Ok(new_id) => {
+                    if !original_id.is_empty() && !new_id.is_empty() {
+                        self.update_msg_id(original_id, &new_id);
+                    }
+                    info!(new_msg_id = %new_id, "wecom: edit via recall+resend ok");
+                }
+                Err(e) => warn!("wecom edit resend failed: {e}"),
+            }
+        }
+    }
+
+    async fn recall_message(&self, msg_id: &str) -> Result<()> {
+        let token = self
+            .token_cache
+            .get_token(&self.client, &self.config.corp_id, &self.config.secret)
+            .await?;
+        let url = format!(
+            "{}/cgi-bin/message/recall?access_token={}",
+            self.token_cache.base_url, token
+        );
+        let body = serde_json::json!({ "msgid": msg_id });
+        let resp: serde_json::Value = self.client.post(&url).json(&body).send().await?.json().await?;
+        let errcode = resp["errcode"].as_i64().unwrap_or(-1);
+        if errcode != 0 {
+            anyhow::bail!(
+                "recall failed: errcode={}, errmsg={}",
+                errcode,
+                resp["errmsg"]
+            );
+        }
+        Ok(())
     }
 
     async fn send_text(&self, to_user: &str, text: &str) -> Result<String> {
