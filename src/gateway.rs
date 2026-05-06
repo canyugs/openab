@@ -723,20 +723,23 @@ pub async fn run_gateway_adapter(
                                             }
                                             "audio" if stt_config.enabled => {
                                                 use base64::Engine;
-                                                if let Ok(audio_bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) {
-                                                    if let Some(transcript) = crate::stt::transcribe(
+                                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) {
+                                                    match crate::stt::transcribe(
                                                         &crate::media::HTTP_CLIENT,
                                                         &stt_config,
-                                                        audio_bytes,
+                                                        bytes,
                                                         att.filename.clone(),
                                                         &att.mime_type,
                                                     ).await {
-                                                        extra_blocks.push(ContentBlock::Text {
-                                                            text: format!("[Voice message transcript]: {transcript}"),
-                                                        });
+                                                        Some(transcript) => {
+                                                            extra_blocks.push(ContentBlock::Text {
+                                                                text: format!("[Voice message transcript]: {transcript}"),
+                                                            });
+                                                        }
+                                                        None => {
+                                                            tracing::warn!(filename = %att.filename, "gateway audio STT failed");
+                                                        }
                                                     }
-                                                } else {
-                                                    warn!(filename = %att.filename, "audio attachment base64 decode failed");
                                                 }
                                             }
                                             _ => {}
