@@ -505,6 +505,7 @@ struct WecomMessage {
     msg_type: String,
     content: String,
     msg_id: String,
+    pic_url: String,
 }
 
 fn parse_envelope_xml(xml: &str) -> Result<CallbackEnvelope> {
@@ -572,6 +573,7 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
     let mut msg_type = String::new();
     let mut content = String::new();
     let mut msg_id = String::new();
+    let mut pic_url = String::new();
     let mut current_tag = String::new();
 
     loop {
@@ -586,6 +588,7 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
                     "MsgType" => msg_type = text,
                     "Content" => content = text,
                     "MsgId" => msg_id = text,
+                    "PicUrl" => pic_url = text,
                     _ => {}
                 }
             }
@@ -612,6 +615,11 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
                             msg_id = text;
                         }
                     }
+                    "PicUrl" => {
+                        if pic_url.is_empty() {
+                            pic_url = text;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -629,6 +637,7 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
         msg_type,
         content,
         msg_id,
+        pic_url,
     })
 }
 
@@ -794,7 +803,7 @@ pub async fn webhook(
         }
     };
 
-    if msg.msg_type != "text" {
+    if !matches!(msg.msg_type.as_str(), "text" | "image") {
         return "success".into_response();
     }
 
@@ -802,18 +811,30 @@ pub async fn webhook(
         return "success".into_response();
     }
 
-    let text = if wecom.config.group_require_mention {
-        strip_bot_mention(&msg.content)
+    let text = if msg.msg_type == "text" {
+        if wecom.config.group_require_mention {
+            strip_bot_mention(&msg.content)
+        } else {
+            msg.content.clone()
+        }
     } else {
-        msg.content.clone()
+        String::new()
     };
 
-    if text.trim().is_empty() {
+    let mut attachments = Vec::new();
+    if msg.msg_type == "image" && !msg.pic_url.is_empty() {
+        match download_wecom_image(&wecom.client, &msg.pic_url).await {
+            Some(att) => attachments.push(att),
+            None => info!("wecom: image download failed, forwarding without attachment"),
+        }
+    }
+
+    if text.trim().is_empty() && attachments.is_empty() {
         return "success".into_response();
     }
 
     let channel_id = format!("wecom:{}:{}", wecom.config.corp_id, msg.from_user);
-    let event = crate::schema::GatewayEvent::new(
+    let mut event = crate::schema::GatewayEvent::new(
         "wecom",
         crate::schema::ChannelInfo {
             id: channel_id,
@@ -830,12 +851,84 @@ pub async fn webhook(
         &msg.msg_id,
         vec![],
     );
+    event.content.attachments = attachments;
 
     if let Ok(json) = serde_json::to_string(&event) {
         let _ = state.event_tx.send(json);
     }
 
     "success".into_response()
+}
+
+const IMAGE_MAX_DOWNLOAD: u64 = 10 * 1024 * 1024;
+const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
+const IMAGE_JPEG_QUALITY: u8 = 75;
+
+async fn download_wecom_image(
+    client: &reqwest::Client,
+    pic_url: &str,
+) -> Option<crate::schema::Attachment> {
+    let resp = match client.get(pic_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "wecom image download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "wecom image download failed");
+        return None;
+    }
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > IMAGE_MAX_DOWNLOAD {
+                warn!(size, "wecom image exceeds 10MB limit, skipping");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
+        warn!(size = bytes.len(), "wecom image exceeds 10MB limit");
+        return None;
+    }
+    let (compressed, mime) = resize_and_compress(&bytes).ok()?;
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    let ext = if mime == "image/gif" { "gif" } else { "jpg" };
+    Some(crate::schema::Attachment {
+        attachment_type: "image".into(),
+        filename: format!("wecom_{}.{}", chrono::Utc::now().timestamp(), ext),
+        mime_type: mime,
+        data,
+        size: compressed.len() as u64,
+    })
+}
+
+fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageError> {
+    use image::ImageReader;
+    use std::io::Cursor;
+
+    let reader = ImageReader::new(Cursor::new(raw)).with_guessed_format()?;
+    let format = reader.format();
+    if format == Some(image::ImageFormat::Gif) {
+        return Ok((raw.to_vec(), "image/gif".to_string()));
+    }
+    let img = reader.decode()?;
+    let (w, h) = (img.width(), img.height());
+    let img = if w > IMAGE_MAX_DIMENSION_PX || h > IMAGE_MAX_DIMENSION_PX {
+        let max_side = std::cmp::max(w, h);
+        let ratio = f64::from(IMAGE_MAX_DIMENSION_PX) / f64::from(max_side);
+        let new_w = (f64::from(w) * ratio) as u32;
+        let new_h = (f64::from(h) * ratio) as u32;
+        img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let mut buf = Cursor::new(Vec::new());
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, IMAGE_JPEG_QUALITY);
+    img.write_with_encoder(encoder)?;
+    Ok((buf.into_inner(), "image/jpeg".to_string()))
 }
 
 #[cfg(test)]
@@ -1081,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn full_webhook_non_text_skipped() {
+    fn parse_image_message() {
         let encoding_aes_key = "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE";
         let corp_id = "ww_test_corp";
 
@@ -1091,7 +1184,16 @@ mod tests {
         let decrypted = decrypt_message(encoding_aes_key, &encrypted, corp_id).unwrap();
         let msg = parse_message_xml(&decrypted).unwrap();
         assert_eq!(msg.msg_type, "image");
-        // In the real handler, this would return "success" without broadcasting
+        assert_eq!(msg.pic_url, "http://example.com/pic.jpg");
+        assert_eq!(msg.from_user, "user42");
+    }
+
+    #[test]
+    fn unsupported_msg_type_skipped() {
+        let xml = "<xml><ToUserName><![CDATA[ww_test_corp]]></ToUserName><FromUserName><![CDATA[user42]]></FromUserName><CreateTime>1348831860</CreateTime><MsgType><![CDATA[voice]]></MsgType><MsgId>7777</MsgId><AgentID>1000002</AgentID></xml>";
+        let msg = parse_message_xml(xml).unwrap();
+        assert_eq!(msg.msg_type, "voice");
+        assert!(!matches!(msg.msg_type.as_str(), "text" | "image"));
     }
 
     #[test]
