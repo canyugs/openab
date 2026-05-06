@@ -4,7 +4,8 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -24,6 +25,44 @@ const MEDIA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const TEXT_FILE_COUNT_CAP: usize = 5;
 /// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
 const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
+/// Default per-space cap on consecutive bot turns without a human message
+/// (matches feishu adapter). A human message resets the counter.
+const DEFAULT_MAX_BOT_TURNS: u32 = 20;
+
+/// Bot-to-bot message policy. Mirrors the pattern from Discord (PR #321) and
+/// the feishu adapter. `Mentions` and `All` behave identically in Google Chat
+/// because the platform pre-filters: in a Space, every message must @mention
+/// the receiving bot to be delivered, and bots cannot DM other bots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowBots {
+    /// Drop all messages from bot senders (default — no behavior change).
+    Off,
+    /// Equivalent to `All` in Google Chat (platform already enforces @mention).
+    Mentions,
+    /// Process bot messages, subject to `trusted_bot_ids` and turn cap.
+    All,
+}
+
+/// Bot-to-bot policy applied at adapter level. `is_bot: true` events still
+/// get dropped at the core (`src/gateway.rs`), so this code is effectively
+/// dead until that guard becomes adapter-aware. Mirrors the same situation
+/// as the feishu adapter.
+#[derive(Debug, Clone)]
+pub struct GoogleChatBotPolicy {
+    pub allow_bots: AllowBots,
+    pub trusted_bot_ids: Vec<String>,
+    pub max_bot_turns: u32,
+}
+
+impl Default for GoogleChatBotPolicy {
+    fn default() -> Self {
+        Self {
+            allow_bots: AllowBots::Off,
+            trusted_bot_ids: Vec::new(),
+            max_bot_turns: DEFAULT_MAX_BOT_TURNS,
+        }
+    }
+}
 
 // --- Google Chat types (v2 envelope format) ---
 
@@ -252,6 +291,11 @@ pub struct GoogleChatAdapter {
     pub jwt_verifier: Option<GoogleChatJwtVerifier>,
     pub client: reqwest::Client,
     pub api_base: String,
+    pub bot_policy: GoogleChatBotPolicy,
+    /// Per-space consecutive-bot-turn counter. Reset to 0 on any human message
+    /// in that space; incremented on each bot message. Caps `allow_bots = All`
+    /// from running away (mirrors feishu's `bot_turns`).
+    pub bot_turn_counts: StdMutex<HashMap<String, u32>>,
 }
 
 impl GoogleChatAdapter {
@@ -266,7 +310,14 @@ impl GoogleChatAdapter {
             jwt_verifier,
             client: reqwest::Client::new(),
             api_base: GOOGLE_CHAT_API_BASE.into(),
+            bot_policy: GoogleChatBotPolicy::default(),
+            bot_turn_counts: StdMutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_bot_policy(mut self, policy: GoogleChatBotPolicy) -> Self {
+        self.bot_policy = policy;
+        self
     }
 
     async fn get_token(&self) -> Option<String> {
@@ -444,6 +495,46 @@ impl GoogleChatAdapter {
     }
 }
 
+// --- Bot-to-bot policy helpers ---
+
+/// Returns true if the message should pass the bot policy gate. Human
+/// senders always pass. Bots pass only when `AllowBots` permits and
+/// `trusted_bot_ids` is either empty or contains the sender's resource name.
+fn bot_allowed_by_policy(is_bot: bool, sender_id: &str, policy: &GoogleChatBotPolicy) -> bool {
+    if !is_bot {
+        return true;
+    }
+    match policy.allow_bots {
+        AllowBots::Off => false,
+        AllowBots::Mentions | AllowBots::All => {
+            policy.trusted_bot_ids.is_empty()
+                || policy.trusted_bot_ids.iter().any(|id| id == sender_id)
+        }
+    }
+}
+
+/// Per-space consecutive-bot-turn cap. Bot messages increment the counter;
+/// human messages reset it. Returns true if the message should pass, false
+/// if the cap has been exceeded (runaway-loop guard).
+fn register_turn(
+    space: &str,
+    is_bot: bool,
+    counts: &StdMutex<HashMap<String, u32>>,
+    max_turns: u32,
+) -> bool {
+    let mut guard = counts.lock().unwrap_or_else(|e| e.into_inner());
+    if is_bot {
+        let count = guard.entry(space.to_string()).or_insert(0);
+        *count += 1;
+        if *count > max_turns {
+            return false;
+        }
+    } else {
+        guard.remove(space);
+    }
+    true
+}
+
 // --- Webhook handler ---
 
 pub async fn webhook(
@@ -509,11 +600,36 @@ pub async fn webhook(
     let space = msg.space.as_ref().or(payload.space.as_ref());
 
     let is_bot = sender.map(|s| s.user_type == "BOT").unwrap_or(false);
-    if is_bot {
+    let sender_id = sender.map(|s| s.name.clone()).unwrap_or_default();
+    let space_name = space.map(|s| s.name.clone()).unwrap_or_default();
+
+    // Bot-to-bot policy gate (mirrors the feishu adapter and Discord PR #321).
+    // The is_bot flag is propagated to core, but `src/gateway.rs` currently
+    // drops all is_bot events from gateway adapters (TODO at line 577 there).
+    // Until that guard is lifted, bot-to-bot in Google Chat is gated here but
+    // still blocked at the core — same situation as feishu.
+    if let Some(ref adapter) = state.google_chat {
+        if !bot_allowed_by_policy(is_bot, &sender_id, &adapter.bot_policy) {
+            return empty_json_response();
+        }
+        if !register_turn(
+            &space_name,
+            is_bot,
+            &adapter.bot_turn_counts,
+            adapter.bot_policy.max_bot_turns,
+        ) {
+            warn!(
+                space = %space_name,
+                max = adapter.bot_policy.max_bot_turns,
+                "googlechat: bot turn cap reached, dropping message"
+            );
+            return empty_json_response();
+        }
+    } else if is_bot {
+        // Adapter not configured but webhook still wired — preserve old behavior.
         return empty_json_response();
     }
 
-    let sender_id = sender.map(|s| s.name.clone()).unwrap_or_default();
     let display_name = sender
         .map(|s| s.display_name.clone())
         .unwrap_or_else(|| "Unknown".into());
@@ -522,7 +638,7 @@ pub async fn webhook(
         .unwrap_or(&sender_id)
         .to_string();
 
-    let space_name = space.map(|s| s.name.clone()).unwrap_or_default();
+
     let space_type = space
         .and_then(|s| s.space_type.clone())
         .unwrap_or_else(|| "ROOM".into());
@@ -549,6 +665,7 @@ pub async fn webhook(
             &text,
             &message_id,
             Vec::new(),
+            is_bot,
         );
         return empty_json_response();
     }
@@ -664,6 +781,7 @@ pub async fn webhook(
             &text,
             &message_id,
             downloaded,
+            is_bot,
         );
     });
 
@@ -682,6 +800,7 @@ fn send_googlechat_event(
     text: &str,
     message_id: &str,
     attachments: Vec<crate::schema::Attachment>,
+    is_bot: bool,
 ) {
     let mut gw_event = GatewayEvent::new(
         "googlechat",
@@ -694,7 +813,7 @@ fn send_googlechat_event(
             id: sender_id.to_string(),
             name: sender_name.to_string(),
             display_name: display_name.to_string(),
-            is_bot: false,
+            is_bot,
         },
         text,
         message_id,
@@ -1692,6 +1811,108 @@ mod tests {
             .or(chat.user.as_ref());
         let is_bot = sender.map(|s| s.user_type == "BOT").unwrap_or(false);
         assert!(!is_bot);
+    }
+
+    // --- bot policy tests ---
+
+    #[test]
+    fn policy_off_drops_bot() {
+        let policy = GoogleChatBotPolicy::default();
+        assert!(!bot_allowed_by_policy(true, "users/100", &policy));
+    }
+
+    #[test]
+    fn policy_off_passes_human() {
+        let policy = GoogleChatBotPolicy::default();
+        assert!(bot_allowed_by_policy(false, "users/100", &policy));
+    }
+
+    #[test]
+    fn policy_all_passes_bot_when_no_whitelist() {
+        let policy = GoogleChatBotPolicy {
+            allow_bots: AllowBots::All,
+            ..Default::default()
+        };
+        assert!(bot_allowed_by_policy(true, "users/100", &policy));
+    }
+
+    #[test]
+    fn policy_mentions_passes_bot_in_googlechat() {
+        // Mentions == All in Google Chat (platform pre-filters @mentions).
+        let policy = GoogleChatBotPolicy {
+            allow_bots: AllowBots::Mentions,
+            ..Default::default()
+        };
+        assert!(bot_allowed_by_policy(true, "users/100", &policy));
+    }
+
+    #[test]
+    fn policy_trusted_list_accepts_listed_bot() {
+        let policy = GoogleChatBotPolicy {
+            allow_bots: AllowBots::All,
+            trusted_bot_ids: vec!["users/100".into(), "users/200".into()],
+            ..Default::default()
+        };
+        assert!(bot_allowed_by_policy(true, "users/100", &policy));
+    }
+
+    #[test]
+    fn policy_trusted_list_rejects_unlisted_bot() {
+        let policy = GoogleChatBotPolicy {
+            allow_bots: AllowBots::All,
+            trusted_bot_ids: vec!["users/200".into()],
+            ..Default::default()
+        };
+        assert!(!bot_allowed_by_policy(true, "users/100", &policy));
+    }
+
+    // --- turn counter tests ---
+
+    #[test]
+    fn turn_human_passes_and_resets_counter() {
+        let counts = StdMutex::new(HashMap::new());
+        counts.lock().unwrap().insert("spaces/AA".into(), 5);
+        assert!(register_turn("spaces/AA", false, &counts, 20));
+        assert!(counts.lock().unwrap().get("spaces/AA").is_none());
+    }
+
+    #[test]
+    fn turn_bot_increments_under_cap() {
+        let counts = StdMutex::new(HashMap::new());
+        for _ in 0..20 {
+            assert!(register_turn("spaces/AA", true, &counts, 20));
+        }
+        assert_eq!(*counts.lock().unwrap().get("spaces/AA").unwrap(), 20);
+    }
+
+    #[test]
+    fn turn_bot_drops_when_exceeds_cap() {
+        let counts = StdMutex::new(HashMap::new());
+        for _ in 0..20 {
+            register_turn("spaces/AA", true, &counts, 20);
+        }
+        assert!(!register_turn("spaces/AA", true, &counts, 20));
+    }
+
+    #[test]
+    fn turn_human_after_cap_resets_then_bot_resumes() {
+        let counts = StdMutex::new(HashMap::new());
+        for _ in 0..21 {
+            register_turn("spaces/AA", true, &counts, 20);
+        }
+        assert!(register_turn("spaces/AA", false, &counts, 20));
+        assert!(register_turn("spaces/AA", true, &counts, 20));
+        assert_eq!(*counts.lock().unwrap().get("spaces/AA").unwrap(), 1);
+    }
+
+    #[test]
+    fn turn_per_space_independent() {
+        let counts = StdMutex::new(HashMap::new());
+        register_turn("spaces/AA", true, &counts, 20);
+        register_turn("spaces/AA", true, &counts, 20);
+        register_turn("spaces/BB", true, &counts, 20);
+        assert_eq!(*counts.lock().unwrap().get("spaces/AA").unwrap(), 2);
+        assert_eq!(*counts.lock().unwrap().get("spaces/BB").unwrap(), 1);
     }
 
     // --- markdown_to_gchat tests ---

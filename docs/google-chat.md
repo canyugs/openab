@@ -155,6 +155,21 @@ working_dir = "/home/agent"
 - **Outbound attachments** — bot cannot send image/file attachments back to the user yet
 - **Drive-linked attachments** — only `UPLOADED_CONTENT` source is handled; `DRIVE_FILE` source skipped
 
+### Bot-to-bot multi-agent (gateway-side, currently no-op)
+
+The adapter implements the same bot-to-bot policy pattern as the feishu adapter and Discord (PR #321): `GOOGLE_CHAT_ALLOW_BOTS` plus `GOOGLE_CHAT_TRUSTED_BOT_IDS`, with a per-Space turn cap. **This is currently dead code** — `src/gateway.rs` drops every gateway-adapter event with `is_bot: true` (TODO at line 577). When the core guard becomes adapter-aware, Google Chat (and feishu) will start delivering bot-to-bot events without further adapter changes.
+
+When wired up, the model mirrors Discord:
+
+- Bot A wants to @mention Bot B → write the raw resource name in the reply text:
+  ```
+  <users/12345678> please review the diff
+  ```
+  Google Chat displays "@AgentB please review the diff" and delivers the event to Bot B. Same shape as Discord's `<@USER_ID>` — the platform does **not** auto-resolve display names for bots.
+- Bot B's agent learns Bot A's resource name from the inbound event's `sender.id` (e.g. `users/87654321`) and uses that for outbound mentions. Pre-seeding the agent with known bot IDs in its system prompt is the operational pattern.
+- `argument_text` strips the leading @mention; the raw `text` field preserves all `<users/...>` tokens, so the agent can see who else was @mentioned in multi-target messages.
+- Why `Mentions` and `All` behave the same in Google Chat: in a Space the platform requires every message to @mention the receiving bot, and bots cannot DM other bots. There is no path through which a bot can deliver a non-mention message to another bot.
+
 ## Environment Variables (Gateway)
 
 | Variable | Required | Default | Description |
@@ -165,6 +180,9 @@ working_dir = "/home/agent"
 | `GOOGLE_CHAT_SA_KEY_FILE` | No | — | Path to service account key JSON file (alternative to `SA_KEY_JSON`) |
 | `GOOGLE_CHAT_ACCESS_TOKEN` | No | — | Static OAuth2 access token (fallback, expires in 1 hour) |
 | `GOOGLE_CHAT_WEBHOOK_PATH` | No | `/webhook/googlechat` | Webhook endpoint path |
+| `GOOGLE_CHAT_ALLOW_BOTS` | No | `off` | Bot-to-bot policy: `off` / `mentions` / `all`. `mentions` and `all` behave identically in Google Chat (platform pre-filters @mentions). |
+| `GOOGLE_CHAT_TRUSTED_BOT_IDS` | No | — | CSV of trusted bot resource names (e.g. `users/12345678,users/87654321`). When non-empty, only listed bots pass when `ALLOW_BOTS` is not `off`. |
+| `GOOGLE_CHAT_MAX_BOT_TURNS` | No | `20` | Per-Space cap on consecutive bot turns; reset to 0 by any human message. Runaway-loop safety net. |
 
 ## Security: Webhook Verification
 

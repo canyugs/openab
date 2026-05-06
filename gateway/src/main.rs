@@ -309,7 +309,35 @@ async fn main() -> Result<()> {
             warn!("GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)");
         }
 
-        Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier))
+        let allow_bots = match std::env::var("GOOGLE_CHAT_ALLOW_BOTS")
+            .unwrap_or_else(|_| "off".into())
+            .to_lowercase()
+            .as_str()
+        {
+            "mentions" => adapters::googlechat::AllowBots::Mentions,
+            "all" => adapters::googlechat::AllowBots::All,
+            _ => adapters::googlechat::AllowBots::Off,
+        };
+        let trusted_bot_ids: Vec<String> = std::env::var("GOOGLE_CHAT_TRUSTED_BOT_IDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let max_bot_turns = std::env::var("GOOGLE_CHAT_MAX_BOT_TURNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20u32);
+        let bot_policy = adapters::googlechat::GoogleChatBotPolicy {
+            allow_bots,
+            trusted_bot_ids,
+            max_bot_turns,
+        };
+
+        Some(
+            adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier)
+                .with_bot_policy(bot_policy),
+        )
     } else {
         None
     };
