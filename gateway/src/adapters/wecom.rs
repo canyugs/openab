@@ -555,6 +555,8 @@ struct WecomMessage {
     content: String,
     msg_id: String,
     pic_url: String,
+    media_id: String,
+    file_name: String,
 }
 
 fn parse_envelope_xml(xml: &str) -> Result<CallbackEnvelope> {
@@ -623,6 +625,8 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
     let mut content = String::new();
     let mut msg_id = String::new();
     let mut pic_url = String::new();
+    let mut media_id = String::new();
+    let mut file_name = String::new();
     let mut current_tag = String::new();
 
     loop {
@@ -638,6 +642,8 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
                     "Content" => content = text,
                     "MsgId" => msg_id = text,
                     "PicUrl" => pic_url = text,
+                    "MediaId" => media_id = text,
+                    "FileName" => file_name = text,
                     _ => {}
                 }
             }
@@ -669,6 +675,16 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
                             pic_url = text;
                         }
                     }
+                    "MediaId" => {
+                        if media_id.is_empty() {
+                            media_id = text;
+                        }
+                    }
+                    "FileName" => {
+                        if file_name.is_empty() {
+                            file_name = text;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -687,6 +703,8 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
         content,
         msg_id,
         pic_url,
+        media_id,
+        file_name,
     })
 }
 
@@ -881,7 +899,7 @@ pub async fn webhook(
         "wecom: parsed message"
     );
 
-    if !matches!(msg.msg_type.as_str(), "text" | "image") {
+    if !matches!(msg.msg_type.as_str(), "text" | "image" | "file") {
         return "success".into_response();
     }
 
@@ -889,16 +907,17 @@ pub async fn webhook(
         return "success".into_response();
     }
 
-    let text = if msg.msg_type == "text" {
-        if wecom.config.group_require_mention {
-            strip_bot_mention(&msg.content)
-        } else {
-            msg.content.clone()
+    let text = match msg.msg_type.as_str() {
+        "text" => {
+            if wecom.config.group_require_mention {
+                strip_bot_mention(&msg.content)
+            } else {
+                msg.content.clone()
+            }
         }
-    } else if msg.msg_type == "image" {
-        "Describe this image.".to_string()
-    } else {
-        String::new()
+        "image" => "Describe this image.".to_string(),
+        "file" => format!("User sent a file: {}", msg.file_name),
+        _ => String::new(),
     };
 
     let mut attachments = Vec::new();
@@ -906,6 +925,20 @@ pub async fn webhook(
         match download_wecom_image(&wecom.client, &msg.pic_url).await {
             Some(att) => attachments.push(att),
             None => info!("wecom: image download failed, forwarding without attachment"),
+        }
+    }
+    if msg.msg_type == "file" && !msg.media_id.is_empty() {
+        let token = wecom.token_cache.get_token(
+            &wecom.client, &wecom.config.corp_id, &wecom.config.secret
+        ).await;
+        if let Ok(token) = token {
+            match download_wecom_file(
+                &wecom.client, &wecom.token_cache.base_url, &token,
+                &msg.media_id, &msg.file_name,
+            ).await {
+                Some(att) => attachments.push(att),
+                None => info!("wecom: file download failed, forwarding without attachment"),
+            }
         }
     }
 
@@ -1002,6 +1035,92 @@ async fn download_wecom_image(
         mime_type: mime,
         data,
         size: compressed.len() as u64,
+    })
+}
+
+const FILE_MAX_DOWNLOAD: u64 = 20 * 1024 * 1024;
+
+const TEXT_EXTENSIONS: &[&str] = &[
+    "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
+    "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash", "zsh", "fish",
+    "ps1", "bat", "sql", "html", "css", "scss", "less", "ini", "cfg", "conf", "env",
+    "swift", "kt", "scala", "r", "pl", "lua", "graphql", "tsv",
+];
+
+const TEXT_FILENAMES: &[&str] = &[
+    "dockerfile", "makefile", "justfile", "rakefile", "gemfile",
+    "procfile", "vagrantfile", ".gitignore", ".dockerignore", ".editorconfig",
+];
+
+fn is_text_file(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    if lower.contains('.') {
+        if let Some(ext) = lower.rsplit('.').next() {
+            if TEXT_EXTENSIONS.contains(&ext) {
+                return true;
+            }
+        }
+    }
+    TEXT_FILENAMES.contains(&lower.as_str())
+}
+
+async fn download_wecom_file(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    media_id: &str,
+    filename: &str,
+) -> Option<crate::schema::Attachment> {
+    let url = format!("{base_url}/cgi-bin/media/get?access_token={token}&media_id={media_id}");
+    info!(filename, media_id, "wecom: downloading file");
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "wecom file download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "wecom file download failed");
+        return None;
+    }
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > FILE_MAX_DOWNLOAD {
+                warn!(size, "wecom file exceeds 20MB limit, skipping");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
+        warn!(size = bytes.len(), "wecom file exceeds 20MB limit");
+        return None;
+    }
+
+    if !is_text_file(filename) {
+        info!(filename, "wecom: skipping non-text file");
+        return None;
+    }
+
+    let text_content = match String::from_utf8(bytes.to_vec()) {
+        Ok(s) => s,
+        Err(_) => {
+            info!(filename, "wecom: file is not valid UTF-8, skipping");
+            return None;
+        }
+    };
+
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(text_content.as_bytes());
+    let size = text_content.len() as u64;
+
+    Some(crate::schema::Attachment {
+        attachment_type: "text_file".into(),
+        filename: filename.to_string(),
+        mime_type: "text/plain".into(),
+        data,
+        size,
     })
 }
 
@@ -1226,19 +1345,39 @@ mod tests {
     }
 
     #[test]
-    fn split_text_utf8_safe() {
-        let text = "你好世界"; // 12 bytes (3 bytes per char)
-        let chunks = split_text(text, 6);
+    fn split_text_lines_multi() {
+        let text = "line1\nline2\nline3";
+        let chunks = split_text_lines(text, 11);
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], "你好");
-        assert_eq!(chunks[1], "世界");
+        assert_eq!(chunks[0], "line1\nline2");
+        assert_eq!(chunks[1], "line3");
     }
 
     #[test]
-    fn split_text_within_limit() {
+    fn split_text_lines_within_limit() {
         let text = "short";
-        let chunks = split_text(text, 100);
+        let chunks = split_text_lines(text, 100);
         assert_eq!(chunks, vec!["short"]);
+    }
+
+    #[test]
+    fn is_text_file_check() {
+        assert!(is_text_file("readme.md"));
+        assert!(is_text_file("config.json"));
+        assert!(is_text_file("data.csv"));
+        assert!(is_text_file("MAIN.PY"));
+        assert!(!is_text_file("photo.png"));
+        assert!(!is_text_file("archive.zip"));
+        assert!(!is_text_file("doc.pdf"));
+    }
+
+    #[test]
+    fn parse_file_message() {
+        let xml = r#"<xml><ToUserName><![CDATA[ww_test_corp]]></ToUserName><FromUserName><![CDATA[user42]]></FromUserName><CreateTime>1348831860</CreateTime><MsgType><![CDATA[file]]></MsgType><MediaId><![CDATA[media_abc123]]></MediaId><FileName><![CDATA[report.csv]]></FileName><MsgId>6666</MsgId><AgentID>1000002</AgentID></xml>"#;
+        let msg = parse_message_xml(xml).unwrap();
+        assert_eq!(msg.msg_type, "file");
+        assert_eq!(msg.media_id, "media_abc123");
+        assert_eq!(msg.file_name, "report.csv");
     }
 
     #[test]
