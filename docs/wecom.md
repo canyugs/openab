@@ -47,8 +47,6 @@ Set the following environment variables:
 | `WECOM_WEBHOOK_PATH` | No | Webhook path (default: `/webhook/wecom`) |
 | `WECOM_GROUP_REQUIRE_MENTION` | No | Require @mention in groups (default: `true`) |
 
-### Docker
-
 ```bash
 docker run -d --name openab-gateway \
   -e WECOM_CORP_ID="ww1234567890abcdef" \
@@ -60,52 +58,7 @@ docker run -d --name openab-gateway \
   ghcr.io/openabdev/openab-gateway:latest
 ```
 
-### Kubernetes
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: openab-gateway
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: openab-gateway
-  template:
-    metadata:
-      labels:
-        app: openab-gateway
-    spec:
-      containers:
-        - name: gateway
-          image: ghcr.io/openabdev/openab-gateway:latest
-          ports:
-            - containerPort: 8080
-          env:
-            - name: WECOM_CORP_ID
-              valueFrom:
-                secretKeyRef:
-                  name: openab-gateway
-                  key: wecom-corp-id
-            - name: WECOM_AGENT_ID
-              value: "1000002"
-            - name: WECOM_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: openab-gateway
-                  key: wecom-secret
-            - name: WECOM_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: openab-gateway
-                  key: wecom-token
-            - name: WECOM_ENCODING_AES_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: openab-gateway
-                  key: wecom-encoding-aes-key
-```
+For Kubernetes with Helm, see [`charts/openab/values.yaml`](../charts/openab/values.yaml) — set values under `agents.<name>.gateway.wecom`.
 
 ## 4. Verify the Callback URL
 
@@ -182,6 +135,8 @@ Send a direct message to the bot in the WeCom mobile or desktop app:
 The bot will reply directly in the same conversation.
 
 ### Group Chat
+
+> **Note:** Adding an enterprise app bot to a group chat requires the WeCom enterprise to have completed **real-name verification** (实名认证). Without it, the bot can only be used in 1:1 direct messages.
 
 In group chats, @mention the bot to trigger it (when `WECOM_GROUP_REQUIRE_MENTION=true`):
 
