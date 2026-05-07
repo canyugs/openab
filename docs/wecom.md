@@ -199,7 +199,7 @@ Set `WECOM_GROUP_REQUIRE_MENTION=false` to make the bot respond to all messages 
 | Text message receive/reply | ✅ |
 | AES-256-CBC message decryption | ✅ |
 | Message deduplication | ✅ |
-| Auto-split long replies (2048 chars) | ✅ |
+| Auto-split long replies (2048 bytes) | ✅ |
 | Access token auto-refresh | ✅ |
 | Group chat @mention gating | ✅ |
 | Image receive | ✅ |

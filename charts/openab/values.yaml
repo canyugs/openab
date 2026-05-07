@@ -316,7 +316,7 @@ agents:
         secret: ""             # App Secret → WECOM_SECRET (use --set-literal or external secret mgmt)
         token: ""              # Callback verification token → WECOM_TOKEN
         encodingAesKey: ""     # 43-char AES key → WECOM_ENCODING_AES_KEY
-        agentId: ""            # Agent ID → WECOM_AGENT_ID (default: 0)
+        agentId: ""            # Agent ID → WECOM_AGENT_ID (required)
         webhookPath: ""        # Gateway default: /webhook/wecom → WECOM_WEBHOOK_PATH
     # Scheduled messages — config-driven cron (ADR: basic-cronjob)
     # Each entry sends a message to the agent at the specified schedule.

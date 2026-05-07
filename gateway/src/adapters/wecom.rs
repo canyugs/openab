@@ -21,6 +21,10 @@ impl WecomConfig {
         let token = std::env::var("WECOM_TOKEN").ok()?;
         let encoding_aes_key = std::env::var("WECOM_ENCODING_AES_KEY").ok()?;
         let agent_id = std::env::var("WECOM_AGENT_ID").ok()?;
+        if agent_id.parse::<u64>().is_err() {
+            warn!("WECOM_AGENT_ID must be a numeric value, got '{}'", agent_id);
+            return None;
+        }
         let webhook_path =
             std::env::var("WECOM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/wecom".into());
         let group_require_mention = std::env::var("WECOM_GROUP_REQUIRE_MENTION")
@@ -120,7 +124,11 @@ fn decrypt_message(
     if pad_byte == 0 || pad_byte > 32 || pad_byte > plaintext.len() {
         anyhow::bail!("invalid wecom padding value: {pad_byte}");
     }
-    let plaintext = &plaintext[..plaintext.len() - pad_byte];
+    let pad_start = plaintext.len() - pad_byte;
+    if !plaintext[pad_start..].iter().all(|&b| b as usize == pad_byte) {
+        anyhow::bail!("invalid PKCS#7 padding: not all padding bytes match");
+    }
+    let plaintext = &plaintext[..pad_start];
 
     // Plaintext structure: random(16) + msg_len(4, big-endian) + msg + corp_id
     if plaintext.len() < 20 {
@@ -484,7 +492,7 @@ impl WecomAdapter {
             .get_token(&self.client, &self.config.corp_id, &self.config.secret)
             .await?;
 
-        let agent_id = self.config.agent_id.parse::<u64>().unwrap_or(0);
+        let agent_id: u64 = self.config.agent_id.parse().expect("agent_id validated at startup");
         let body = serde_json::json!({
             "touser": to_user,
             "msgtype": "text",
@@ -767,14 +775,14 @@ async fn flush_thinking(
     }
 }
 
-fn strip_bot_mention(content: &str) -> String {
+fn strip_bot_mention(content: &str) -> Option<String> {
     let trimmed = content.trim_start();
     if trimmed.starts_with('@') {
         if let Some(rest) = trimmed.split_once(|c: char| c.is_whitespace()) {
-            return rest.1.to_string();
+            return Some(rest.1.to_string());
         }
     }
-    content.to_string()
+    None
 }
 
 fn split_text_lines(text: &str, limit: usize) -> Vec<String> {
@@ -945,7 +953,10 @@ pub async fn webhook(
     let text = match msg.msg_type.as_str() {
         "text" => {
             if wecom.config.group_require_mention {
-                strip_bot_mention(&msg.content)
+                match strip_bot_mention(&msg.content) {
+                    Some(stripped) => stripped,
+                    None => return "success".into_response(),
+                }
             } else {
                 msg.content.clone()
             }
@@ -1337,9 +1348,9 @@ mod tests {
 
     #[test]
     fn strip_bot_mention_removes_prefix() {
-        assert_eq!(strip_bot_mention("@Bot hello"), "hello");
-        assert_eq!(strip_bot_mention("no mention"), "no mention");
-        assert_eq!(strip_bot_mention("@OnlyMention"), "@OnlyMention");
+        assert_eq!(strip_bot_mention("@Bot hello"), Some("hello".to_string()));
+        assert_eq!(strip_bot_mention("no mention"), None);
+        assert_eq!(strip_bot_mention("@OnlyMention"), None);
     }
 
     #[test]

@@ -184,10 +184,12 @@ spec:
               value: {{ ($cfg.gateway).googleChat.webhookPath | quote }}
             {{- end }}
             {{- end }}
-            {{- $hasWecom := and (($cfg.gateway).wecom).corpId (($cfg.gateway).wecom).secret (($cfg.gateway).wecom).token (($cfg.gateway).wecom).encodingAesKey }}
+            {{- $hasWecom := and (($cfg.gateway).wecom).corpId (($cfg.gateway).wecom).agentId (($cfg.gateway).wecom).secret (($cfg.gateway).wecom).token (($cfg.gateway).wecom).encodingAesKey }}
             {{- if $hasWecom }}
             - name: WECOM_CORP_ID
               value: {{ ($cfg.gateway).wecom.corpId | quote }}
+            - name: WECOM_AGENT_ID
+              value: {{ ($cfg.gateway).wecom.agentId | quote }}
             - name: WECOM_SECRET
               valueFrom:
                 secretKeyRef:
@@ -203,10 +205,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "openab.agentFullname" $d }}
                   key: wecom-encoding-aes-key
-            {{- if (($cfg.gateway).wecom).agentId }}
-            - name: WECOM_AGENT_ID
-              value: {{ ($cfg.gateway).wecom.agentId | quote }}
-            {{- end }}
             {{- if (($cfg.gateway).wecom).webhookPath }}
             - name: WECOM_WEBHOOK_PATH
               value: {{ ($cfg.gateway).wecom.webhookPath | quote }}
