@@ -724,17 +724,27 @@ async fn flush_thinking(
     to_user: &str,
     text: &str,
 ) {
+    info!(thinking_msg_id, text_len = text.len(), "wecom: flush_thinking starting");
+
     // Recall thinking placeholder
     if let Ok(token) = token_cache.get_token(client, corp_id, secret).await {
         let url = format!("{}/cgi-bin/message/recall?access_token={}", token_cache.base_url, token);
         let body = serde_json::json!({ "msgid": thinking_msg_id });
-        let _ = client.post(&url).json(&body).send().await;
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let body_text = resp.text().await.unwrap_or_default();
+                info!(status = %status, body = %body_text, "wecom: recall response");
+            }
+            Err(e) => warn!(error = %e, "wecom: recall request failed"),
+        }
     }
 
     // Send final text
     let aid = agent_id.parse::<u64>().unwrap_or(0);
     let chunks = split_text_lines(text, 2048);
-    for chunk in &chunks {
+    info!(chunk_count = chunks.len(), "wecom: sending final chunks");
+    for (i, chunk) in chunks.iter().enumerate() {
         if let Ok(token) = token_cache.get_token(client, corp_id, secret).await {
             let url = format!("{}/cgi-bin/message/send?access_token={}", token_cache.base_url, token);
             let body = serde_json::json!({
@@ -747,10 +757,11 @@ async fn flush_thinking(
                 Ok(resp) => {
                     if let Ok(val) = resp.json::<serde_json::Value>().await {
                         let msg_id = val["msgid"].as_str().unwrap_or("");
-                        info!(msg_id = %msg_id, "wecom: sent final reply chunk");
+                        let errcode = val["errcode"].as_i64().unwrap_or(-1);
+                        info!(msg_id = %msg_id, errcode, chunk_idx = i, "wecom: sent final reply chunk");
                     }
                 }
-                Err(e) => warn!("wecom flush send failed: {e}"),
+                Err(e) => warn!(error = %e, chunk_idx = i, "wecom flush send failed"),
             }
         }
     }
@@ -773,6 +784,24 @@ fn split_text_lines(text: &str, limit: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
     for line in text.split('\n') {
+        if line.len() > limit {
+            if !current.is_empty() {
+                chunks.push(current);
+                current = String::new();
+            }
+            // Split long line at char boundaries
+            let mut pos = 0;
+            for (i, ch) in line.char_indices() {
+                if i - pos + ch.len_utf8() > limit {
+                    chunks.push(line[pos..i].to_string());
+                    pos = i;
+                }
+            }
+            if pos < line.len() {
+                current = line[pos..].to_string();
+            }
+            continue;
+        }
         let candidate_len = if current.is_empty() {
             line.len()
         } else {
@@ -1364,6 +1393,20 @@ mod tests {
         let text = "short";
         let chunks = split_text_lines(text, 100);
         assert_eq!(chunks, vec!["short"]);
+    }
+
+    #[test]
+    fn split_text_lines_long_line() {
+        let text = "abcdefghij";
+        let chunks = split_text_lines(text, 4);
+        assert_eq!(chunks, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn split_text_lines_long_line_utf8() {
+        let text = "你好世界測試"; // 18 bytes, 6 chars
+        let chunks = split_text_lines(text, 6);
+        assert_eq!(chunks, vec!["你好", "世界", "測試"]);
     }
 
     #[test]
