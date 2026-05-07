@@ -271,34 +271,31 @@ impl WecomTokenCache {
 
 // --- Adapter ---
 
+struct PendingStream {
+    text_watch: tokio::sync::watch::Sender<String>,
+}
+
+type PendingMap = Arc<std::sync::Mutex<std::collections::HashMap<String, PendingStream>>>;
+
 pub struct WecomAdapter {
     pub config: WecomConfig,
-    pub token_cache: WecomTokenCache,
+    pub token_cache: Arc<WecomTokenCache>,
     client: reqwest::Client,
     dedupe: DedupeCache,
-    msg_id_map: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    pending_streams: PendingMap,
 }
 
 impl WecomAdapter {
     pub fn new(config: WecomConfig) -> Self {
         Self {
-            token_cache: WecomTokenCache::new(),
+            token_cache: Arc::new(WecomTokenCache::new()),
             client: reqwest::Client::new(),
             dedupe: DedupeCache::new(),
-            msg_id_map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_streams: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             config,
         }
     }
 
-    fn resolve_msg_id(&self, original_id: &str) -> String {
-        let map = self.msg_id_map.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(original_id).cloned().unwrap_or_else(|| original_id.to_string())
-    }
-
-    fn update_msg_id(&self, original_id: &str, new_id: &str) {
-        let mut map = self.msg_id_map.lock().unwrap_or_else(|e| e.into_inner());
-        map.insert(original_id.to_string(), new_id.to_string());
-    }
 
     pub async fn handle_reply(
         &self,
@@ -312,7 +309,7 @@ impl WecomAdapter {
                     return;
                 }
                 "edit_message" => {
-                    self.handle_edit_message(reply).await;
+                    self.handle_edit_message(reply);
                     return;
                 }
                 _ => {}
@@ -330,6 +327,108 @@ impl WecomAdapter {
             .rsplit(':')
             .next()
             .unwrap_or(&reply.channel.id);
+
+        let has_pending = {
+            let pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
+            pending.contains_key(&reply.channel.id)
+        };
+        let is_streaming_placeholder = reply.request_id.is_some() && !has_pending;
+        if is_streaming_placeholder {
+            info!(to_user = to_user, "wecom: sending thinking placeholder");
+            match self.send_text(to_user, "⏳...").await {
+                Ok(msg_id) => {
+                    let (text_tx, text_rx) = tokio::sync::watch::channel(String::new());
+                    {
+                        let mut pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
+                        pending.insert(reply.channel.id.clone(), PendingStream {
+                            text_watch: text_tx,
+                        });
+                    }
+                    let client = self.client.clone();
+                    let token_cache = self.token_cache.clone();
+                    let corp_id = self.config.corp_id.clone();
+                    let secret = self.config.secret.clone();
+                    let agent_id = self.config.agent_id.clone();
+                    let thinking_id = msg_id.clone();
+                    let flush_to_user = to_user.to_string();
+                    let channel_id_clone = reply.channel.id.clone();
+                    let pending_clone = self.pending_streams.clone();
+                    tokio::spawn(async move {
+                        let mut rx = text_rx;
+                        let debounce = std::time::Duration::from_secs(3);
+                        let mut last_text = String::new();
+                        loop {
+                            match tokio::time::timeout(debounce, rx.changed()).await {
+                                Ok(Ok(())) => {
+                                    last_text = rx.borrow().clone();
+                                }
+                                Ok(Err(_)) => break,
+                                Err(_) => {
+                                    if !last_text.is_empty() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Clean up pending entry
+                        {
+                            let mut pending = pending_clone.lock().unwrap_or_else(|e| e.into_inner());
+                            pending.remove(&channel_id_clone);
+                        }
+                        if last_text.is_empty() {
+                            return;
+                        }
+                        flush_thinking(
+                            &client, &token_cache, &corp_id, &secret, &agent_id,
+                            &thinking_id, &flush_to_user, &last_text,
+                        ).await;
+                    });
+
+                    if let Some(ref req_id) = reply.request_id {
+                        let resp = crate::schema::GatewayResponse {
+                            schema: "openab.gateway.response.v1".into(),
+                            request_id: req_id.clone(),
+                            success: true,
+                            thread_id: None,
+                            message_id: Some(msg_id),
+                            error: None,
+                        };
+                        if let Ok(json) = serde_json::to_string(&resp) {
+                            let _ = event_tx.send(json);
+                        }
+                    }
+                }
+                Err(e) => warn!("wecom send thinking failed: {e}"),
+            }
+            return;
+        }
+
+        if has_pending {
+            let pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(stream) = pending.get(&reply.channel.id) {
+                let current = stream.text_watch.borrow().clone();
+                let appended = if current.is_empty() {
+                    text.to_string()
+                } else {
+                    format!("{}\n{}", current, text)
+                };
+                let _ = stream.text_watch.send(appended);
+            }
+            if let Some(ref req_id) = reply.request_id {
+                let resp = crate::schema::GatewayResponse {
+                    schema: "openab.gateway.response.v1".into(),
+                    request_id: req_id.clone(),
+                    success: true,
+                    thread_id: None,
+                    message_id: None,
+                    error: None,
+                };
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    let _ = event_tx.send(json);
+                }
+            }
+            return;
+        }
 
         info!(to_user = to_user, "wecom: sending reply");
         let chunks = split_text_lines(text, 2048);
@@ -361,67 +460,17 @@ impl WecomAdapter {
         }
     }
 
-    async fn handle_edit_message(&self, reply: &crate::schema::GatewayReply) {
-        let text = &reply.content.text;
+    fn handle_edit_message(&self, reply: &crate::schema::GatewayReply) {
+        let text = reply.content.text.trim();
         if text.is_empty() {
             return;
         }
-        let to_user = reply
-            .channel
-            .id
-            .rsplit(':')
-            .next()
-            .unwrap_or(&reply.channel.id);
-
-        let original_id = &reply.reply_to;
-
-        if !original_id.is_empty() {
-            let current_id = self.resolve_msg_id(original_id);
-            if let Err(e) = self.recall_message(&current_id).await {
-                info!(err = %e, msg_id = %current_id, "wecom: recall failed (may already be recalled)");
-            }
-        }
-
-        let clean = text.trim();
-        if clean.is_empty() {
-            return;
-        }
-        let parts = split_text_lines(clean, 2048);
-
-        for part in &parts {
-            match self.send_text(to_user, part).await {
-                Ok(new_id) => {
-                    if !original_id.is_empty() && !new_id.is_empty() {
-                        self.update_msg_id(original_id, &new_id);
-                    }
-                    info!(new_msg_id = %new_id, "wecom: edit via recall+resend ok");
-                }
-                Err(e) => warn!("wecom edit resend failed: {e}"),
-            }
+        let pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(stream) = pending.get(&reply.channel.id) {
+            let _ = stream.text_watch.send(text.to_string());
         }
     }
 
-    async fn recall_message(&self, msg_id: &str) -> Result<()> {
-        let token = self
-            .token_cache
-            .get_token(&self.client, &self.config.corp_id, &self.config.secret)
-            .await?;
-        let url = format!(
-            "{}/cgi-bin/message/recall?access_token={}",
-            self.token_cache.base_url, token
-        );
-        let body = serde_json::json!({ "msgid": msg_id });
-        let resp: serde_json::Value = self.client.post(&url).json(&body).send().await?.json().await?;
-        let errcode = resp["errcode"].as_i64().unwrap_or(-1);
-        if errcode != 0 {
-            anyhow::bail!(
-                "recall failed: errcode={}, errmsg={}",
-                errcode,
-                resp["errmsg"]
-            );
-        }
-        Ok(())
-    }
 
     async fn send_text(&self, to_user: &str, text: &str) -> Result<String> {
         let token = self
@@ -641,6 +690,48 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
     })
 }
 
+async fn flush_thinking(
+    client: &reqwest::Client,
+    token_cache: &WecomTokenCache,
+    corp_id: &str,
+    secret: &str,
+    agent_id: &str,
+    thinking_msg_id: &str,
+    to_user: &str,
+    text: &str,
+) {
+    // Recall thinking placeholder
+    if let Ok(token) = token_cache.get_token(client, corp_id, secret).await {
+        let url = format!("{}/cgi-bin/message/recall?access_token={}", token_cache.base_url, token);
+        let body = serde_json::json!({ "msgid": thinking_msg_id });
+        let _ = client.post(&url).json(&body).send().await;
+    }
+
+    // Send final text
+    let aid = agent_id.parse::<u64>().unwrap_or(0);
+    let chunks = split_text_lines(text, 2048);
+    for chunk in &chunks {
+        if let Ok(token) = token_cache.get_token(client, corp_id, secret).await {
+            let url = format!("{}/cgi-bin/message/send?access_token={}", token_cache.base_url, token);
+            let body = serde_json::json!({
+                "touser": to_user,
+                "msgtype": "text",
+                "agentid": aid,
+                "text": { "content": chunk }
+            });
+            match client.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    if let Ok(val) = resp.json::<serde_json::Value>().await {
+                        let msg_id = val["msgid"].as_str().unwrap_or("");
+                        info!(msg_id = %msg_id, "wecom: sent final reply chunk");
+                    }
+                }
+                Err(e) => warn!("wecom flush send failed: {e}"),
+            }
+        }
+    }
+}
+
 fn strip_bot_mention(content: &str) -> String {
     let trimmed = content.trim_start();
     if trimmed.starts_with('@') {
@@ -649,26 +740,6 @@ fn strip_bot_mention(content: &str) -> String {
         }
     }
     content.to_string()
-}
-
-fn split_text(text: &str, limit: usize) -> Vec<&str> {
-    if text.len() <= limit {
-        return vec![text];
-    }
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    while start < text.len() {
-        let mut end = (start + limit).min(text.len());
-        while end > start && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == start {
-            end = start + 1;
-        }
-        chunks.push(&text[start..end]);
-        start = end;
-    }
-    chunks
 }
 
 fn split_text_lines(text: &str, limit: usize) -> Vec<String> {
@@ -803,6 +874,13 @@ pub async fn webhook(
         }
     };
 
+    info!(
+        msg_type = %msg.msg_type,
+        has_pic_url = !msg.pic_url.is_empty(),
+        msg_id = %msg.msg_id,
+        "wecom: parsed message"
+    );
+
     if !matches!(msg.msg_type.as_str(), "text" | "image") {
         return "success".into_response();
     }
@@ -817,6 +895,8 @@ pub async fn webhook(
         } else {
             msg.content.clone()
         }
+    } else if msg.msg_type == "image" {
+        "Describe this image.".to_string()
     } else {
         String::new()
     };
@@ -853,7 +933,20 @@ pub async fn webhook(
     );
     event.content.attachments = attachments;
 
+    let att_sizes: Vec<usize> = event.content.attachments.iter().map(|a| a.data.len()).collect();
+    info!(
+        attachments = event.content.attachments.len(),
+        text_len = event.content.text.len(),
+        att_data_sizes = ?att_sizes,
+        att_mime = ?event.content.attachments.iter().map(|a| a.mime_type.as_str()).collect::<Vec<_>>(),
+        "wecom: forwarding event to OAB"
+    );
     if let Ok(json) = serde_json::to_string(&event) {
+        info!(
+            json_len = json.len(),
+            has_attachments_in_json = json.contains("\"attachments\""),
+            "wecom: event JSON ready"
+        );
         let _ = state.event_tx.send(json);
     }
 
@@ -868,6 +961,7 @@ async fn download_wecom_image(
     client: &reqwest::Client,
     pic_url: &str,
 ) -> Option<crate::schema::Attachment> {
+    info!(pic_url, "wecom: downloading image");
     let resp = match client.get(pic_url).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -892,7 +986,13 @@ async fn download_wecom_image(
         warn!(size = bytes.len(), "wecom image exceeds 10MB limit");
         return None;
     }
-    let (compressed, mime) = resize_and_compress(&bytes).ok()?;
+    let (compressed, mime) = match resize_and_compress(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "wecom: image resize/compress failed");
+            return None;
+        }
+    };
     use base64::Engine;
     let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
     let ext = if mime == "image/gif" { "gif" } else { "jpg" };
