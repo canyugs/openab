@@ -67,11 +67,11 @@ url = "ws://gateway:8080/ws"
 | `GOOGLE_CHAT_SA_KEY_FILE` | (optional) | Path to service account key JSON file (alternative to `SA_KEY_JSON`) |
 | `GOOGLE_CHAT_ACCESS_TOKEN` | (optional) | Static OAuth2 access token (fallback, expires in 1 hour) |
 | `GOOGLE_CHAT_WEBHOOK_PATH` | `/webhook/googlechat` | Webhook endpoint path |
-| `WECOM_CORP_ID` | (optional) | WeCom Corp ID — enables wecom adapter |
-| `WECOM_AGENT_ID` | (optional) | WeCom App Agent ID |
-| `WECOM_SECRET` | (optional) | WeCom App Secret |
-| `WECOM_TOKEN` | (optional) | Callback verification Token |
-| `WECOM_ENCODING_AES_KEY` | (optional) | Callback EncodingAESKey (43 chars) |
+| `WECOM_CORP_ID` | (required*) | WeCom Corp ID — enables wecom adapter |
+| `WECOM_AGENT_ID` | (required*) | WeCom App Agent ID |
+| `WECOM_SECRET` | (required*) | WeCom App Secret |
+| `WECOM_TOKEN` | (required*) | Callback verification Token |
+| `WECOM_ENCODING_AES_KEY` | (required*) | Callback EncodingAESKey (43 chars) |
 | `WECOM_WEBHOOK_PATH` | `/webhook/wecom` | Webhook endpoint path |
 | `WECOM_GROUP_REQUIRE_MENTION` | `true` | Require @mention in group chats |
 

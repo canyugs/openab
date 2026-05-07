@@ -184,7 +184,7 @@ spec:
               value: {{ ($cfg.gateway).googleChat.webhookPath | quote }}
             {{- end }}
             {{- end }}
-            {{- $hasWecom := and (($cfg.gateway).wecom).corpId (($cfg.gateway).wecom).secret }}
+            {{- $hasWecom := and (($cfg.gateway).wecom).corpId (($cfg.gateway).wecom).secret (($cfg.gateway).wecom).token (($cfg.gateway).wecom).encodingAesKey }}
             {{- if $hasWecom }}
             - name: WECOM_CORP_ID
               value: {{ ($cfg.gateway).wecom.corpId | quote }}

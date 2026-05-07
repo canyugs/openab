@@ -202,9 +202,11 @@ Set `WECOM_GROUP_REQUIRE_MENTION=false` to make the bot respond to all messages 
 | Auto-split long replies (2048 chars) | ✅ |
 | Access token auto-refresh | ✅ |
 | Group chat @mention gating | ✅ |
-| Image/voice/file messages | Planned |
+| Image receive | ✅ |
+| Text file receive | ✅ |
+| Voice/video messages | Planned |
 | Markdown card replies | Planned |
-| Streaming replies | Planned |
+| Streaming replies (thinking placeholder + debounce flush) | ✅ |
 
 ## Troubleshooting
 

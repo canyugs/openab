@@ -341,7 +341,7 @@ async fn main() -> Result<()> {
         && google_chat.is_none()
         && wecom.is_none()
     {
-        warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, TEAMS_APP_ID + TEAMS_APP_SECRET, FEISHU_APP_ID + FEISHU_APP_SECRET, and/or GOOGLE_CHAT_ENABLED=true");
+        warn!("no adapters configured — set TELEGRAM_BOT_TOKEN, LINE_CHANNEL_ACCESS_TOKEN, TEAMS_APP_ID + TEAMS_APP_SECRET, FEISHU_APP_ID + FEISHU_APP_SECRET, GOOGLE_CHAT_ENABLED=true, and/or WECOM_CORP_ID + WECOM_SECRET + WECOM_TOKEN + WECOM_ENCODING_AES_KEY + WECOM_AGENT_ID");
     }
 
     let state = Arc::new(AppState {

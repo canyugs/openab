@@ -20,7 +20,7 @@ impl WecomConfig {
         let secret = std::env::var("WECOM_SECRET").ok()?;
         let token = std::env::var("WECOM_TOKEN").ok()?;
         let encoding_aes_key = std::env::var("WECOM_ENCODING_AES_KEY").ok()?;
-        let agent_id = std::env::var("WECOM_AGENT_ID").unwrap_or_else(|_| "0".into());
+        let agent_id = std::env::var("WECOM_AGENT_ID").ok()?;
         let webhook_path =
             std::env::var("WECOM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/wecom".into());
         let group_require_mention = std::env::var("WECOM_GROUP_REQUIRE_MENTION")
@@ -357,6 +357,8 @@ impl WecomAdapter {
                         let mut rx = text_rx;
                         let debounce = std::time::Duration::from_secs(3);
                         let mut last_text = String::new();
+                        let max_idle = std::time::Duration::from_secs(300);
+                        let started = std::time::Instant::now();
                         loop {
                             match tokio::time::timeout(debounce, rx.changed()).await {
                                 Ok(Ok(())) => {
@@ -365,6 +367,10 @@ impl WecomAdapter {
                                 Ok(Err(_)) => break,
                                 Err(_) => {
                                     if !last_text.is_empty() {
+                                        break;
+                                    }
+                                    if started.elapsed() > max_idle {
+                                        warn!("wecom: debounce task timed out after 5 minutes");
                                         break;
                                     }
                                 }
