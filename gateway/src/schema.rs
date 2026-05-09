@@ -32,7 +32,7 @@ pub struct SenderInfo {
     pub is_bot: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Content {
     #[serde(rename = "type")]
     pub content_type: String,
@@ -41,7 +41,7 @@ pub struct Content {
     pub attachments: Vec<Attachment>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Attachment {
     #[serde(rename = "type")]
     pub attachment_type: String, // "image", "text_file"

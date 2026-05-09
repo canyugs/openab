@@ -11,7 +11,6 @@ pub struct WecomConfig {
     pub token: String,
     pub encoding_aes_key: String,
     pub webhook_path: String,
-    pub group_require_mention: bool,
 }
 
 impl WecomConfig {
@@ -27,9 +26,6 @@ impl WecomConfig {
         }
         let webhook_path =
             std::env::var("WECOM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/wecom".into());
-        let group_require_mention = std::env::var("WECOM_GROUP_REQUIRE_MENTION")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
 
         if encoding_aes_key.len() != 43 {
             warn!("WECOM_ENCODING_AES_KEY must be 43 characters, got {}", encoding_aes_key.len());
@@ -44,7 +40,6 @@ impl WecomConfig {
             token,
             encoding_aes_key,
             webhook_path,
-            group_require_mention,
         })
     }
 }
@@ -57,9 +52,15 @@ fn decode_aes_key(encoding_aes_key: &str) -> anyhow::Result<Vec<u8>> {
         .with_decode_padding_mode(DecodePaddingMode::Indifferent)
         .with_decode_allow_trailing_bits(true);
     let engine = GeneralPurpose::new(&base64::alphabet::STANDARD, config);
-    engine
+    let key = engine
         .decode(&padded)
-        .map_err(|e| anyhow::anyhow!("encoding_aes_key base64 decode failed: {e}"))
+        .map_err(|e| anyhow::anyhow!("encoding_aes_key base64 decode failed: {e}"))?;
+    anyhow::ensure!(
+        key.len() == 32,
+        "encoding_aes_key must decode to 32 bytes, got {}",
+        key.len()
+    );
+    Ok(key)
 }
 
 fn compute_signature(token: &str, timestamp: &str, nonce: &str, encrypt: &str) -> String {
@@ -775,16 +776,6 @@ async fn flush_thinking(
     }
 }
 
-fn strip_bot_mention(content: &str) -> Option<String> {
-    let trimmed = content.trim_start();
-    if trimmed.starts_with('@') {
-        if let Some(rest) = trimmed.split_once(|c: char| c.is_whitespace()) {
-            return Some(rest.1.to_string());
-        }
-    }
-    None
-}
-
 fn split_text_lines(text: &str, limit: usize) -> Vec<String> {
     if text.len() <= limit {
         return vec![text.to_string()];
@@ -951,16 +942,7 @@ pub async fn webhook(
     }
 
     let text = match msg.msg_type.as_str() {
-        "text" => {
-            if wecom.config.group_require_mention {
-                match strip_bot_mention(&msg.content) {
-                    Some(stripped) => stripped,
-                    None => return "success".into_response(),
-                }
-            } else {
-                msg.content.clone()
-            }
-        }
+        "text" => msg.content.clone(),
         "image" => "Describe this image.".to_string(),
         "file" => format!("User sent a file: {}", msg.file_name),
         _ => String::new(),
@@ -1212,7 +1194,6 @@ mod tests {
         assert_eq!(config.corp_id, "ww_test_corp");
         assert_eq!(config.agent_id, "1000002");
         assert_eq!(config.webhook_path, "/webhook/wecom");
-        assert!(config.group_require_mention);
 
         std::env::remove_var("WECOM_CORP_ID");
         std::env::remove_var("WECOM_SECRET");
@@ -1344,13 +1325,6 @@ mod tests {
         let envelope = parse_envelope_xml(xml).unwrap();
         assert_eq!(envelope.to_user_name, "ww_test_corp");
         assert_eq!(envelope.encrypt, "some_encrypted_base64");
-    }
-
-    #[test]
-    fn strip_bot_mention_removes_prefix() {
-        assert_eq!(strip_bot_mention("@Bot hello"), Some("hello".to_string()));
-        assert_eq!(strip_bot_mention("no mention"), None);
-        assert_eq!(strip_bot_mention("@OnlyMention"), None);
     }
 
     #[test]

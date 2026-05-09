@@ -73,7 +73,6 @@ url = "ws://gateway:8080/ws"
 | `WECOM_TOKEN` | (required*) | Callback verification Token |
 | `WECOM_ENCODING_AES_KEY` | (required*) | Callback EncodingAESKey (43 chars) |
 | `WECOM_WEBHOOK_PATH` | `/webhook/wecom` | Webhook endpoint path |
-| `WECOM_GROUP_REQUIRE_MENTION` | `true` | Require @mention in group chats |
 
 ### Endpoints
 

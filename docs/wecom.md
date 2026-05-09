@@ -45,7 +45,6 @@ Set the following environment variables:
 | `WECOM_TOKEN` | Yes | Callback Token (from step 2) |
 | `WECOM_ENCODING_AES_KEY` | Yes | Callback EncodingAESKey (43 characters) |
 | `WECOM_WEBHOOK_PATH` | No | Webhook path (default: `/webhook/wecom`) |
-| `WECOM_GROUP_REQUIRE_MENTION` | No | Require @mention in groups (default: `true`) |
 
 ```bash
 docker run -d --name openab-gateway \
@@ -103,7 +102,7 @@ max_sessions = 10
 
 WeCom requires a publicly accessible HTTPS URL for callbacks.
 
-### Option A: Zeabur (recommended for quick setup)
+### Option A: Zeabur (one-click HTTPS for quick testing)
 
 Deploy the gateway to [Zeabur](https://zeabur.com) — HTTPS is automatically provisioned.
 
@@ -134,17 +133,7 @@ Send a direct message to the bot in the WeCom mobile or desktop app:
 
 The bot will reply directly in the same conversation.
 
-### Group Chat
-
-> **Note:** Adding an enterprise app bot to a group chat requires the WeCom enterprise to have completed **real-name verification** (实名认证). Without it, the bot can only be used in 1:1 direct messages.
-
-In group chats, @mention the bot to trigger it (when `WECOM_GROUP_REQUIRE_MENTION=true`):
-
-```
-@Bot 帮我查一下这个问题
-```
-
-Set `WECOM_GROUP_REQUIRE_MENTION=false` to make the bot respond to all messages in groups.
+> **Note on group chats:** WeCom self-built enterprise apps only deliver **1:1 direct messages** to the callback URL. Group chat messages are not forwarded by this API path; group chat support would require the `appchat` API (not yet implemented). For group chat use cases, see the WeCom AI Bot WebSocket API as a future adapter.
 
 ## Features
 
@@ -156,12 +145,12 @@ Set `WECOM_GROUP_REQUIRE_MENTION=false` to make the bot respond to all messages 
 | Message deduplication | ✅ |
 | Auto-split long replies (2048 bytes) | ✅ |
 | Access token auto-refresh | ✅ |
-| Group chat @mention gating | ✅ |
 | Image receive | ✅ |
 | Text file receive | ✅ |
+| Streaming replies (thinking placeholder + debounce flush) | ✅ |
+| Group chat | ❌ Not supported (callback API limitation) |
 | Voice/video messages | Planned |
 | Markdown card replies | Planned |
-| Streaming replies (thinking placeholder + debounce flush) | ✅ |
 
 ## Troubleshooting
 
