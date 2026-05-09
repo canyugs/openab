@@ -464,30 +464,42 @@ impl WecomAdapter {
         }
 
         if has_pending {
-            let pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(stream) = pending.get(&reply.channel.id) {
-                let current = stream.text_watch.borrow().clone();
-                let appended = if current.is_empty() {
-                    text.to_string()
+            // Re-check under lock: the debounce task may have removed the entry
+            // between our earlier read of `has_pending` and now. If it did,
+            // fall through to the direct-send path so the chunk isn't lost.
+            let appended = {
+                let pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(stream) = pending.get(&reply.channel.id) {
+                    let current = stream.text_watch.borrow().clone();
+                    let combined = if current.is_empty() {
+                        text.to_string()
+                    } else {
+                        format!("{}\n{}", current, text)
+                    };
+                    let _ = stream.text_watch.send(combined);
+                    true
                 } else {
-                    format!("{}\n{}", current, text)
-                };
-                let _ = stream.text_watch.send(appended);
-            }
-            if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: true,
-                    thread_id: None,
-                    message_id: None,
-                    error: None,
-                };
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    let _ = event_tx.send(json);
+                    false
                 }
+            };
+            if appended {
+                if let Some(ref req_id) = reply.request_id {
+                    let resp = crate::schema::GatewayResponse {
+                        schema: "openab.gateway.response.v1".into(),
+                        request_id: req_id.clone(),
+                        success: true,
+                        thread_id: None,
+                        message_id: None,
+                        error: None,
+                    };
+                    if let Ok(json) = serde_json::to_string(&resp) {
+                        let _ = event_tx.send(json);
+                    }
+                }
+                return;
             }
-            return;
+            // Pending entry was already removed (debounce flushed) — fall
+            // through to direct-send below so this chunk still reaches the user.
         }
 
         info!(to_user = to_user, "wecom: sending reply");
@@ -1048,17 +1060,18 @@ pub async fn webhook(
         }
     }
     if msg.msg_type == "file" && !msg.media_id.is_empty() {
-        let token = wecom.token_cache.get_token(
-            &wecom.client, &wecom.config.corp_id, &wecom.config.secret
-        ).await;
-        if let Ok(token) = token {
-            match download_wecom_file(
-                &wecom.client, &wecom.token_cache.base_url, &token,
-                &msg.media_id, &msg.file_name,
-            ).await {
-                Some(att) => attachments.push(att),
-                None => info!("wecom: file download failed, forwarding without attachment"),
-            }
+        match download_wecom_file(
+            &wecom.client,
+            &wecom.token_cache,
+            &wecom.config.corp_id,
+            &wecom.config.secret,
+            &msg.media_id,
+            &msg.file_name,
+        )
+        .await
+        {
+            Some(att) => attachments.push(att),
+            None => info!("wecom: file download failed, forwarding without attachment"),
         }
     }
 
@@ -1191,16 +1204,57 @@ fn is_text_file(filename: &str) -> bool {
     TEXT_FILENAMES.contains(&lower.as_str())
 }
 
+/// GET /cgi-bin/media/get with token-expiry retry. The media API returns
+/// JSON `{"errcode":42001,...}` instead of binary when the token is stale,
+/// so we sniff Content-Type and retry once with a force-refreshed token.
+async fn fetch_media_with_retry(
+    client: &reqwest::Client,
+    token_cache: &WecomTokenCache,
+    corp_id: &str,
+    secret: &str,
+    media_id: &str,
+) -> Result<reqwest::Response> {
+    let token = token_cache.get_token(client, corp_id, secret).await?;
+    let url = format!(
+        "{}/cgi-bin/media/get?access_token={}&media_id={}",
+        token_cache.base_url, token, media_id
+    );
+    let resp = client.get(&url).send().await?;
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !content_type.contains("json") {
+        return Ok(resp);
+    }
+    // JSON body means error path. Inspect for 42001 and retry once.
+    let body = resp.text().await.unwrap_or_default();
+    let val: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let errcode = val["errcode"].as_i64().unwrap_or(-1);
+    if errcode == 42001 {
+        warn!("wecom media: access_token expired, refreshing and retrying");
+        let new_token = token_cache.force_refresh(client, corp_id, secret).await?;
+        let retry_url = format!(
+            "{}/cgi-bin/media/get?access_token={}&media_id={}",
+            token_cache.base_url, new_token, media_id
+        );
+        return Ok(client.get(&retry_url).send().await?);
+    }
+    anyhow::bail!("wecom media error: {body}")
+}
+
 async fn download_wecom_file(
     client: &reqwest::Client,
-    base_url: &str,
-    token: &str,
+    token_cache: &WecomTokenCache,
+    corp_id: &str,
+    secret: &str,
     media_id: &str,
     filename: &str,
 ) -> Option<crate::schema::Attachment> {
-    let url = format!("{base_url}/cgi-bin/media/get?access_token={token}&media_id={media_id}");
     info!(filename, media_id, "wecom: downloading file");
-    let resp = match client.get(&url).send().await {
+    let resp = match fetch_media_with_retry(client, token_cache, corp_id, secret, media_id).await {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "wecom file download failed");
