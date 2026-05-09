@@ -68,6 +68,11 @@ impl WecomConfig {
 fn decode_aes_key(encoding_aes_key: &str) -> anyhow::Result<Vec<u8>> {
     use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
     use base64::Engine;
+    // WeCom's EncodingAESKey is 43 base64 chars without trailing padding.
+    // Append "=" to make it a 44-char standard base64 string before decoding.
+    // Indifferent + allow_trailing_bits accommodate WeCom's non-standard
+    // encoding: the 43rd char's last 2 bits are not part of the output and
+    // must be ignored rather than rejected.
     let padded = format!("{}=", encoding_aes_key);
     let config = GeneralPurposeConfig::new()
         .with_decode_padding_mode(DecodePaddingMode::Indifferent)
