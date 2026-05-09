@@ -168,6 +168,15 @@ Run the gateway behind a reverse proxy or load balancer that enforces rate limit
 
 In addition, restrict the callback URL to WeCom's published IP ranges via the **企业可信IP** (Trusted IP) list in the WeCom Admin Console. This is the most effective control because all legitimate callbacks originate from those ranges.
 
+### Redact `corpsecret` from access logs
+
+WeCom's `gettoken` API mandates `corpsecret` as a query parameter (the protocol does not support a header alternative). The gateway itself does not log this URL, but if the gateway sits behind a reverse proxy with default access logging enabled, the secret will appear in access logs. Configure the proxy to redact query strings on `/cgi-bin/gettoken` outbound calls (or sanitize at log-shipping time).
+
+### Known limitations
+
+- **Streaming task lifetime on shutdown** — the optional streaming mode (`WECOM_STREAMING_ENABLED=true`) spawns one debounce task per in-flight reply. On SIGTERM these tasks are dropped by the tokio runtime; any text buffered but not yet flushed is lost. The agent will typically re-emit on the next interaction. If you need flush-on-shutdown semantics, keep streaming off (default) so each reply is sent synchronously.
+- **DedupeCache eviction is lazy** — entries are TTL-checked on lookup and bulk-evicted only when the cache reaches `DEDUPE_MAX_SIZE` (10K). For low-traffic deployments the HashMap can sit just below the cap with stale entries; max memory is bounded (~500 KB) and the dedup window itself is honored, so this does not affect correctness.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

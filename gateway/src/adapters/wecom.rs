@@ -271,6 +271,11 @@ impl WecomTokenCache {
             }
         }
 
+        // WeCom's gettoken API requires `corpsecret` as a query parameter — the
+        // protocol mandates this, we can't move it to a header. Operators must
+        // configure their reverse proxy / load balancer to redact query strings
+        // on `/cgi-bin/gettoken` paths before logging access logs. We do not log
+        // this URL anywhere from the gateway side.
         let url = format!(
             "{}/cgi-bin/gettoken?corpid={}&corpsecret={}",
             self.base_url, corp_id, secret
@@ -825,6 +830,12 @@ async fn flush_thinking(
     }
 }
 
+/// Split `text` into chunks that each fit within `limit` bytes (WeCom's
+/// `message/send` truncates server-side at 2048 bytes). Splits prefer
+/// newline boundaries; lines that exceed the limit themselves are split at
+/// UTF-8 char boundaries via `char_indices()` so multibyte characters are
+/// never severed mid-codepoint. The `limit` and all `len()` comparisons in
+/// this function are in **bytes**, matching WeCom's server-side check.
 fn split_text_lines(text: &str, limit: usize) -> Vec<String> {
     if text.len() <= limit {
         return vec![text.to_string()];
