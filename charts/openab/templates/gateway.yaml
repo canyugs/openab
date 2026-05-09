@@ -209,6 +209,14 @@ spec:
             - name: WECOM_WEBHOOK_PATH
               value: {{ ($cfg.gateway).wecom.webhookPath | quote }}
             {{- end }}
+            {{- if (($cfg.gateway).wecom).streamingEnabled }}
+            - name: WECOM_STREAMING_ENABLED
+              value: {{ ($cfg.gateway).wecom.streamingEnabled | quote }}
+            {{- end }}
+            {{- if (($cfg.gateway).wecom).debounceSecs }}
+            - name: WECOM_DEBOUNCE_SECS
+              value: {{ ($cfg.gateway).wecom.debounceSecs | quote }}
+            {{- end }}
             {{- end }}
             - name: RUST_LOG
               value: {{ ($cfg.gateway).rustLog | default "info" | quote }}

@@ -425,9 +425,17 @@ impl WecomAdapter {
                         }
                     }
                 }
-                // Clean up pending entry
+                // Acquire pending lock first, then capture any late writes
+                // that landed between the loop break and now. Holding the
+                // lock blocks handle_reply from sending more chunks for this
+                // channel, so this read is the last writeable moment. Then
+                // remove the entry, which drops text_tx and closes the channel.
                 {
                     let mut pending = pending_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    let final_text = rx.borrow().clone();
+                    if !final_text.is_empty() {
+                        last_text = final_text;
+                    }
                     pending.remove(&channel_id_clone);
                 }
                 if last_text.is_empty() {
@@ -937,6 +945,19 @@ pub async fn webhook(
     let timestamp = query.get("timestamp").map(|s| s.as_str()).unwrap_or("");
     let nonce = query.get("nonce").map(|s| s.as_str()).unwrap_or("");
 
+    // Reject stale callbacks. WeCom retries within ~5s, our dedup window is
+    // 30s, so a 5-minute freshness check rejects replays without false-
+    // positives on legitimate retries. The signature itself doesn't bind a
+    // freshness expectation, so without this an attacker who captured a
+    // signed payload could replay it indefinitely.
+    if let Ok(ts) = timestamp.parse::<i64>() {
+        let now = chrono::Utc::now().timestamp();
+        if (now - ts).abs() > 300 {
+            warn!(timestamp_age_secs = now - ts, "wecom webhook: rejecting stale callback");
+            return axum::http::StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
     let body_str = match std::str::from_utf8(&body) {
         Ok(s) => s,
         Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response(),
@@ -1093,6 +1114,13 @@ async fn download_wecom_image(
     client: &reqwest::Client,
     pic_url: &str,
 ) -> Option<crate::schema::Attachment> {
+    // Only fetch over HTTPS. WeCom's CDN serves images over HTTPS; rejecting
+    // non-HTTPS URLs prevents SSRF if the AES key is ever compromised and
+    // an attacker forges a callback with PicUrl pointing at an internal host.
+    if !pic_url.starts_with("https://") {
+        warn!(pic_url, "wecom: rejecting non-HTTPS pic_url");
+        return None;
+    }
     info!(pic_url, "wecom: downloading image");
     let resp = match client.get(pic_url).send().await {
         Ok(r) => r,
