@@ -525,11 +525,6 @@ impl WecomAdapter {
 
 
     async fn send_text(&self, to_user: &str, text: &str) -> Result<String> {
-        let token = self
-            .token_cache
-            .get_token(&self.client, &self.config.corp_id, &self.config.secret)
-            .await?;
-
         let agent_id: u64 = self.config.agent_id.parse().expect("agent_id validated at startup");
         let body = serde_json::json!({
             "touser": to_user,
@@ -538,41 +533,61 @@ impl WecomAdapter {
             "text": { "content": text }
         });
 
-        let resp = self.do_send(&token, &body).await?;
-        let errcode = resp["errcode"].as_i64().unwrap_or(-1);
-
-        if errcode == 42001 {
-            let new_token = self
-                .token_cache
-                .force_refresh(&self.client, &self.config.corp_id, &self.config.secret)
-                .await?;
-            let retry_resp = self.do_send(&new_token, &body).await?;
-            let retry_code = retry_resp["errcode"].as_i64().unwrap_or(-1);
-            if retry_code != 0 {
-                anyhow::bail!("wecom send retry failed: {}", retry_resp["errmsg"]);
-            }
-            Ok(retry_resp["msgid"].as_str().unwrap_or("").to_string())
-        } else if errcode != 0 {
-            anyhow::bail!(
-                "wecom send failed: errcode={}, errmsg={}",
-                errcode,
-                resp["errmsg"]
-            );
-        } else {
-            Ok(resp["msgid"].as_str().unwrap_or("").to_string())
-        }
+        let resp = post_with_token_retry(
+            &self.client,
+            &self.token_cache,
+            &self.config.corp_id,
+            &self.config.secret,
+            "/cgi-bin/message/send",
+            &body,
+        )
+        .await?;
+        Ok(resp["msgid"].as_str().unwrap_or("").to_string())
     }
+}
 
-    async fn do_send(
-        &self,
-        token: &str,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let url = format!(
-            "{}/cgi-bin/message/send?access_token={}",
-            self.token_cache.base_url, token
+/// POST a JSON body to a WeCom API endpoint with automatic token refresh
+/// on errcode 42001 (access_token expired). Used by both `send_text` and
+/// the streaming flush path so a long-running stream can't lose its final
+/// reply if the cached token expires mid-flight.
+async fn post_with_token_retry(
+    client: &reqwest::Client,
+    token_cache: &WecomTokenCache,
+    corp_id: &str,
+    secret: &str,
+    api_path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let token = token_cache.get_token(client, corp_id, secret).await?;
+    let url = format!("{}{}?access_token={}", token_cache.base_url, api_path, token);
+    let resp: serde_json::Value = client.post(&url).json(body).send().await?.json().await?;
+    let errcode = resp["errcode"].as_i64().unwrap_or(-1);
+
+    if errcode == 42001 {
+        warn!(api_path, "wecom: access_token expired, refreshing and retrying");
+        let new_token = token_cache.force_refresh(client, corp_id, secret).await?;
+        let retry_url = format!("{}{}?access_token={}", token_cache.base_url, api_path, new_token);
+        let retry_resp: serde_json::Value =
+            client.post(&retry_url).json(body).send().await?.json().await?;
+        let retry_code = retry_resp["errcode"].as_i64().unwrap_or(-1);
+        if retry_code != 0 {
+            anyhow::bail!(
+                "wecom {} retry failed: errcode={}, errmsg={}",
+                api_path,
+                retry_code,
+                retry_resp["errmsg"]
+            );
+        }
+        Ok(retry_resp)
+    } else if errcode != 0 {
+        anyhow::bail!(
+            "wecom {} failed: errcode={}, errmsg={}",
+            api_path,
+            errcode,
+            resp["errmsg"]
         );
-        Ok(self.client.post(&url).json(body).send().await?.json().await?)
+    } else {
+        Ok(resp)
     }
 }
 
@@ -595,7 +610,6 @@ fn handle_verify_request(
 
 // --- XML parsing ---
 
-#[allow(dead_code)]
 struct CallbackEnvelope {
     to_user_name: String,
     encrypt: String,
@@ -774,43 +788,49 @@ async fn flush_thinking(
 
     // Recall thinking placeholder (only when streaming was enabled)
     if let Some(id) = thinking_msg_id {
-        if let Ok(token) = token_cache.get_token(client, corp_id, secret).await {
-            let url = format!("{}/cgi-bin/message/recall?access_token={}", token_cache.base_url, token);
-            let body = serde_json::json!({ "msgid": id });
-            match client.post(&url).json(&body).send().await {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body_text = resp.text().await.unwrap_or_default();
-                    info!(status = %status, body = %body_text, "wecom: recall response");
-                }
-                Err(e) => warn!(error = %e, "wecom: recall request failed"),
-            }
+        let body = serde_json::json!({ "msgid": id });
+        match post_with_token_retry(
+            client,
+            token_cache,
+            corp_id,
+            secret,
+            "/cgi-bin/message/recall",
+            &body,
+        )
+        .await
+        {
+            Ok(resp) => info!(body = %resp, "wecom: recall response"),
+            Err(e) => warn!(error = %e, "wecom: recall failed"),
         }
     }
 
-    // Send final text
+    // Send final text. Each chunk goes through retry-on-token-expiry so a
+    // long stream that outlives the cached token still delivers its reply.
     let aid = agent_id.parse::<u64>().unwrap_or(0);
     let chunks = split_text_lines(text, 2048);
     info!(chunk_count = chunks.len(), "wecom: sending final chunks");
     for (i, chunk) in chunks.iter().enumerate() {
-        if let Ok(token) = token_cache.get_token(client, corp_id, secret).await {
-            let url = format!("{}/cgi-bin/message/send?access_token={}", token_cache.base_url, token);
-            let body = serde_json::json!({
-                "touser": to_user,
-                "msgtype": "text",
-                "agentid": aid,
-                "text": { "content": chunk }
-            });
-            match client.post(&url).json(&body).send().await {
-                Ok(resp) => {
-                    if let Ok(val) = resp.json::<serde_json::Value>().await {
-                        let msg_id = val["msgid"].as_str().unwrap_or("");
-                        let errcode = val["errcode"].as_i64().unwrap_or(-1);
-                        info!(msg_id = %msg_id, errcode, chunk_idx = i, "wecom: sent final reply chunk");
-                    }
-                }
-                Err(e) => warn!(error = %e, chunk_idx = i, "wecom flush send failed"),
+        let body = serde_json::json!({
+            "touser": to_user,
+            "msgtype": "text",
+            "agentid": aid,
+            "text": { "content": chunk }
+        });
+        match post_with_token_retry(
+            client,
+            token_cache,
+            corp_id,
+            secret,
+            "/cgi-bin/message/send",
+            &body,
+        )
+        .await
+        {
+            Ok(val) => {
+                let msg_id = val["msgid"].as_str().unwrap_or("");
+                info!(msg_id = %msg_id, chunk_idx = i, "wecom: sent final reply chunk");
             }
+            Err(e) => warn!(error = %e, chunk_idx = i, "wecom flush send failed"),
         }
     }
 }
@@ -929,6 +949,18 @@ pub async fn webhook(
             return axum::http::StatusCode::BAD_REQUEST.into_response();
         }
     };
+
+    // ToUserName in the outer envelope must match our configured Corp ID.
+    // The decrypt step also validates the inner Corp ID suffix; checking here
+    // first surfaces misrouted callbacks before we touch crypto.
+    if envelope.to_user_name != wecom.config.corp_id {
+        warn!(
+            envelope_to = %envelope.to_user_name,
+            expected = %wecom.config.corp_id,
+            "wecom webhook: envelope ToUserName mismatch"
+        );
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
 
     if !verify_signature(
         &wecom.config.token,
