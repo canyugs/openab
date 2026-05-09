@@ -73,6 +73,8 @@ url = "ws://gateway:8080/ws"
 | `WECOM_TOKEN` | (required*) | Callback verification Token |
 | `WECOM_ENCODING_AES_KEY` | (required*) | Callback EncodingAESKey (43 chars) |
 | `WECOM_WEBHOOK_PATH` | `/webhook/wecom` | Webhook endpoint path |
+| `WECOM_STREAMING_ENABLED` | `false` | Enable thinking-placeholder + recall streaming (causes brief client flicker) |
+| `WECOM_DEBOUNCE_SECS` | `3` | Debounce quiet-period seconds before flushing buffered streamed text |
 
 ### Endpoints
 

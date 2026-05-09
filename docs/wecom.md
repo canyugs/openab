@@ -45,6 +45,8 @@ Set the following environment variables:
 | `WECOM_TOKEN` | Yes | Callback Token (from step 2) |
 | `WECOM_ENCODING_AES_KEY` | Yes | Callback EncodingAESKey (43 characters) |
 | `WECOM_WEBHOOK_PATH` | No | Webhook path (default: `/webhook/wecom`) |
+| `WECOM_STREAMING_ENABLED` | No | Stream replies via "thinking" placeholder + recall + resend (default: `false`). WeCom has no edit-message API; enabling this causes a brief client flicker during streaming. |
+| `WECOM_DEBOUNCE_SECS` | No | Quiet-period seconds before flushing buffered streamed text (default: `3`) |
 
 ```bash
 docker run -d --name openab-gateway \

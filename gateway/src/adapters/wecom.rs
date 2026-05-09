@@ -11,6 +11,8 @@ pub struct WecomConfig {
     pub token: String,
     pub encoding_aes_key: String,
     pub webhook_path: String,
+    pub streaming_enabled: bool,
+    pub debounce_secs: u64,
 }
 
 impl WecomConfig {
@@ -26,13 +28,30 @@ impl WecomConfig {
         }
         let webhook_path =
             std::env::var("WECOM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/wecom".into());
+        // Streaming opts-in: WeCom callback mode has no edit-message API, so
+        // streaming is implemented via thinking-placeholder + recall + resend,
+        // which causes a brief client flicker. Default off; set to true only if
+        // the UX tradeoff is acceptable.
+        let streaming_enabled = std::env::var("WECOM_STREAMING_ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let debounce_secs = std::env::var("WECOM_DEBOUNCE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3);
 
         if encoding_aes_key.len() != 43 {
             warn!("WECOM_ENCODING_AES_KEY must be 43 characters, got {}", encoding_aes_key.len());
             return None;
         }
 
-        info!(corp_id = %corp_id, agent_id = %agent_id, "wecom adapter configured");
+        info!(
+            corp_id = %corp_id,
+            agent_id = %agent_id,
+            streaming_enabled,
+            debounce_secs,
+            "wecom adapter configured"
+        );
         Some(Self {
             corp_id,
             agent_id,
@@ -40,6 +59,8 @@ impl WecomConfig {
             token,
             encoding_aes_key,
             webhook_path,
+            streaming_enabled,
+            debounce_secs,
         })
     }
 }
@@ -343,77 +364,88 @@ impl WecomAdapter {
         };
         let is_streaming_placeholder = reply.request_id.is_some() && !has_pending;
         if is_streaming_placeholder {
-            info!(to_user = to_user, "wecom: sending thinking placeholder");
-            match self.send_text(to_user, "⏳...").await {
-                Ok(msg_id) => {
-                    let (text_tx, text_rx) = tokio::sync::watch::channel(String::new());
-                    {
-                        let mut pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
-                        pending.insert(reply.channel.id.clone(), PendingStream {
-                            text_watch: text_tx,
-                        });
+            // Optionally send a thinking placeholder. With streaming disabled
+            // (default), buffer chunks silently and send the consolidated text
+            // when the debounce settles — no recall/flicker.
+            let placeholder_id = if self.config.streaming_enabled {
+                info!(to_user = to_user, "wecom: sending thinking placeholder");
+                match self.send_text(to_user, "⏳...").await {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        warn!("wecom send thinking failed: {e}");
+                        return;
                     }
-                    let client = self.client.clone();
-                    let token_cache = self.token_cache.clone();
-                    let corp_id = self.config.corp_id.clone();
-                    let secret = self.config.secret.clone();
-                    let agent_id = self.config.agent_id.clone();
-                    let thinking_id = msg_id.clone();
-                    let flush_to_user = to_user.to_string();
-                    let channel_id_clone = reply.channel.id.clone();
-                    let pending_clone = self.pending_streams.clone();
-                    tokio::spawn(async move {
-                        let mut rx = text_rx;
-                        let debounce = std::time::Duration::from_secs(3);
-                        let mut last_text = String::new();
-                        let max_idle = std::time::Duration::from_secs(300);
-                        let started = std::time::Instant::now();
-                        loop {
-                            match tokio::time::timeout(debounce, rx.changed()).await {
-                                Ok(Ok(())) => {
-                                    last_text = rx.borrow().clone();
-                                }
-                                Ok(Err(_)) => break,
-                                Err(_) => {
-                                    if !last_text.is_empty() {
-                                        break;
-                                    }
-                                    if started.elapsed() > max_idle {
-                                        warn!("wecom: debounce task timed out after 5 minutes");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        // Clean up pending entry
-                        {
-                            let mut pending = pending_clone.lock().unwrap_or_else(|e| e.into_inner());
-                            pending.remove(&channel_id_clone);
-                        }
-                        if last_text.is_empty() {
-                            return;
-                        }
-                        flush_thinking(
-                            &client, &token_cache, &corp_id, &secret, &agent_id,
-                            &thinking_id, &flush_to_user, &last_text,
-                        ).await;
-                    });
+                }
+            } else {
+                None
+            };
 
-                    if let Some(ref req_id) = reply.request_id {
-                        let resp = crate::schema::GatewayResponse {
-                            schema: "openab.gateway.response.v1".into(),
-                            request_id: req_id.clone(),
-                            success: true,
-                            thread_id: None,
-                            message_id: Some(msg_id),
-                            error: None,
-                        };
-                        if let Ok(json) = serde_json::to_string(&resp) {
-                            let _ = event_tx.send(json);
+            let (text_tx, text_rx) = tokio::sync::watch::channel(String::new());
+            {
+                let mut pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
+                pending.insert(reply.channel.id.clone(), PendingStream {
+                    text_watch: text_tx,
+                });
+            }
+            let client = self.client.clone();
+            let token_cache = self.token_cache.clone();
+            let corp_id = self.config.corp_id.clone();
+            let secret = self.config.secret.clone();
+            let agent_id = self.config.agent_id.clone();
+            let thinking_id = placeholder_id.clone();
+            let flush_to_user = to_user.to_string();
+            let channel_id_clone = reply.channel.id.clone();
+            let pending_clone = self.pending_streams.clone();
+            let debounce_secs = self.config.debounce_secs;
+            tokio::spawn(async move {
+                let mut rx = text_rx;
+                let debounce = std::time::Duration::from_secs(debounce_secs);
+                let mut last_text = String::new();
+                let max_idle = std::time::Duration::from_secs(300);
+                let started = std::time::Instant::now();
+                loop {
+                    match tokio::time::timeout(debounce, rx.changed()).await {
+                        Ok(Ok(())) => {
+                            last_text = rx.borrow().clone();
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => {
+                            if !last_text.is_empty() {
+                                break;
+                            }
+                            if started.elapsed() > max_idle {
+                                warn!("wecom: debounce task timed out after 5 minutes");
+                                break;
+                            }
                         }
                     }
                 }
-                Err(e) => warn!("wecom send thinking failed: {e}"),
+                // Clean up pending entry
+                {
+                    let mut pending = pending_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    pending.remove(&channel_id_clone);
+                }
+                if last_text.is_empty() {
+                    return;
+                }
+                flush_thinking(
+                    &client, &token_cache, &corp_id, &secret, &agent_id,
+                    thinking_id.as_deref(), &flush_to_user, &last_text,
+                ).await;
+            });
+
+            if let Some(ref req_id) = reply.request_id {
+                let resp = crate::schema::GatewayResponse {
+                    schema: "openab.gateway.response.v1".into(),
+                    request_id: req_id.clone(),
+                    success: true,
+                    thread_id: None,
+                    message_id: placeholder_id,
+                    error: None,
+                };
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    let _ = event_tx.send(json);
+                }
             }
             return;
         }
@@ -729,23 +761,25 @@ async fn flush_thinking(
     corp_id: &str,
     secret: &str,
     agent_id: &str,
-    thinking_msg_id: &str,
+    thinking_msg_id: Option<&str>,
     to_user: &str,
     text: &str,
 ) {
-    info!(thinking_msg_id, text_len = text.len(), "wecom: flush_thinking starting");
+    info!(?thinking_msg_id, text_len = text.len(), "wecom: flush_thinking starting");
 
-    // Recall thinking placeholder
-    if let Ok(token) = token_cache.get_token(client, corp_id, secret).await {
-        let url = format!("{}/cgi-bin/message/recall?access_token={}", token_cache.base_url, token);
-        let body = serde_json::json!({ "msgid": thinking_msg_id });
-        match client.post(&url).json(&body).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let body_text = resp.text().await.unwrap_or_default();
-                info!(status = %status, body = %body_text, "wecom: recall response");
+    // Recall thinking placeholder (only when streaming was enabled)
+    if let Some(id) = thinking_msg_id {
+        if let Ok(token) = token_cache.get_token(client, corp_id, secret).await {
+            let url = format!("{}/cgi-bin/message/recall?access_token={}", token_cache.base_url, token);
+            let body = serde_json::json!({ "msgid": id });
+            match client.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    info!(status = %status, body = %body_text, "wecom: recall response");
+                }
+                Err(e) => warn!(error = %e, "wecom: recall request failed"),
             }
-            Err(e) => warn!(error = %e, "wecom: recall request failed"),
         }
     }
 
@@ -1194,6 +1228,8 @@ mod tests {
         assert_eq!(config.corp_id, "ww_test_corp");
         assert_eq!(config.agent_id, "1000002");
         assert_eq!(config.webhook_path, "/webhook/wecom");
+        assert!(!config.streaming_enabled, "streaming defaults off");
+        assert_eq!(config.debounce_secs, 3);
 
         std::env::remove_var("WECOM_CORP_ID");
         std::env::remove_var("WECOM_SECRET");
