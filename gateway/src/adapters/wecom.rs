@@ -17,26 +17,31 @@ pub struct WecomConfig {
 
 impl WecomConfig {
     pub fn from_env() -> Option<Self> {
-        let corp_id = std::env::var("WECOM_CORP_ID").ok()?;
-        let secret = std::env::var("WECOM_SECRET").ok()?;
-        let token = std::env::var("WECOM_TOKEN").ok()?;
-        let encoding_aes_key = std::env::var("WECOM_ENCODING_AES_KEY").ok()?;
-        let agent_id = std::env::var("WECOM_AGENT_ID").ok()?;
+        Self::from_reader(|k| std::env::var(k).ok())
+    }
+
+    /// Build config from an arbitrary string reader. Tests use this with a
+    /// HashMap so they don't mutate process-wide environment variables —
+    /// `env::set_var` races other tests under cargo's parallel runner.
+    fn from_reader<F: Fn(&str) -> Option<String>>(read: F) -> Option<Self> {
+        let corp_id = read("WECOM_CORP_ID")?;
+        let secret = read("WECOM_SECRET")?;
+        let token = read("WECOM_TOKEN")?;
+        let encoding_aes_key = read("WECOM_ENCODING_AES_KEY")?;
+        let agent_id = read("WECOM_AGENT_ID")?;
         if agent_id.parse::<u64>().is_err() {
             warn!("WECOM_AGENT_ID must be a numeric value, got '{}'", agent_id);
             return None;
         }
-        let webhook_path =
-            std::env::var("WECOM_WEBHOOK_PATH").unwrap_or_else(|_| "/webhook/wecom".into());
+        let webhook_path = read("WECOM_WEBHOOK_PATH").unwrap_or_else(|| "/webhook/wecom".into());
         // Streaming opts-in: WeCom callback mode has no edit-message API, so
         // streaming is implemented via thinking-placeholder + recall + resend,
         // which causes a brief client flicker. Default off; set to true only if
         // the UX tradeoff is acceptable.
-        let streaming_enabled = std::env::var("WECOM_STREAMING_ENABLED")
+        let streaming_enabled = read("WECOM_STREAMING_ENABLED")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let debounce_secs = std::env::var("WECOM_DEBOUNCE_SECS")
-            .ok()
+        let debounce_secs = read("WECOM_DEBOUNCE_SECS")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(3);
 
@@ -670,16 +675,8 @@ fn parse_envelope_xml(xml: &str) -> Result<CallbackEnvelope> {
             Ok(Event::Text(e)) => {
                 let text = e.unescape().unwrap_or_default().to_string();
                 match current_tag.as_str() {
-                    "ToUserName" => {
-                        if to_user_name.is_empty() {
-                            to_user_name = text;
-                        }
-                    }
-                    "Encrypt" => {
-                        if encrypt.is_empty() {
-                            encrypt = text;
-                        }
-                    }
+                    "ToUserName" if to_user_name.is_empty() => to_user_name = text,
+                    "Encrypt" if encrypt.is_empty() => encrypt = text,
                     _ => {}
                 }
             }
@@ -736,41 +733,13 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
             Ok(Event::Text(e)) => {
                 let text = e.unescape().unwrap_or_default().to_string();
                 match current_tag.as_str() {
-                    "FromUserName" => {
-                        if from_user.is_empty() {
-                            from_user = text;
-                        }
-                    }
-                    "MsgType" => {
-                        if msg_type.is_empty() {
-                            msg_type = text;
-                        }
-                    }
-                    "Content" => {
-                        if content.is_empty() {
-                            content = text;
-                        }
-                    }
-                    "MsgId" => {
-                        if msg_id.is_empty() {
-                            msg_id = text;
-                        }
-                    }
-                    "PicUrl" => {
-                        if pic_url.is_empty() {
-                            pic_url = text;
-                        }
-                    }
-                    "MediaId" => {
-                        if media_id.is_empty() {
-                            media_id = text;
-                        }
-                    }
-                    "FileName" => {
-                        if file_name.is_empty() {
-                            file_name = text;
-                        }
-                    }
+                    "FromUserName" if from_user.is_empty() => from_user = text,
+                    "MsgType" if msg_type.is_empty() => msg_type = text,
+                    "Content" if content.is_empty() => content = text,
+                    "MsgId" if msg_id.is_empty() => msg_id = text,
+                    "PicUrl" if pic_url.is_empty() => pic_url = text,
+                    "MediaId" if media_id.is_empty() => media_id = text,
+                    "FileName" if file_name.is_empty() => file_name = text,
                     _ => {}
                 }
             }
@@ -1335,35 +1304,35 @@ fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageErro
 mod tests {
     use super::*;
 
+    fn make_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
     #[test]
     fn config_from_env_all_present() {
-        std::env::set_var("WECOM_CORP_ID", "ww_test_corp");
-        std::env::set_var("WECOM_SECRET", "test_secret");
-        std::env::set_var("WECOM_TOKEN", "test_token");
-        std::env::set_var("WECOM_ENCODING_AES_KEY", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG");
-        std::env::set_var("WECOM_AGENT_ID", "1000002");
-
-        let config = WecomConfig::from_env().unwrap();
+        let env = make_env(&[
+            ("WECOM_CORP_ID", "ww_test_corp"),
+            ("WECOM_SECRET", "test_secret"),
+            ("WECOM_TOKEN", "test_token"),
+            ("WECOM_ENCODING_AES_KEY", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"),
+            ("WECOM_AGENT_ID", "1000002"),
+        ]);
+        let config = WecomConfig::from_reader(env).unwrap();
         assert_eq!(config.corp_id, "ww_test_corp");
         assert_eq!(config.agent_id, "1000002");
         assert_eq!(config.webhook_path, "/webhook/wecom");
         assert!(!config.streaming_enabled, "streaming defaults off");
         assert_eq!(config.debounce_secs, 3);
-
-        std::env::remove_var("WECOM_CORP_ID");
-        std::env::remove_var("WECOM_SECRET");
-        std::env::remove_var("WECOM_TOKEN");
-        std::env::remove_var("WECOM_ENCODING_AES_KEY");
-        std::env::remove_var("WECOM_AGENT_ID");
     }
 
     #[test]
     fn config_from_env_missing_required() {
-        std::env::remove_var("WECOM_CORP_ID");
-        std::env::remove_var("WECOM_SECRET");
-        std::env::remove_var("WECOM_TOKEN");
-        std::env::remove_var("WECOM_ENCODING_AES_KEY");
-        assert!(WecomConfig::from_env().is_none());
+        let env = make_env(&[]);
+        assert!(WecomConfig::from_reader(env).is_none());
     }
 
     fn encrypt_for_test(encoding_aes_key: &str, msg: &str, corp_id: &str) -> String {

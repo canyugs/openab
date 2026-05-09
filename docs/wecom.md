@@ -46,7 +46,7 @@ Set the following environment variables:
 | `WECOM_ENCODING_AES_KEY` | Yes | Callback EncodingAESKey (43 characters) |
 | `WECOM_WEBHOOK_PATH` | No | Webhook path (default: `/webhook/wecom`) |
 | `WECOM_STREAMING_ENABLED` | No | Stream replies via "thinking" placeholder + recall + resend (default: `false`). WeCom has no edit-message API; enabling this causes a brief client flicker during streaming. |
-| `WECOM_DEBOUNCE_SECS` | No | Quiet-period seconds before flushing buffered streamed text (default: `3`) |
+| `WECOM_DEBOUNCE_SECS` | No | Quiet-period seconds before flushing buffered streamed text (default: `3`, minimum: `1` — `0` is silently ignored by Helm's truthy check and disables the buffer purpose) |
 
 ```bash
 docker run -d --name openab-gateway \
@@ -153,6 +153,20 @@ The bot will reply directly in the same conversation.
 | Group chat | ❌ Not supported (callback API limitation) |
 | Voice/video messages | Planned |
 | Markdown card replies | Planned |
+
+## Production Hardening
+
+The gateway does no application-level rate limiting on `/webhook/wecom`. Each request triggers an XML envelope parse, a SHA1 signature computation, and (if signature passes) AES-256-CBC decryption. A 5-minute timestamp freshness check rejects stale callbacks before any crypto runs, so old replays are cheap to drop, but fresh-but-invalid requests still consume CPU.
+
+Run the gateway behind a reverse proxy or load balancer that enforces rate limits at the IP / connection level:
+
+| Layer | Example |
+|---|---|
+| Edge / CDN | Cloudflare WAF rate limiting rules on `/webhook/wecom` |
+| Cloud LB | AWS ALB rate-based rules, GCP Cloud Armor |
+| Reverse proxy | nginx `limit_req_zone`, Caddy `rate_limit` directive |
+
+In addition, restrict the callback URL to WeCom's published IP ranges via the **企业可信IP** (Trusted IP) list in the WeCom Admin Console. This is the most effective control because all legitimate callbacks originate from those ranges.
 
 ## Troubleshooting
 

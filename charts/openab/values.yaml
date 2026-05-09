@@ -319,7 +319,7 @@ agents:
         agentId: ""            # Agent ID → WECOM_AGENT_ID (required)
         webhookPath: ""        # Gateway default: /webhook/wecom → WECOM_WEBHOOK_PATH
         streamingEnabled: ""   # Enable thinking-placeholder + recall streaming (causes brief client flicker) → WECOM_STREAMING_ENABLED. Default off.
-        debounceSecs: ""       # Debounce quiet-period seconds before flushing streamed text → WECOM_DEBOUNCE_SECS. Default 3.
+        debounceSecs: ""       # Debounce quiet-period seconds before flushing streamed text → WECOM_DEBOUNCE_SECS. Default 3, minimum 1 (0 is treated as unset by Helm).
     # Scheduled messages — config-driven cron (ADR: basic-cronjob)
     # Each entry sends a message to the agent at the specified schedule.
     # Example:
