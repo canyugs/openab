@@ -64,6 +64,8 @@ pub struct GoogleChatSpace {
     pub name: String,
     #[serde(rename = "type")]
     pub space_type: Option<String>,
+    // Parsed by serde, not consumed in current code paths.
+    #[allow(dead_code)]
     pub space_type_renamed: Option<String>,
 }
 
