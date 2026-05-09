@@ -96,8 +96,8 @@ fn decode_aes_key(encoding_aes_key: &str) -> anyhow::Result<Vec<u8>> {
 
 fn compute_signature(token: &str, timestamp: &str, nonce: &str, encrypt: &str) -> String {
     use sha1::Digest;
-    let mut parts = vec![token, timestamp, nonce, encrypt];
-    parts.sort();
+    let mut parts = [token, timestamp, nonce, encrypt];
+    parts.sort_unstable();
     let joined: String = parts.concat();
     let hash = sha1::Sha1::digest(joined.as_bytes());
     format!("{:x}", hash)
@@ -763,6 +763,7 @@ fn parse_message_xml(xml: &str) -> Result<WecomMessage> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_thinking(
     client: &reqwest::Client,
     token_cache: &WecomTokenCache,

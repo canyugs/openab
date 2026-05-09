@@ -109,7 +109,7 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
         let client = reqwest::Client::new();
         while let Some(Ok(msg)) = ws_rx.next().await {
             if let Message::Text(text) = msg {
-                match serde_json::from_str::<GatewayReply>(&*text) {
+                match serde_json::from_str::<GatewayReply>(&text) {
                     Ok(reply) => {
                         info!(
                             platform = %reply.platform,

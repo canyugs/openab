@@ -465,13 +465,15 @@ mod event_types {
         // Bypass: if bot has previously replied in this thread (participated),
         // no @mention needed (like Discord's "involved" mode).
         let in_thread = thread_id.is_some();
-        if channel_type == "group" && !is_bot_sender && config.require_mention {
-            if !(in_thread && bypass_mention_gating) {
-                if let Some(bot_id) = bot_open_id {
-                    let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
-                    if !bot_mentioned {
-                        return None;
-                    }
+        if channel_type == "group"
+            && !is_bot_sender
+            && config.require_mention
+            && !(in_thread && bypass_mention_gating)
+        {
+            if let Some(bot_id) = bot_open_id {
+                let bot_mentioned = mention_ids.iter().any(|id| id == bot_id);
+                if !bot_mentioned {
+                    return None;
                 }
             }
         }
@@ -1818,7 +1820,9 @@ fn detect_and_mark_multibot(
                 thread_id_for_check
                     .map(|tid| {
                         let cache = multibot_threads.lock().unwrap_or_else(|e| e.into_inner());
-                        !cache.get(tid).is_some_and(|ts| ts.elapsed().as_secs() < config.session_ttl_secs)
+                        cache
+                            .get(tid)
+                            .is_none_or(|ts| ts.elapsed().as_secs() >= config.session_ttl_secs)
                     })
                     .unwrap_or(true)
             }
