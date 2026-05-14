@@ -62,11 +62,13 @@ pub struct GoogleChatMessage {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoogleChatAttachment {
+    #[allow(dead_code)]
     pub name: Option<String>,
     pub content_name: Option<String>,
     pub content_type: Option<String>,
     pub source: Option<String>,
     pub attachment_data_ref: Option<AttachmentDataRef>,
+    #[allow(dead_code)]
     pub drive_data_ref: Option<DriveDataRef>,
 }
 
@@ -78,12 +80,14 @@ pub struct AttachmentDataRef {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct DriveDataRef {
     pub drive_file_id: Option<String>,
 }
 
 /// Reference to media that needs async download after webhook parse.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum GoogleChatMediaRef {
     Image {
         resource_name: String,
@@ -558,7 +562,8 @@ pub async fn webhook(
     // Has attachments — spawn background task so the webhook returns 200 within
     // Google Chat's 30 s deadline regardless of how long downloads take.
     let state = state.clone();
-    tokio::spawn(async move {
+    let spawn_space = space_name.clone();
+    let handle = tokio::spawn(async move {
         let mut downloaded: Vec<crate::schema::Attachment> = Vec::new();
         let mut text_file_count: usize = 0;
         let mut text_file_bytes: u64 = 0;
@@ -667,6 +672,11 @@ pub async fn webhook(
             &message_id,
             downloaded,
         );
+    });
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            error!(space = %spawn_space, error = %e, "googlechat attachment download task panicked");
+        }
     });
 
     empty_json_response()
@@ -1212,13 +1222,13 @@ fn resize_and_compress(raw: &[u8]) -> Result<(Vec<u8>, String), image::ImageErro
 }
 
 /// Build the Media API URL for a given resource_name.
-/// resource_name is encoded as path segment.
+/// Google Chat Media API uses `{+resourceName}` (RFC 6570 reserved expansion),
+/// so `/` must stay literal while other special chars are percent-encoded.
 fn media_url(api_base: &str, resource_name: &str) -> String {
-    // Percent-encode each character that needs escaping in a URL path segment.
     let encoded: String = resource_name
         .bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
                 (b as char).to_string()
             }
             _ => format!("%{:02X}", b),
@@ -1317,9 +1327,8 @@ pub async fn download_googlechat_file(
         warn!(content_name, size = bytes.len(), "googlechat file exceeds 512KB limit");
         return None;
     }
-    let text = String::from_utf8_lossy(&bytes);
     use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Some(crate::schema::Attachment {
         attachment_type: "text_file".into(),
         filename: content_name.to_string(),
@@ -1844,7 +1853,6 @@ mod tests {
                 content_type: "text".into(),
                 attachments: Vec::new(),
                 text: "hello".into(),
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_123".into()),
@@ -1889,7 +1897,6 @@ mod tests {
                 content_type: "text".into(),
                 attachments: Vec::new(),
                 text: "hello".into(),
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_fail".into()),
@@ -1938,7 +1945,6 @@ mod tests {
                 content_type: "text".into(),
                 attachments: Vec::new(),
                 text: "".into(),
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_empty".into()),
@@ -1984,7 +1990,6 @@ mod tests {
                 content_type: "text".into(),
                 attachments: Vec::new(),
                 text: long_text,
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_multi_fail".into()),
@@ -2020,7 +2025,6 @@ mod tests {
                 content_type: "text".into(),
                 attachments: Vec::new(),
                 text: "hello".into(),
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_notoken".into()),
@@ -2067,7 +2071,6 @@ mod tests {
                 content_type: "text".into(),
                 attachments: Vec::new(),
                 text: "updated text".into(),
-                attachments: vec![],
             },
             command: Some("edit_message".into()),
             request_id: None,
@@ -2111,7 +2114,6 @@ mod tests {
                 content_type: "text".into(),
                 attachments: Vec::new(),
                 text: long_text,
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_multi".into()),
@@ -2170,7 +2172,6 @@ mod tests {
                 content_type: "text".into(),
                 attachments: Vec::new(),
                 text: long_text,
-                attachments: vec![],
             },
             command: None,
             request_id: Some("req_partial".into()),
@@ -2284,11 +2285,16 @@ mod tests {
     }
 
     #[test]
-    fn media_url_encodes_resource_name() {
-        let url = media_url("https://chat.googleapis.com/v1", "AATT/some+resource=name");
+    fn media_url_preserves_slashes_and_encodes_specials() {
+        let url = media_url("https://chat.googleapis.com/v1", "spaces/SP/messages/MSG/attachments/ATT");
         assert_eq!(
             url,
-            "https://chat.googleapis.com/v1/media/AATT%2Fsome%2Bresource%3Dname?alt=media"
+            "https://chat.googleapis.com/v1/media/spaces/SP/messages/MSG/attachments/ATT?alt=media"
+        );
+        let url2 = media_url("https://chat.googleapis.com/v1", "AATT/some+resource=name");
+        assert_eq!(
+            url2,
+            "https://chat.googleapis.com/v1/media/AATT/some%2Bresource%3Dname?alt=media"
         );
     }
 
