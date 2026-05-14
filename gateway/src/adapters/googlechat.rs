@@ -501,8 +501,7 @@ pub async fn webhook(
         .argument_text
         .as_deref()
         .or(msg.text.as_deref())
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
 
     let media_refs = parse_attachments(&msg.attachment);
 
@@ -552,7 +551,7 @@ pub async fn webhook(
             &sender_id,
             &sender_name,
             &display_name,
-            &text,
+            text,
             &message_id,
             Vec::new(),
         );
@@ -561,6 +560,7 @@ pub async fn webhook(
 
     // Has attachments — spawn background task so the webhook returns 200 within
     // Google Chat's 30 s deadline regardless of how long downloads take.
+    let text = text.to_string();
     let state = state.clone();
     let spawn_space = space_name.clone();
     let handle = tokio::spawn(async move {
@@ -590,41 +590,26 @@ pub async fn webhook(
                             content_name,
                             ..
                         } => {
-                            // Match Discord/Slack: cap text file count and aggregate bytes.
                             if text_file_count >= TEXT_FILE_COUNT_CAP {
-                                warn!(
-                                    content_name = %content_name,
-                                    cap = TEXT_FILE_COUNT_CAP,
-                                    "googlechat text file count cap reached, skipping"
-                                );
-                                None
-                            } else {
-                                let result = download_googlechat_file(
-                                    &adapter.client,
-                                    &token,
-                                    &adapter.api_base,
-                                    resource_name,
-                                    content_name,
-                                )
-                                .await;
-                                if let Some(ref att) = result {
-                                    if text_file_bytes + att.size > TEXT_TOTAL_CAP {
-                                        warn!(
-                                            content_name = %content_name,
-                                            total = text_file_bytes + att.size,
-                                            cap = TEXT_TOTAL_CAP,
-                                            "googlechat text file aggregate exceeds cap, skipping"
-                                        );
-                                        None
-                                    } else {
-                                        text_file_count += 1;
-                                        text_file_bytes += att.size;
-                                        result
-                                    }
-                                } else {
-                                    None
-                                }
+                                warn!(content_name = %content_name, cap = TEXT_FILE_COUNT_CAP, "googlechat text file count cap reached, skipping");
+                                continue;
                             }
+                            let att = download_googlechat_file(
+                                &adapter.client,
+                                &token,
+                                &adapter.api_base,
+                                resource_name,
+                                content_name,
+                            )
+                            .await;
+                            let Some(att) = att else { continue };
+                            if text_file_bytes + att.size > TEXT_TOTAL_CAP {
+                                warn!(content_name = %content_name, total = text_file_bytes + att.size, cap = TEXT_TOTAL_CAP, "googlechat text file aggregate exceeds cap, skipping");
+                                continue;
+                            }
+                            text_file_count += 1;
+                            text_file_bytes += att.size;
+                            Some(att)
                         }
                         GoogleChatMediaRef::Audio {
                             resource_name,
