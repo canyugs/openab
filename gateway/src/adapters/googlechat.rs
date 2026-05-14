@@ -87,17 +87,14 @@ pub struct DriveDataRef {
 
 /// Reference to media that needs async download after webhook parse.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum GoogleChatMediaRef {
     Image {
         resource_name: String,
         content_name: String,
-        content_type: String,
     },
     File {
         resource_name: String,
         content_name: String,
-        content_type: String,
     },
     Audio {
         resource_name: String,
@@ -563,7 +560,9 @@ pub async fn webhook(
     let text = text.to_string();
     let state = state.clone();
     let spawn_space = space_name.clone();
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
+        use futures_util::FutureExt;
+        let result = std::panic::AssertUnwindSafe(async {
         let mut downloaded: Vec<crate::schema::Attachment> = Vec::new();
         let mut text_file_count: usize = 0;
         let mut text_file_bytes: u64 = 0;
@@ -594,19 +593,17 @@ pub async fn webhook(
                                 warn!(content_name = %content_name, cap = TEXT_FILE_COUNT_CAP, "googlechat text file count cap reached, skipping");
                                 continue;
                             }
+                            let remaining = TEXT_TOTAL_CAP.saturating_sub(text_file_bytes);
                             let att = download_googlechat_file(
                                 &adapter.client,
                                 &token,
                                 &adapter.api_base,
                                 resource_name,
                                 content_name,
+                                remaining,
                             )
                             .await;
                             let Some(att) = att else { continue };
-                            if text_file_bytes + att.size > TEXT_TOTAL_CAP {
-                                warn!(content_name = %content_name, total = text_file_bytes + att.size, cap = TEXT_TOTAL_CAP, "googlechat text file aggregate exceeds cap, skipping");
-                                continue;
-                            }
                             text_file_count += 1;
                             text_file_bytes += att.size;
                             Some(att)
@@ -657,10 +654,9 @@ pub async fn webhook(
             &message_id,
             downloaded,
         );
-    });
-    tokio::spawn(async move {
-        if let Err(e) = handle.await {
-            error!(space = %spawn_space, error = %e, "googlechat attachment download task panicked");
+        }).catch_unwind().await;
+        if let Err(e) = result {
+            error!(space = %spawn_space, "googlechat attachment download task panicked: {e:?}");
         }
     });
 
@@ -1158,7 +1154,6 @@ fn parse_attachments(attachments: &[GoogleChatAttachment]) -> Vec<GoogleChatMedi
             refs.push(GoogleChatMediaRef::Image {
                 resource_name,
                 content_name,
-                content_type,
             });
         } else if content_type.starts_with("audio/") {
             refs.push(GoogleChatMediaRef::Audio {
@@ -1167,11 +1162,9 @@ fn parse_attachments(attachments: &[GoogleChatAttachment]) -> Vec<GoogleChatMedi
                 content_type,
             });
         } else {
-            // Treat as file — download_googlechat_file checks extension whitelist
             refs.push(GoogleChatMediaRef::File {
                 resource_name,
                 content_name,
-                content_type,
             });
         }
     }
@@ -1281,12 +1274,14 @@ pub async fn download_googlechat_file(
     api_base: &str,
     resource_name: &str,
     content_name: &str,
+    remaining_budget: u64,
 ) -> Option<crate::schema::Attachment> {
     let ext = content_name.rsplit('.').next().unwrap_or("").to_lowercase();
     if !TEXT_EXTS.contains(&ext.as_str()) {
         tracing::debug!(content_name, "skipping non-text googlechat file attachment");
         return None;
     }
+    let max_size = FILE_MAX_DOWNLOAD.min(remaining_budget);
     let url = media_url(api_base, resource_name);
     let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
         Ok(r) => r,
@@ -1301,8 +1296,8 @@ pub async fn download_googlechat_file(
     }
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
-            if size > FILE_MAX_DOWNLOAD {
-                warn!(content_name, size, "googlechat file Content-Length exceeds 512KB limit");
+            if size > max_size {
+                warn!(content_name, size, limit = max_size, "googlechat file Content-Length exceeds limit");
                 return None;
             }
         }
@@ -2209,11 +2204,9 @@ mod tests {
             GoogleChatMediaRef::Image {
                 resource_name,
                 content_name,
-                content_type,
             } => {
                 assert_eq!(resource_name, "AATT_resource");
                 assert_eq!(content_name, "photo.png");
-                assert_eq!(content_type, "image/png");
             }
             other => panic!("expected Image, got {:?}", other),
         }
@@ -2333,6 +2326,7 @@ mod tests {
             "https://unused", // not called for non-text
             "AATT",
             "binary.exe",
+            TEXT_TOTAL_CAP,
         )
         .await;
         assert!(result.is_none(), "non-text extensions must be skipped");
@@ -2359,6 +2353,7 @@ mod tests {
             &mock_server.uri(),
             "AATT",
             "notes.txt",
+            TEXT_TOTAL_CAP,
         )
         .await;
         let att = result.expect("expected successful download");
