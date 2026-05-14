@@ -1143,7 +1143,7 @@ fn split_text(text: &str, limit: usize) -> Vec<&str> {
 const TEXT_EXTS: &[&str] = &[
     "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml",
     "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp",
-    "rb", "sh", "bash", "sql", "html", "css", "ini", "cfg", "conf", "env",
+    "rb", "sh", "bash", "sql", "html", "css", "ini", "cfg", "conf",
 ];
 
 /// Parse Google Chat attachment array into media references for async download.

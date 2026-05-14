@@ -723,30 +723,44 @@ pub async fn run_gateway_adapter(
                                             }
                                             "audio" if stt_config.enabled => {
                                                 use base64::Engine;
-                                                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&att.data) {
-                                                    match crate::stt::transcribe(
-                                                        &crate::media::HTTP_CLIENT,
-                                                        &stt_config,
-                                                        bytes,
-                                                        att.filename.clone(),
-                                                        &att.mime_type,
-                                                    ).await {
-                                                        Some(transcript) => {
-                                                            extra_blocks.push(ContentBlock::Text {
-                                                                text: format!("[Voice message transcript]: {transcript}"),
-                                                            });
-                                                        }
-                                                        None => {
-                                                            tracing::warn!(filename = %att.filename, "gateway audio STT failed");
-                                                            extra_blocks.push(ContentBlock::Text {
-                                                                text: format!(
-                                                                    "[Voice message — transcription failed for {}]",
-                                                                    att.filename
-                                                                ),
-                                                            });
+                                                match base64::engine::general_purpose::STANDARD.decode(&att.data) {
+                                                    Ok(bytes) => {
+                                                        match crate::stt::transcribe(
+                                                            &crate::media::HTTP_CLIENT,
+                                                            &stt_config,
+                                                            bytes,
+                                                            att.filename.clone(),
+                                                            &att.mime_type,
+                                                        ).await {
+                                                            Some(transcript) => {
+                                                                extra_blocks.push(ContentBlock::Text {
+                                                                    text: format!("[Voice message transcript]: {transcript}"),
+                                                                });
+                                                            }
+                                                            None => {
+                                                                tracing::warn!(filename = %att.filename, "gateway audio STT failed");
+                                                                extra_blocks.push(ContentBlock::Text {
+                                                                    text: format!(
+                                                                        "[Voice message — transcription failed for {}]",
+                                                                        att.filename
+                                                                    ),
+                                                                });
+                                                            }
                                                         }
                                                     }
+                                                    Err(e) => {
+                                                        tracing::warn!(filename = %att.filename, error = %e, "gateway audio base64 decode failed");
+                                                        extra_blocks.push(ContentBlock::Text {
+                                                            text: format!(
+                                                                "[Voice message — decode failed for {}]",
+                                                                att.filename
+                                                            ),
+                                                        });
+                                                    }
                                                 }
+                                            }
+                                            "audio" => {
+                                                tracing::debug!(filename = %att.filename, "audio attachment skipped — STT not enabled");
                                             }
                                             _ => {}
                                         }
