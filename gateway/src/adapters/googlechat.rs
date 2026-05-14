@@ -1161,6 +1161,8 @@ fn parse_attachments(attachments: &[GoogleChatAttachment]) -> Vec<GoogleChatMedi
                 content_name,
                 content_type,
             });
+        } else if content_type.starts_with("video/") {
+            info!(content_name = %content_name, content_type = %content_type, "googlechat: video attachment skipped (not yet supported)");
         } else {
             refs.push(GoogleChatMediaRef::File {
                 resource_name,
@@ -1303,8 +1305,8 @@ pub async fn download_googlechat_file(
         }
     }
     let bytes = resp.bytes().await.ok()?;
-    if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
-        warn!(content_name, size = bytes.len(), "googlechat file exceeds 512KB limit");
+    if bytes.len() as u64 > max_size {
+        warn!(content_name, size = bytes.len(), limit = max_size, "googlechat file exceeds size limit");
         return None;
     }
     use base64::Engine;
