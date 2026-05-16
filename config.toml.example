@@ -110,6 +110,16 @@ working_dir = "/home/agent"
 # # Supports 30+ providers (xAI Grok OAuth, Anthropic, OpenAI Codex, Gemini, etc.)
 # # Provider switching: kubectl exec -it <pod> -- hermes model
 
+# [agent]
+# command = "grok"
+# args = ["agent", "stdio"]
+# working_dir = "/home/agent"
+# # Auth options:
+# #   1. API key:        env = { GROK_CODE_XAI_API_KEY = "${XAI_API_KEY}" }
+# #   2. Device-code:    kubectl exec -it <pod> -- grok login --device-auth
+# #   3. Deployment key: env = { GROK_DEPLOYMENT_KEY = "${GROK_DEPLOYMENT_KEY}" }
+# # See docs/grok.md for details.
+
 [pool]
 max_sessions = 10
 session_ttl_hours = 24
