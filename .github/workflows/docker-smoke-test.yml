@@ -21,6 +21,7 @@ jobs:
           - { dockerfile: Dockerfile.opencode, suffix: "-opencode", agent: "opencode", agent_args: "acp" }
           - { dockerfile: Dockerfile.cursor, suffix: "-cursor", agent: "cursor-agent", agent_args: "acp" }
           - { dockerfile: Dockerfile.hermes, suffix: "-hermes", agent: "hermes-acp", agent_args: "" }
+          - { dockerfile: Dockerfile.grok, suffix: "-grok", agent: "grok", agent_args: "agent stdio" }
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
