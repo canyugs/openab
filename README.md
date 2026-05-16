@@ -169,6 +169,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | Copilot CLI ⚠️ | `copilot --acp --stdio` | Native | [docs/copilot.md](docs/copilot.md) |
 | Cursor | `cursor-agent acp` | Native | [docs/cursor.md](docs/cursor.md) |
 | Hermes Agent | `hermes-acp` | Native | [docs/hermes.md](docs/hermes.md) |
+| OpenClaw | `openclaw acp` | Native (requires external gateway) | [docs/openclaw.md](docs/openclaw.md) |
 
 > 🔧 Running multiple agents? See [docs/multi-agent.md](docs/multi-agent.md)
 

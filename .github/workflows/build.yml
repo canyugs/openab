@@ -73,6 +73,7 @@ jobs:
           - { suffix: "-opencode", dockerfile: "Dockerfile.opencode", artifact: "opencode" }
           - { suffix: "-cursor", dockerfile: "Dockerfile.cursor", artifact: "cursor" }
           - { suffix: "-hermes", dockerfile: "Dockerfile.hermes", artifact: "hermes" }
+          - { suffix: "-openclaw", dockerfile: "Dockerfile.openclaw", artifact: "openclaw" }
         platform:
           - { os: linux/amd64, runner: ubuntu-latest }
           - { os: linux/arm64, runner: ubuntu-24.04-arm }
@@ -137,6 +138,7 @@ jobs:
           - { suffix: "-opencode", artifact: "opencode" }
           - { suffix: "-cursor", artifact: "cursor" }
           - { suffix: "-hermes", artifact: "hermes" }
+          - { suffix: "-openclaw", artifact: "openclaw" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -188,6 +190,7 @@ jobs:
           - { suffix: "-opencode" }
           - { suffix: "-cursor" }
           - { suffix: "-hermes" }
+          - { suffix: "-openclaw" }
     runs-on: ubuntu-latest
     permissions:
       contents: read
