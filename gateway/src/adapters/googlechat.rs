@@ -10,6 +10,9 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 pub const GOOGLE_CHAT_API_BASE: &str = "https://chat.googleapis.com/v1";
+/// Google Chat Media API base for `media.upload`. Distinct host prefix from
+/// the message API: `/upload/v1/...` instead of `/v1/...`.
+pub const GOOGLE_CHAT_UPLOAD_BASE: &str = "https://chat.googleapis.com/upload/v1";
 const GOOGLE_CHAT_MESSAGE_LIMIT: usize = 4096;
 
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
@@ -24,6 +27,166 @@ const MEDIA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const TEXT_FILE_COUNT_CAP: usize = 5;
 /// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
 const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
+
+// Outbound attachment caps: mirror inbound limits per MIME family so what a
+// user can send the bot, the bot can send back.
+const OUTBOUND_IMAGE_MAX_BYTES: u64 = IMAGE_MAX_DOWNLOAD;
+const OUTBOUND_AUDIO_MAX_BYTES: u64 = AUDIO_MAX_DOWNLOAD;
+const OUTBOUND_TEXT_MAX_BYTES: u64 = TEXT_TOTAL_CAP;
+const OUTBOUND_PDF_MAX_BYTES: u64 = IMAGE_MAX_DOWNLOAD;
+/// Timeout for a single outbound upload request.
+const OUTBOUND_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+// --- Access / mesh configuration (mirrors feishu.rs) ---
+
+/// Controls bot-to-bot messaging — when this bot responds to messages from
+/// other bots in the same Space. Mirrors `FEISHU_ALLOW_BOTS`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AllowBots {
+    /// Never respond to bot messages (default).
+    #[default]
+    Off,
+    /// Respond only if explicitly @mentioned.
+    Mentions,
+    /// Respond to any bot message in an active thread.
+    All,
+}
+
+/// Controls when the bot responds without an @mention in a Space. Note that
+/// Google Chat platform requires @mention in every Space message regardless;
+/// this setting governs which messages the gateway forwards (vs. drops).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AllowUsers {
+    /// Forward messages in Spaces the bot has previously participated in,
+    /// even if the platform's @mention requirement made the message addressed
+    /// to it (default).
+    #[default]
+    Involved,
+    /// Only forward messages that @mention this bot.
+    Mentions,
+    /// Like Involved, but if another bot is also participating in the Space,
+    /// require @mention to disambiguate.
+    MultibotMentions,
+}
+
+/// Hard safety cap for `max_bot_turns` when `AllowBots::All` is configured.
+/// Mirrors feishu's safety hard cap so a misconfigured deployment can't run
+/// unbounded bot-to-bot loops.
+const BOT_TURNS_SAFETY_HARD_CAP: u32 = 10;
+
+#[derive(Debug, Clone)]
+pub struct GoogleChatConfig {
+    /// Allow DM (direct message) conversations. Default: false. Mirrors
+    /// `messaging.md` Layer 0 — DM is opt-in.
+    pub allow_dm: bool,
+    /// Allowed Space resource names (`spaces/AAAA...`). Empty = all allowed.
+    pub allowed_spaces: Vec<String>,
+    /// Allowed user IDs (stripped of `users/` prefix). Empty = all allowed.
+    pub allowed_users: Vec<String>,
+    pub allow_bots: AllowBots,
+    pub allow_user_messages: AllowUsers,
+    /// Whitelist of bot IDs (stripped of `users/` prefix). Empty + `allow_bots
+    /// != Off` = any bot allowed (subject to mode).
+    pub trusted_bot_ids: Vec<String>,
+    /// Maximum consecutive bot-to-bot turns per Space before responses stop.
+    /// Reset on any human message.
+    pub max_bot_turns: u32,
+    /// TTL for participated-thread cache (seconds). 0 disables participation
+    /// tracking, requiring every message to be a fresh @mention.
+    pub session_ttl_secs: u64,
+    /// When true, the SA token request asks for the `drive.readonly` scope
+    /// in addition to `chat.bot`, allowing the adapter to download
+    /// Drive-sourced attachments (`DRIVE_FILE` source). Deployments must
+    /// pre-authorize the SA for this scope; otherwise token exchange fails.
+    pub enable_drive_attachments: bool,
+}
+
+impl Default for GoogleChatConfig {
+    fn default() -> Self {
+        Self {
+            allow_dm: false,
+            allowed_spaces: Vec::new(),
+            allowed_users: Vec::new(),
+            allow_bots: AllowBots::Off,
+            allow_user_messages: AllowUsers::Involved,
+            trusted_bot_ids: Vec::new(),
+            max_bot_turns: 20,
+            session_ttl_secs: 24 * 3600,
+            enable_drive_attachments: false,
+        }
+    }
+}
+
+impl GoogleChatConfig {
+    /// Build config from environment. All keys are optional; missing keys
+    /// fall back to safe defaults (no allowlist constraints + bots off).
+    pub fn from_env() -> Self {
+        let allow_dm = std::env::var("GOOGLE_CHAT_ALLOW_DM")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let allowed_spaces = parse_csv_env("GOOGLE_CHAT_ALLOWED_SPACES");
+        let allowed_users = parse_csv_env("GOOGLE_CHAT_ALLOWED_USERS");
+        let allow_bots = match std::env::var("GOOGLE_CHAT_ALLOW_BOTS")
+            .unwrap_or_else(|_| "off".into())
+            .to_lowercase()
+            .as_str()
+        {
+            "mentions" => AllowBots::Mentions,
+            "all" => AllowBots::All,
+            _ => AllowBots::Off,
+        };
+        let allow_user_messages = match std::env::var("GOOGLE_CHAT_ALLOW_USER_MESSAGES")
+            .unwrap_or_else(|_| "involved".into())
+            .to_lowercase()
+            .replace('-', "_")
+            .as_str()
+        {
+            "mentions" => AllowUsers::Mentions,
+            "multibot_mentions" => AllowUsers::MultibotMentions,
+            _ => AllowUsers::Involved,
+        };
+        let trusted_bot_ids = parse_csv_env("GOOGLE_CHAT_TRUSTED_BOT_IDS");
+        let configured_max_turns: u32 = std::env::var("GOOGLE_CHAT_MAX_BOT_TURNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        // Safety hard cap only applies under AllowBots::All (matches feishu).
+        let max_bot_turns = if allow_bots == AllowBots::All {
+            configured_max_turns.min(BOT_TURNS_SAFETY_HARD_CAP)
+        } else {
+            configured_max_turns
+        };
+        let session_ttl_secs = std::env::var("GOOGLE_CHAT_SESSION_TTL_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(24)
+            * 3600;
+        let enable_drive_attachments = std::env::var("GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        Self {
+            allow_dm,
+            allowed_spaces,
+            allowed_users,
+            allow_bots,
+            allow_user_messages,
+            trusted_bot_ids,
+            max_bot_turns,
+            session_ttl_secs,
+            enable_drive_attachments,
+        }
+    }
+}
+
+fn parse_csv_env(var: &str) -> Vec<String> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
 
 // --- Google Chat types (v2 envelope format) ---
 
@@ -80,7 +243,6 @@ pub struct AttachmentDataRef {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct DriveDataRef {
     pub drive_file_id: Option<String>,
 }
@@ -98,6 +260,14 @@ pub enum GoogleChatMediaRef {
     },
     Audio {
         resource_name: String,
+        content_name: String,
+        content_type: String,
+    },
+    /// User attached a Google Drive file (not direct upload). Downloaded via
+    /// Drive API; requires `drive.readonly` SA scope (gated by
+    /// `GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS`).
+    DriveFile {
+        drive_file_id: String,
         content_name: String,
         content_type: String,
     },
@@ -255,6 +425,19 @@ pub struct GoogleChatAdapter {
     pub jwt_verifier: Option<GoogleChatJwtVerifier>,
     pub client: reqwest::Client,
     pub api_base: String,
+    pub upload_base: String,
+    pub drive_api_base: String,
+    pub config: GoogleChatConfig,
+    /// Consecutive bot-to-bot turn counter, keyed by Space resource name.
+    /// Reset on any human message in the Space.
+    pub bot_turns: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    /// Last-seen timestamp per Space where this bot has participated.
+    /// Used by `AllowUsers::Involved` mode to decide whether to forward
+    /// non-mention messages.
+    pub participated_threads: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Instant>>>,
+    /// Spaces where this bot has detected another bot participating. Used by
+    /// `AllowUsers::MultibotMentions` to require @mention disambiguation.
+    pub multibot_threads: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Instant>>>,
 }
 
 impl GoogleChatAdapter {
@@ -262,6 +445,7 @@ impl GoogleChatAdapter {
         token_cache: Option<GoogleChatTokenCache>,
         access_token: Option<String>,
         jwt_verifier: Option<GoogleChatJwtVerifier>,
+        config: GoogleChatConfig,
     ) -> Self {
         Self {
             token_cache,
@@ -269,6 +453,12 @@ impl GoogleChatAdapter {
             jwt_verifier,
             client: reqwest::Client::new(),
             api_base: GOOGLE_CHAT_API_BASE.into(),
+            upload_base: GOOGLE_CHAT_UPLOAD_BASE.into(),
+            drive_api_base: GOOGLE_DRIVE_API_BASE.into(),
+            config,
+            bot_turns: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            participated_threads: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            multibot_threads: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -358,16 +548,52 @@ impl GoogleChatAdapter {
         let text = &reply.content.text;
         let chunks = split_text(text, GOOGLE_CHAT_MESSAGE_LIMIT);
 
-        // Empty message: short-circuit, send failure ack and skip API call
-        if chunks.is_empty() {
+        // Upload outbound attachments. Failures are logged and skipped — they
+        // don't abort the reply; text-only delivery is still useful.
+        let mut uploaded: Vec<serde_json::Value> = Vec::new();
+        let mut upload_errors: Vec<String> = Vec::new();
+        for att in &reply.content.attachments {
+            match upload_attachment(
+                &self.client,
+                &token,
+                &self.upload_base,
+                &reply.channel.id,
+                att,
+            )
+            .await
+            {
+                Ok(data_ref) => uploaded.push(build_attachment_payload(
+                    &data_ref,
+                    &att.filename,
+                    &att.mime_type,
+                )),
+                Err(e) => {
+                    warn!(
+                        filename = %att.filename,
+                        mime = %att.mime_type,
+                        error = %e,
+                        "googlechat outbound attachment skipped"
+                    );
+                    upload_errors.push(format!("{}: {}", att.filename, e));
+                }
+            }
+        }
+
+        // Short-circuit only when there is literally nothing to send.
+        if chunks.is_empty() && uploaded.is_empty() {
             if let Some(ref req_id) = reply.request_id {
+                let error_msg = if reply.content.attachments.is_empty() {
+                    "empty message".into()
+                } else {
+                    format!("empty message; all attachments failed: {}", upload_errors.join("; "))
+                };
                 let resp = crate::schema::GatewayResponse {
                     schema: "openab.gateway.response.v1".into(),
                     request_id: req_id.clone(),
                     success: false,
                     thread_id: None,
                     message_id: None,
-                    error: Some("empty message".into()),
+                    error: Some(error_msg),
                 };
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
@@ -376,48 +602,45 @@ impl GoogleChatAdapter {
             return;
         }
 
-        if chunks.len() == 1 {
+        let mut first_msg_name: Option<String> = None;
+        let mut first_error: Option<String> = None;
+
+        if chunks.is_empty() {
+            // Attachments only, no text.
             let result = send_message(
                 &self.client,
                 &token,
                 &reply.channel.id,
                 reply.channel.thread_id.as_deref(),
-                text,
+                "",
                 &self.api_base,
+                &uploaded,
             )
             .await;
-
-            if let Some(ref req_id) = reply.request_id {
-                let (success, message_id, error) = match result {
-                    Ok(name) => (true, Some(name), None),
-                    Err(e) => (false, None, Some(e)),
-                };
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success,
-                    thread_id: None,
-                    message_id,
-                    error,
-                };
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    let _ = event_tx.send(json);
-                }
+            match result {
+                Ok(name) => first_msg_name = Some(name),
+                Err(e) => first_error = Some(e),
             }
         } else {
-            let mut first_msg_name: Option<String> = None;
-            let mut first_error: Option<String> = None;
-            for chunk in chunks {
-                match send_message(
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                // Attachments piggyback on the first chunk only, so the user
+                // doesn't see N copies of the same image across split messages.
+                let attachments_for_chunk: &[serde_json::Value] = if idx == 0 {
+                    &uploaded
+                } else {
+                    &[]
+                };
+                let result = send_message(
                     &self.client,
                     &token,
                     &reply.channel.id,
                     reply.channel.thread_id.as_deref(),
                     chunk,
                     &self.api_base,
+                    attachments_for_chunk,
                 )
-                .await
-                {
+                .await;
+                match result {
                     Ok(name) => {
                         if first_msg_name.is_none() {
                             first_msg_name = Some(name);
@@ -430,18 +653,30 @@ impl GoogleChatAdapter {
                     }
                 }
             }
-            if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: first_msg_name.is_some() && first_error.is_none(),
-                    thread_id: None,
-                    message_id: first_msg_name,
-                    error: first_error,
-                };
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    let _ = event_tx.send(json);
-                }
+        }
+
+        if let Some(ref req_id) = reply.request_id {
+            // text delivered AND no chunk failed; partial-upload failures alone
+            // do not flip success to false, but are surfaced via `error`.
+            let text_ok = first_msg_name.is_some() && first_error.is_none();
+            let error = match (first_error, upload_errors.is_empty()) {
+                (Some(e), _) => Some(e),
+                (None, false) => Some(format!(
+                    "attachment upload partial failure: {}",
+                    upload_errors.join("; ")
+                )),
+                (None, true) => None,
+            };
+            let resp = crate::schema::GatewayResponse {
+                schema: "openab.gateway.response.v1".into(),
+                request_id: req_id.clone(),
+                success: text_ok,
+                thread_id: None,
+                message_id: first_msg_name,
+                error,
+            };
+            if let Ok(json) = serde_json::to_string(&resp) {
+                let _ = event_tx.send(json);
             }
         }
     }
@@ -511,9 +746,6 @@ pub async fn webhook(
     let space = msg.space.as_ref().or(payload.space.as_ref());
 
     let is_bot = sender.map(|s| s.user_type == "BOT").unwrap_or(false);
-    if is_bot {
-        return empty_json_response();
-    }
 
     let sender_id = sender.map(|s| s.name.clone()).unwrap_or_default();
     let display_name = sender
@@ -530,6 +762,82 @@ pub async fn webhook(
         .unwrap_or_else(|| "ROOM".into());
 
     let thread_id = msg.thread.as_ref().map(|t| t.name.clone());
+
+    // ----- Access control (messaging.md Layer 0-4) -----
+    // Adapter is registered → access controls always apply via the adapter
+    // config. (state.google_chat is None when GOOGLE_CHAT_ENABLED is false,
+    // in which case this handler isn't routed.)
+    if let Some(ref adapter) = state.google_chat {
+        // Layer 0: DM opt-in. Google Chat platform delivers DMs by default;
+        // gateway gates them behind allow_dm.
+        if space_type == "DM" && !adapter.config.allow_dm {
+            warn!(space = %space_name, sender = %sender_name, "googlechat: DM dropped (allow_dm=false)");
+            return empty_json_response();
+        }
+        // Layer 1: Space allowlist.
+        if space_type != "DM"
+            && !adapter.config.allowed_spaces.is_empty()
+            && !adapter.config.allowed_spaces.iter().any(|s| s == &space_name)
+        {
+            warn!(space = %space_name, "googlechat: space dropped (not in allowed_spaces)");
+            return empty_json_response();
+        }
+        // User allowlist applies to humans only — bots have their own mesh
+        // gates (trusted_bot_ids + allow_bots below). Without this carve-out,
+        // a deployment that scopes allowed_users to a single human admin
+        // would inadvertently silence all bot-to-bot traffic too.
+        if !is_bot
+            && !adapter.config.allowed_users.is_empty()
+            && !adapter.config.allowed_users.iter().any(|u| u == &sender_name)
+        {
+            warn!(sender = %sender_name, "googlechat: user not in allowlist, dropping");
+            return empty_json_response();
+        }
+
+        // Layer 4: bot → bot mesh.
+        if is_bot {
+            match adapter.config.allow_bots {
+                AllowBots::Off => {
+                    return empty_json_response();
+                }
+                AllowBots::Mentions | AllowBots::All => {
+                    // Google Chat only delivers Space messages to a bot when
+                    // the bot is @mentioned (platform requirement), so by the
+                    // time we see a bot message, the "mentions" condition is
+                    // already satisfied. Trusted-bot allowlist still applies.
+                    if !adapter.config.trusted_bot_ids.is_empty()
+                        && !adapter
+                            .config
+                            .trusted_bot_ids
+                            .iter()
+                            .any(|id| id == &sender_name)
+                    {
+                        warn!(sender = %sender_name, "googlechat: bot not in trusted_bot_ids, dropping");
+                        return empty_json_response();
+                    }
+                }
+            }
+
+            // Consecutive bot-to-bot turns counter. Reset on human messages
+            // below. We don't await an Option<Adapter> here so use a blocking
+            // lock — the map is small and contention is unlikely.
+            let mut turns = adapter.bot_turns.lock().await;
+            let count = turns.entry(space_name.clone()).or_insert(0);
+            *count += 1;
+            if *count > adapter.config.max_bot_turns {
+                warn!(
+                    space = %space_name,
+                    count = *count,
+                    cap = adapter.config.max_bot_turns,
+                    "googlechat: bot turns cap reached, dropping"
+                );
+                return empty_json_response();
+            }
+        } else {
+            // Human message resets the bot-turns counter for this Space.
+            adapter.bot_turns.lock().await.remove(&space_name);
+        }
+    }
 
     let message_id = msg
         .name
@@ -551,6 +859,7 @@ pub async fn webhook(
             text,
             &message_id,
             Vec::new(),
+            is_bot,
         );
         return empty_json_response();
     }
@@ -560,6 +869,7 @@ pub async fn webhook(
     let text = text.to_string();
     let state = state.clone();
     let spawn_space = space_name.clone();
+    let spawn_is_bot = is_bot;
     tokio::spawn(async move {
         use futures_util::FutureExt;
         let result = std::panic::AssertUnwindSafe(async {
@@ -623,6 +933,40 @@ pub async fn webhook(
                             )
                             .await
                         }
+                        GoogleChatMediaRef::DriveFile {
+                            drive_file_id,
+                            content_name,
+                            content_type,
+                        } => {
+                            if !adapter.config.enable_drive_attachments {
+                                warn!(
+                                    content_name = %content_name,
+                                    "googlechat: drive attachment skipped (GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS=false)"
+                                );
+                                continue;
+                            }
+                            let remaining = TEXT_TOTAL_CAP.saturating_sub(text_file_bytes);
+                            let att = download_googledrive_file(
+                                &adapter.client,
+                                &token,
+                                &adapter.drive_api_base,
+                                drive_file_id,
+                                content_name,
+                                content_type,
+                                remaining,
+                            )
+                            .await;
+                            let Some(att) = att else { continue };
+                            if att.attachment_type == "text_file" {
+                                if text_file_count >= TEXT_FILE_COUNT_CAP {
+                                    warn!(content_name = %content_name, cap = TEXT_FILE_COUNT_CAP, "googlechat drive text file count cap reached, skipping");
+                                    continue;
+                                }
+                                text_file_count += 1;
+                                text_file_bytes += att.size;
+                            }
+                            Some(att)
+                        }
                     };
                     if let Some(att) = attachment {
                         downloaded.push(att);
@@ -653,6 +997,7 @@ pub async fn webhook(
             &text,
             &message_id,
             downloaded,
+            spawn_is_bot,
         );
         }).catch_unwind().await;
         if let Err(e) = result {
@@ -675,6 +1020,7 @@ fn send_googlechat_event(
     text: &str,
     message_id: &str,
     attachments: Vec<crate::schema::Attachment>,
+    is_bot: bool,
 ) {
     let mut gw_event = GatewayEvent::new(
         "googlechat",
@@ -687,7 +1033,7 @@ fn send_googlechat_event(
             id: sender_id.to_string(),
             name: sender_name.to_string(),
             display_name: display_name.to_string(),
-            is_bot: false,
+            is_bot,
         },
         text,
         message_id,
@@ -727,12 +1073,27 @@ pub struct GoogleChatTokenCache {
     token: RwLock<Option<(String, Instant, u64)>>,
     sa_email: String,
     private_key: String,
+    /// Space-separated OAuth scopes requested in the JWT. Always includes
+    /// `chat.bot`; extra scopes (e.g. `drive.readonly`) are appended when
+    /// optional features are enabled.
+    scopes: String,
 }
 
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
+const GOOGLE_CHAT_BASE_SCOPE: &str = "https://www.googleapis.com/auth/chat.bot";
+const GOOGLE_DRIVE_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 
 impl GoogleChatTokenCache {
     pub fn new(sa_key_json: &str) -> Result<Self, String> {
+        Self::new_with_scopes(sa_key_json, &[])
+    }
+
+    /// Build a token cache requesting `chat.bot` plus any additional scopes.
+    /// Pass `&[GOOGLE_DRIVE_READONLY_SCOPE]` to enable Drive-attachment
+    /// downloads. Token exchange will fail at runtime if the deployment
+    /// hasn't authorized the SA for the requested scopes — fail-fast is
+    /// preferred over silently degrading.
+    pub fn new_with_scopes(sa_key_json: &str, extra_scopes: &[&str]) -> Result<Self, String> {
         let key: serde_json::Value =
             serde_json::from_str(sa_key_json).map_err(|e| format!("invalid SA key JSON: {e}"))?;
         let email = key
@@ -745,10 +1106,13 @@ impl GoogleChatTokenCache {
             .and_then(|v| v.as_str())
             .ok_or("missing private_key in SA key")?
             .to_string();
+        let mut scope_list = vec![GOOGLE_CHAT_BASE_SCOPE.to_string()];
+        scope_list.extend(extra_scopes.iter().map(|s| s.to_string()));
         Ok(Self {
             token: RwLock::new(None),
             sa_email: email,
             private_key: pkey,
+            scopes: scope_list.join(" "),
         })
     }
 
@@ -818,7 +1182,7 @@ impl GoogleChatTokenCache {
 
         let claims = serde_json::json!({
             "iss": self.sa_email,
-            "scope": "https://www.googleapis.com/auth/chat.bot",
+            "scope": self.scopes,
             "aud": "https://oauth2.googleapis.com/token",
             "iat": now,
             "exp": now + 3600,
@@ -1046,6 +1410,7 @@ async fn send_message(
     thread_id: Option<&str>,
     text: &str,
     api_base: &str,
+    attachments: &[serde_json::Value],
 ) -> Result<String, String> {
     let mut url = format!("{}/{}/messages", api_base, space);
 
@@ -1053,6 +1418,10 @@ async fn send_message(
     let mut body = serde_json::json!({
         "text": formatted,
     });
+
+    if !attachments.is_empty() {
+        body["attachment"] = serde_json::Value::Array(attachments.to_vec());
+    }
 
     if let Some(thread_id) = thread_id {
         body["thread"] = serde_json::json!({
@@ -1118,6 +1487,131 @@ fn split_text(text: &str, limit: usize) -> Vec<&str> {
     chunks
 }
 
+// --- Outbound attachment upload (bot → user) ---
+
+/// Returns the per-MIME outbound size cap, or None if the MIME family is not
+/// allowed for outbound. Mirrors inbound limits so the bot can send back what
+/// a user can send it. `video/*` is intentionally skipped to match inbound.
+fn outbound_mime_cap(mime: &str) -> Option<u64> {
+    let lower = mime.to_ascii_lowercase();
+    if lower.starts_with("image/") {
+        Some(OUTBOUND_IMAGE_MAX_BYTES)
+    } else if lower.starts_with("audio/") {
+        Some(OUTBOUND_AUDIO_MAX_BYTES)
+    } else if lower.starts_with("text/") {
+        Some(OUTBOUND_TEXT_MAX_BYTES)
+    } else if lower == "application/pdf" {
+        Some(OUTBOUND_PDF_MAX_BYTES)
+    } else {
+        None
+    }
+}
+
+/// Build the JSON object for a single outbound attachment entry in
+/// `messages.create` request body, from the `attachmentDataRef` returned by
+/// `media.upload`.
+fn build_attachment_payload(
+    data_ref: &serde_json::Value,
+    filename: &str,
+    mime: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "contentName": filename,
+        "contentType": mime,
+        "attachmentDataRef": data_ref,
+    })
+}
+
+/// Build a `multipart/related` body for the Google Chat Media API.
+///
+/// Google's `media.upload` requires `multipart/related` (not the
+/// `multipart/form-data` produced by `reqwest::multipart::Form`), with the
+/// metadata part first and the media part second. Returns
+/// `(content_type_header_value, body_bytes)`.
+fn build_multipart_related(metadata_json: &str, media: &[u8], media_mime: &str) -> (String, Vec<u8>) {
+    let boundary = format!("oab_gc_{}", uuid::Uuid::new_v4().simple());
+    let mut body: Vec<u8> = Vec::with_capacity(media.len() + metadata_json.len() + 256);
+    body.extend_from_slice(b"--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n");
+    body.extend_from_slice(metadata_json.as_bytes());
+    body.extend_from_slice(b"\r\n--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"\r\nContent-Type: ");
+    body.extend_from_slice(media_mime.as_bytes());
+    body.extend_from_slice(b"\r\n\r\n");
+    body.extend_from_slice(media);
+    body.extend_from_slice(b"\r\n--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"--\r\n");
+    (format!("multipart/related; boundary={}", boundary), body)
+}
+
+/// Upload a single attachment to Google Chat via the Media API
+/// (`spaces.messages.attachments.upload`) and return the `attachmentDataRef`
+/// JSON object to be embedded in a subsequent `messages.create` request.
+///
+/// Performs all client-side validation (MIME whitelist, size cap, base64
+/// decode) before any network call. Returns `Err(String)` on any failure;
+/// callers are expected to log and skip the attachment, not abort the reply.
+async fn upload_attachment(
+    client: &reqwest::Client,
+    token: &str,
+    upload_base: &str,
+    space: &str,
+    att: &crate::schema::Attachment,
+) -> Result<serde_json::Value, String> {
+    let cap = outbound_mime_cap(&att.mime_type)
+        .ok_or_else(|| format!("outbound MIME not allowed: {}", att.mime_type))?;
+
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(att.data.as_bytes())
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+
+    if (bytes.len() as u64) > cap {
+        return Err(format!(
+            "attachment size {} exceeds cap {} for mime {}",
+            bytes.len(),
+            cap,
+            att.mime_type
+        ));
+    }
+
+    let url = format!(
+        "{}/{}/attachments:upload?uploadType=multipart",
+        upload_base, space
+    );
+
+    let metadata = serde_json::json!({ "filename": att.filename }).to_string();
+    let (content_type, body) = build_multipart_related(&metadata, &bytes, &att.mime_type);
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .timeout(OUTBOUND_UPLOAD_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("upload request error: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("upload failed: {} {}", status, body));
+    }
+
+    let parsed: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("upload response parse: {e}"))?;
+    parsed
+        .get("attachmentDataRef")
+        .cloned()
+        .ok_or_else(|| "upload response missing attachmentDataRef".into())
+}
+
 // --- Attachment parsing & download ---
 
 /// Whitelist of text-like file extensions for `download_googlechat_file`.
@@ -1135,39 +1629,66 @@ const TEXT_EXTS: &[&str] = &[
 fn parse_attachments(attachments: &[GoogleChatAttachment]) -> Vec<GoogleChatMediaRef> {
     let mut refs = Vec::new();
     for att in attachments {
-        // Only handle UPLOADED_CONTENT (Drive needs separate Drive API call)
-        if att.source.as_deref() != Some("UPLOADED_CONTENT") {
-            continue;
-        }
-        let resource_name = match att
-            .attachment_data_ref
-            .as_ref()
-            .and_then(|d| d.resource_name.clone())
-        {
-            Some(rn) => rn,
-            None => continue,
-        };
         let content_type = att.content_type.clone().unwrap_or_default();
         let content_name = att.content_name.clone().unwrap_or_else(|| "file".into());
 
-        if content_type.starts_with("image/") {
-            refs.push(GoogleChatMediaRef::Image {
-                resource_name,
-                content_name,
-            });
-        } else if content_type.starts_with("audio/") {
-            refs.push(GoogleChatMediaRef::Audio {
-                resource_name,
-                content_name,
-                content_type,
-            });
-        } else if content_type.starts_with("video/") {
-            info!(content_name = %content_name, content_type = %content_type, "googlechat: video attachment skipped (not yet supported)");
-        } else {
-            refs.push(GoogleChatMediaRef::File {
-                resource_name,
-                content_name,
-            });
+        match att.source.as_deref() {
+            Some("DRIVE_FILE") => {
+                let drive_file_id = match att
+                    .drive_data_ref
+                    .as_ref()
+                    .and_then(|d| d.drive_file_id.clone())
+                {
+                    Some(id) => id,
+                    None => continue,
+                };
+                if content_type.starts_with("video/") {
+                    info!(content_name = %content_name, content_type = %content_type, "googlechat: drive video attachment skipped (not yet supported)");
+                    continue;
+                }
+                // Google-native types (Doc / Sheet / Slides) need Drive's
+                // `export` API with a target MIME, not `files.{id}?alt=media`.
+                // Out of scope for the first cut — skip with a debug log.
+                if content_type.starts_with("application/vnd.google-apps") {
+                    tracing::debug!(content_name = %content_name, content_type = %content_type, "googlechat: google-native drive type skipped (needs Drive export API)");
+                    continue;
+                }
+                refs.push(GoogleChatMediaRef::DriveFile {
+                    drive_file_id,
+                    content_name,
+                    content_type,
+                });
+            }
+            Some("UPLOADED_CONTENT") => {
+                let resource_name = match att
+                    .attachment_data_ref
+                    .as_ref()
+                    .and_then(|d| d.resource_name.clone())
+                {
+                    Some(rn) => rn,
+                    None => continue,
+                };
+                if content_type.starts_with("image/") {
+                    refs.push(GoogleChatMediaRef::Image {
+                        resource_name,
+                        content_name,
+                    });
+                } else if content_type.starts_with("audio/") {
+                    refs.push(GoogleChatMediaRef::Audio {
+                        resource_name,
+                        content_name,
+                        content_type,
+                    });
+                } else if content_type.starts_with("video/") {
+                    info!(content_name = %content_name, content_type = %content_type, "googlechat: video attachment skipped (not yet supported)");
+                } else {
+                    refs.push(GoogleChatMediaRef::File {
+                        resource_name,
+                        content_name,
+                    });
+                }
+            }
+            _ => continue,
         }
     }
     refs
@@ -1364,6 +1885,123 @@ pub async fn download_googlechat_audio(
         data,
         size: bytes.len() as u64,
     })
+}
+
+/// Base URL for Google Drive v3 API. Override only in tests.
+pub const GOOGLE_DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
+
+/// Download a Drive-sourced attachment via the Drive v3 API.
+///
+/// Routes the result into the same image/file/audio post-processing as
+/// uploaded-content attachments so the downstream agent sees a uniform
+/// `Attachment` shape regardless of source. Requires a token issued with
+/// the `drive.readonly` scope — token exchange will fail upstream if the
+/// SA hasn't been authorized for Drive.
+///
+/// Per-family caps (image 10 MB / audio 25 MB / text 1 MB per file) match
+/// the inbound `UPLOADED_CONTENT` limits.
+pub async fn download_googledrive_file(
+    client: &reqwest::Client,
+    token: &str,
+    drive_api_base: &str,
+    drive_file_id: &str,
+    content_name: &str,
+    content_type: &str,
+    remaining_text_budget: u64,
+) -> Option<crate::schema::Attachment> {
+    // Decide cap up front so we can reject oversize at Content-Length time.
+    let (cap, kind): (u64, &str) = if content_type.starts_with("image/") {
+        (IMAGE_MAX_DOWNLOAD, "image")
+    } else if content_type.starts_with("audio/") {
+        (AUDIO_MAX_DOWNLOAD, "audio")
+    } else if content_type.starts_with("text/") {
+        (FILE_MAX_DOWNLOAD.min(remaining_text_budget), "file")
+    } else {
+        // Try to treat unknown content types as text if the extension is in
+        // the inbound text whitelist; otherwise skip.
+        let ext = content_name.rsplit('.').next().unwrap_or("").to_lowercase();
+        if TEXT_EXTS.contains(&ext.as_str()) {
+            (FILE_MAX_DOWNLOAD.min(remaining_text_budget), "file")
+        } else {
+            tracing::debug!(content_name, content_type, "skipping unsupported drive content type");
+            return None;
+        }
+    };
+
+    let url = format!("{}/files/{}?alt=media", drive_api_base, drive_file_id);
+    let resp = match client
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(MEDIA_REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(content_name, error = %e, "googledrive download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(content_name, status = %resp.status(), "googledrive download failed");
+        return None;
+    }
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > cap {
+                warn!(content_name, size, cap, "googledrive Content-Length exceeds cap");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > cap {
+        warn!(content_name, size = bytes.len(), cap, "googledrive payload exceeds cap");
+        return None;
+    }
+
+    match kind {
+        "image" => {
+            let (compressed, mime) = match resize_and_compress(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(content_name, error = %e, "googledrive image resize failed");
+                    return None;
+                }
+            };
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
+            Some(crate::schema::Attachment {
+                attachment_type: "image".into(),
+                filename: content_name.to_string(),
+                mime_type: mime,
+                data,
+                size: compressed.len() as u64,
+            })
+        }
+        "audio" => {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Some(crate::schema::Attachment {
+                attachment_type: "audio".into(),
+                filename: content_name.to_string(),
+                mime_type: content_type.to_string(),
+                data,
+                size: bytes.len() as u64,
+            })
+        }
+        _ => {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Some(crate::schema::Attachment {
+                attachment_type: "text_file".into(),
+                filename: content_name.to_string(),
+                mime_type: content_type.to_string(),
+                data,
+                size: bytes.len() as u64,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1820,7 +2458,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
@@ -1864,7 +2502,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
@@ -1912,7 +2550,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
@@ -1956,7 +2594,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let long_text = "x".repeat(5000);
@@ -1993,7 +2631,7 @@ mod tests {
     #[tokio::test]
     async fn handle_reply_token_failure_sends_error_response() {
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let adapter = GoogleChatAdapter::new(None, None, None);
+        let adapter = GoogleChatAdapter::new(None, None, None, GoogleChatConfig::default());
 
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
@@ -2038,7 +2676,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
@@ -2080,7 +2718,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let long_text = "x".repeat(5000);
@@ -2138,7 +2776,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let long_text = "x".repeat(5000);
@@ -2239,7 +2877,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_attachments_skips_drive() {
+    fn parse_attachments_skips_google_native_drive_types() {
+        // Google-native types (Docs/Sheets/Slides) require Drive's export API
+        // and cannot be fetched via files.{id}?alt=media — skipped at parse.
         let atts = vec![GoogleChatAttachment {
             name: Some("spaces/SP/messages/MSG/attachments/ATT".into()),
             content_name: Some("doc".into()),
@@ -2251,6 +2891,157 @@ mod tests {
             }),
         }];
         assert_eq!(parse_attachments(&atts).len(), 0);
+    }
+
+    #[test]
+    fn parse_attachments_emits_drive_file_for_uploaded_binary() {
+        // A regular file (image, PDF, audio, text) uploaded to Drive and then
+        // attached should produce a DriveFile media ref.
+        let atts = vec![GoogleChatAttachment {
+            name: Some("spaces/SP/messages/MSG/attachments/ATT".into()),
+            content_name: Some("photo.png".into()),
+            content_type: Some("image/png".into()),
+            source: Some("DRIVE_FILE".into()),
+            attachment_data_ref: None,
+            drive_data_ref: Some(DriveDataRef {
+                drive_file_id: Some("drive_id_456".into()),
+            }),
+        }];
+        let refs = parse_attachments(&atts);
+        assert_eq!(refs.len(), 1);
+        assert!(matches!(refs[0], GoogleChatMediaRef::DriveFile { .. }));
+    }
+
+    #[test]
+    fn parse_attachments_skips_drive_file_with_missing_id() {
+        let atts = vec![GoogleChatAttachment {
+            name: Some("spaces/SP/messages/MSG/attachments/ATT".into()),
+            content_name: Some("photo.png".into()),
+            content_type: Some("image/png".into()),
+            source: Some("DRIVE_FILE".into()),
+            attachment_data_ref: None,
+            drive_data_ref: Some(DriveDataRef {
+                drive_file_id: None,
+            }),
+        }];
+        assert_eq!(parse_attachments(&atts).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn download_googledrive_file_image_succeeds() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+        // Use a minimal but valid 1x1 PNG so resize_and_compress doesn't fail.
+        let png_bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+            0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+            0x42, 0x60, 0x82,
+        ];
+        Mock::given(method("GET"))
+            .and(path("/files/drv-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(png_bytes))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googledrive_file(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "drv-abc",
+            "photo.png",
+            "image/png",
+            TEXT_TOTAL_CAP,
+        )
+        .await;
+        let att = result.expect("expected image attachment");
+        assert_eq!(att.attachment_type, "image");
+        assert_eq!(att.filename, "photo.png");
+    }
+
+    #[tokio::test]
+    async fn download_googledrive_file_rejects_oversize_via_content_length() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/files/big"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "30000000") // 30 MB > 25 MB audio cap
+                    .set_body_bytes(vec![0u8; 100]),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googledrive_file(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "big",
+            "song.mp3",
+            "audio/mpeg",
+            TEXT_TOTAL_CAP,
+        )
+        .await;
+        assert!(result.is_none(), "oversized audio must be rejected");
+    }
+
+    #[tokio::test]
+    async fn download_googledrive_file_skips_unsupported_type() {
+        // Unknown content type with no whitelisted extension → skip without
+        // hitting the network. Mock with expect(0) to enforce no request.
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/files/.*"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googledrive_file(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "x",
+            "weird.bin",
+            "application/x-executable",
+            TEXT_TOTAL_CAP,
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn token_cache_default_scope_is_chat_bot() {
+        let key_json = r#"{
+            "client_email": "test@example.iam.gserviceaccount.com",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nMIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA0Z+8O1eaQ9YHGsxn\nVQQAAAAAAAA=\n-----END PRIVATE KEY-----\n"
+        }"#;
+        // Parse may fail on the dummy key but that's not what we're testing
+        // — we want to check the scope string composition when it succeeds.
+        if let Ok(cache) = GoogleChatTokenCache::new_with_scopes(key_json, &[]) {
+            assert_eq!(cache.scopes, GOOGLE_CHAT_BASE_SCOPE);
+        }
+        if let Ok(cache) = GoogleChatTokenCache::new_with_scopes(
+            key_json,
+            &[GOOGLE_DRIVE_READONLY_SCOPE],
+        ) {
+            assert_eq!(
+                cache.scopes,
+                format!("{} {}", GOOGLE_CHAT_BASE_SCOPE, GOOGLE_DRIVE_READONLY_SCOPE)
+            );
+        }
     }
 
     #[test]
@@ -2420,5 +3211,442 @@ mod tests {
         )
         .await;
         assert!(result.is_none(), "oversized image must be rejected");
+    }
+
+    // --- Outbound attachment tests ---
+
+    #[test]
+    fn outbound_mime_cap_allows_image_audio_text_pdf() {
+        assert_eq!(outbound_mime_cap("image/png"), Some(OUTBOUND_IMAGE_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("image/jpeg"), Some(OUTBOUND_IMAGE_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("audio/mpeg"), Some(OUTBOUND_AUDIO_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("text/plain"), Some(OUTBOUND_TEXT_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("application/pdf"), Some(OUTBOUND_PDF_MAX_BYTES));
+    }
+
+    #[test]
+    fn outbound_mime_cap_skips_video_and_unknown() {
+        assert_eq!(outbound_mime_cap("video/mp4"), None);
+        assert_eq!(outbound_mime_cap("application/x-executable"), None);
+        assert_eq!(outbound_mime_cap("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn outbound_mime_cap_case_insensitive() {
+        assert_eq!(outbound_mime_cap("Image/PNG"), Some(OUTBOUND_IMAGE_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("APPLICATION/PDF"), Some(OUTBOUND_PDF_MAX_BYTES));
+    }
+
+    #[test]
+    fn build_attachment_payload_has_expected_shape() {
+        let data_ref = serde_json::json!({
+            "resourceName": "spaces/X/attachments/AB.token",
+            "attachmentToken": "tok"
+        });
+        let payload = build_attachment_payload(&data_ref, "chart.png", "image/png");
+        assert_eq!(payload["contentName"], "chart.png");
+        assert_eq!(payload["contentType"], "image/png");
+        assert_eq!(payload["attachmentDataRef"]["resourceName"], "spaces/X/attachments/AB.token");
+    }
+
+    fn make_image_attachment(bytes: &[u8]) -> crate::schema::Attachment {
+        use base64::Engine;
+        crate::schema::Attachment {
+            attachment_type: "image".into(),
+            filename: "pixel.png".into(),
+            mime_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            size: bytes.len() as u64,
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_reply_with_image_attachment_uploads_and_sends() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "attachmentDataRef": {
+                    "resourceName": "spaces/TEST/attachments/AB.token",
+                    "attachmentToken": "tok-xyz"
+                },
+                "contentType": "image/png"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/TEST/messages/msg_abc"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig_msg".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![make_image_attachment(b"\x89PNG\r\n\x1a\n fake")],
+                text: "here you go".into(),
+            },
+            command: None,
+            request_id: Some("req_att".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let received = event_rx.try_recv().expect("expected GatewayResponse");
+        let resp: GatewayResponse = serde_json::from_str(&received).unwrap();
+        assert!(resp.success, "expected success, got error: {:?}", resp.error);
+        assert_eq!(resp.message_id, Some("spaces/TEST/messages/msg_abc".into()));
+        assert!(resp.error.is_none(), "no error expected: {:?}", resp.error);
+    }
+
+    #[tokio::test]
+    async fn handle_reply_attachment_only_no_text_still_sends() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "attachmentDataRef": {
+                    "resourceName": "spaces/T/attachments/A.tok",
+                    "attachmentToken": "t"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/T/messages/m1"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "x".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel { id: "spaces/T".into(), thread_id: None },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![make_image_attachment(b"px")],
+                text: "".into(),
+            },
+            command: None,
+            request_id: Some("req_only".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let resp: GatewayResponse = serde_json::from_str(&event_rx.try_recv().unwrap()).unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.message_id, Some("spaces/T/messages/m1".into()));
+    }
+
+    #[tokio::test]
+    async fn handle_reply_upload_failure_falls_back_to_text_only() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/T/messages/m2"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "x".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel { id: "spaces/T".into(), thread_id: None },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![make_image_attachment(b"px")],
+                text: "the text still goes out".into(),
+            },
+            command: None,
+            request_id: Some("req_partial".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let resp: GatewayResponse = serde_json::from_str(&event_rx.try_recv().unwrap()).unwrap();
+        // Text delivery succeeded, so overall success=true; but error field
+        // surfaces the attachment failure for observability.
+        assert!(resp.success);
+        let err = resp.error.expect("partial upload failure should be surfaced");
+        assert!(err.contains("partial failure"), "error should mention partial failure, got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn handle_reply_unsupported_mime_skipped_no_upload_call() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        // Upload mock must NOT be called for unsupported MIME.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/T/messages/m3"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        use base64::Engine;
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "x".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel { id: "spaces/T".into(), thread_id: None },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![crate::schema::Attachment {
+                    attachment_type: "video".into(),
+                    filename: "clip.mp4".into(),
+                    mime_type: "video/mp4".into(),
+                    data: base64::engine::general_purpose::STANDARD.encode(b"px"),
+                    size: 2,
+                }],
+                text: "video as text".into(),
+            },
+            command: None,
+            request_id: Some("req_skip".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let resp: GatewayResponse = serde_json::from_str(&event_rx.try_recv().unwrap()).unwrap();
+        assert!(resp.success);
+        let err = resp.error.expect("MIME-skip should surface as partial failure");
+        assert!(err.contains("MIME not allowed") || err.contains("partial failure"));
+    }
+
+    #[tokio::test]
+    async fn handle_reply_attachment_size_exceeds_cap_skipped() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/T/messages/m4"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        let oversize_bytes = vec![0u8; (OUTBOUND_IMAGE_MAX_BYTES as usize) + 1024];
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "x".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel { id: "spaces/T".into(), thread_id: None },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![make_image_attachment(&oversize_bytes)],
+                text: "still got text".into(),
+            },
+            command: None,
+            request_id: Some("req_big".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let resp: GatewayResponse = serde_json::from_str(&event_rx.try_recv().unwrap()).unwrap();
+        assert!(resp.success);
+        assert!(resp.error.unwrap().contains("exceeds cap"));
+    }
+
+    // --- Mesh / allowlist config tests ---
+
+    #[test]
+    fn config_default_is_locked_down() {
+        // The safe default forbids DMs, has no allowlist, and disables bot
+        // chatter — deployments must explicitly opt in.
+        let c = GoogleChatConfig::default();
+        assert!(!c.allow_dm);
+        assert!(c.allowed_spaces.is_empty());
+        assert!(c.allowed_users.is_empty());
+        assert!(c.trusted_bot_ids.is_empty());
+        assert_eq!(c.allow_bots, AllowBots::Off);
+        assert_eq!(c.allow_user_messages, AllowUsers::Involved);
+        assert_eq!(c.max_bot_turns, 20);
+        assert_eq!(c.session_ttl_secs, 24 * 3600);
+    }
+
+    #[test]
+    fn parse_csv_env_handles_blank_single_multi() {
+        // Use a randomized var name so concurrent tests can't collide. This
+        // is the only env-touching test in the module — the rest of the
+        // mesh logic is tested via webhook integration paths.
+        let v = format!("OPENAB_TEST_PARSE_CSV_{}", uuid::Uuid::new_v4().simple());
+        std::env::remove_var(&v);
+        assert!(parse_csv_env(&v).is_empty(), "unset → empty");
+        std::env::set_var(&v, "");
+        assert!(parse_csv_env(&v).is_empty(), "blank → empty");
+        std::env::set_var(&v, "foo");
+        assert_eq!(parse_csv_env(&v), vec!["foo".to_string()]);
+        std::env::set_var(&v, " a, b ,c,,d ");
+        assert_eq!(
+            parse_csv_env(&v),
+            vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]
+        );
+        std::env::remove_var(&v);
+    }
+
+    fn make_mesh_adapter(config: GoogleChatConfig) -> GoogleChatAdapter {
+        GoogleChatAdapter::new(None, Some("fake-token".into()), None, config)
+    }
+
+    /// Build a minimal envelope that produces a Space message for tests.
+    fn build_space_envelope(space_name: &str, sender_id: &str, is_bot: bool) -> String {
+        let user_type = if is_bot { "BOT" } else { "HUMAN" };
+        serde_json::json!({
+            "chat": {
+                "messagePayload": {
+                    "message": {
+                        "name": format!("{}/messages/m_xxx", space_name),
+                        "text": "hello",
+                        "argumentText": "hello",
+                        "sender": {
+                            "name": sender_id,
+                            "displayName": "Tester",
+                            "type": user_type
+                        },
+                        "space": { "name": space_name, "type": "ROOM" }
+                    },
+                    "space": { "name": space_name, "type": "ROOM" }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn envelope_parser_detects_bot_sender() {
+        // Sanity check the bot-detection branch used by the webhook handler:
+        // a BOT-typed sender from the envelope is recognized as is_bot=true.
+        let envelope = build_space_envelope("spaces/T1", "users/bot1", true);
+        let parsed: GoogleChatEnvelope = serde_json::from_str(&envelope).unwrap();
+        let sender = parsed
+            .chat
+            .as_ref()
+            .and_then(|c| c.message_payload.as_ref())
+            .and_then(|p| p.message.as_ref())
+            .and_then(|m| m.sender.as_ref());
+        let is_bot = sender.map(|s| s.user_type == "BOT").unwrap_or(false);
+        assert!(is_bot);
+    }
+
+    #[tokio::test]
+    async fn mesh_bot_turns_counter_resets_on_human() {
+        // Direct cache-shape test: simulate the counter manipulation the
+        // webhook handler performs without spinning up an AppState.
+        let mut config = GoogleChatConfig::default();
+        config.allow_bots = AllowBots::All;
+        config.max_bot_turns = 3;
+        let adapter = make_mesh_adapter(config);
+
+        // 3 bot turns OK, 4th would exceed.
+        for expected in 1..=3 {
+            let mut turns = adapter.bot_turns.lock().await;
+            let c = turns.entry("spaces/T".into()).or_insert(0);
+            *c += 1;
+            assert_eq!(*c, expected);
+            assert!(*c <= adapter.config.max_bot_turns);
+        }
+        // 4th bot turn exceeds the cap.
+        {
+            let mut turns = adapter.bot_turns.lock().await;
+            let c = turns.entry("spaces/T".into()).or_insert(0);
+            *c += 1;
+            assert!(*c > adapter.config.max_bot_turns);
+        }
+        // Human message resets the counter.
+        adapter.bot_turns.lock().await.remove("spaces/T");
+        assert!(adapter.bot_turns.lock().await.get("spaces/T").is_none());
+    }
+
+    #[test]
+    fn allowed_users_excludes_unlisted_human() {
+        // Unit-level check of allowlist semantics: an empty list means
+        // "allow all", a non-empty list is a strict allowlist.
+        let mut config = GoogleChatConfig::default();
+        config.allowed_users = vec!["alice".into(), "bob".into()];
+        assert!(config.allowed_users.iter().any(|u| u == "alice"));
+        assert!(config.allowed_users.iter().any(|u| u == "bob"));
+        assert!(!config.allowed_users.iter().any(|u| u == "eve"));
     }
 }
