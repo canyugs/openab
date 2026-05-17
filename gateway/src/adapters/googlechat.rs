@@ -10,6 +10,9 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 pub const GOOGLE_CHAT_API_BASE: &str = "https://chat.googleapis.com/v1";
+/// Google Chat Media API base for `media.upload`. Distinct host prefix from
+/// the message API: `/upload/v1/...` instead of `/v1/...`.
+pub const GOOGLE_CHAT_UPLOAD_BASE: &str = "https://chat.googleapis.com/upload/v1";
 const GOOGLE_CHAT_MESSAGE_LIMIT: usize = 4096;
 
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
@@ -24,6 +27,15 @@ const MEDIA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const TEXT_FILE_COUNT_CAP: usize = 5;
 /// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
 const TEXT_TOTAL_CAP: u64 = 1024 * 1024;
+
+// Outbound attachment caps: mirror inbound limits per MIME family so what a
+// user can send the bot, the bot can send back.
+const OUTBOUND_IMAGE_MAX_BYTES: u64 = IMAGE_MAX_DOWNLOAD;
+const OUTBOUND_AUDIO_MAX_BYTES: u64 = AUDIO_MAX_DOWNLOAD;
+const OUTBOUND_TEXT_MAX_BYTES: u64 = TEXT_TOTAL_CAP;
+const OUTBOUND_PDF_MAX_BYTES: u64 = IMAGE_MAX_DOWNLOAD;
+/// Timeout for a single outbound upload request.
+const OUTBOUND_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // --- Google Chat types (v2 envelope format) ---
 
@@ -255,6 +267,7 @@ pub struct GoogleChatAdapter {
     pub jwt_verifier: Option<GoogleChatJwtVerifier>,
     pub client: reqwest::Client,
     pub api_base: String,
+    pub upload_base: String,
 }
 
 impl GoogleChatAdapter {
@@ -269,6 +282,7 @@ impl GoogleChatAdapter {
             jwt_verifier,
             client: reqwest::Client::new(),
             api_base: GOOGLE_CHAT_API_BASE.into(),
+            upload_base: GOOGLE_CHAT_UPLOAD_BASE.into(),
         }
     }
 
@@ -358,16 +372,52 @@ impl GoogleChatAdapter {
         let text = &reply.content.text;
         let chunks = split_text(text, GOOGLE_CHAT_MESSAGE_LIMIT);
 
-        // Empty message: short-circuit, send failure ack and skip API call
-        if chunks.is_empty() {
+        // Upload outbound attachments. Failures are logged and skipped — they
+        // don't abort the reply; text-only delivery is still useful.
+        let mut uploaded: Vec<serde_json::Value> = Vec::new();
+        let mut upload_errors: Vec<String> = Vec::new();
+        for att in &reply.content.attachments {
+            match upload_attachment(
+                &self.client,
+                &token,
+                &self.upload_base,
+                &reply.channel.id,
+                att,
+            )
+            .await
+            {
+                Ok(data_ref) => uploaded.push(build_attachment_payload(
+                    &data_ref,
+                    &att.filename,
+                    &att.mime_type,
+                )),
+                Err(e) => {
+                    warn!(
+                        filename = %att.filename,
+                        mime = %att.mime_type,
+                        error = %e,
+                        "googlechat outbound attachment skipped"
+                    );
+                    upload_errors.push(format!("{}: {}", att.filename, e));
+                }
+            }
+        }
+
+        // Short-circuit only when there is literally nothing to send.
+        if chunks.is_empty() && uploaded.is_empty() {
             if let Some(ref req_id) = reply.request_id {
+                let error_msg = if reply.content.attachments.is_empty() {
+                    "empty message".into()
+                } else {
+                    format!("empty message; all attachments failed: {}", upload_errors.join("; "))
+                };
                 let resp = crate::schema::GatewayResponse {
                     schema: "openab.gateway.response.v1".into(),
                     request_id: req_id.clone(),
                     success: false,
                     thread_id: None,
                     message_id: None,
-                    error: Some("empty message".into()),
+                    error: Some(error_msg),
                 };
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
@@ -376,48 +426,45 @@ impl GoogleChatAdapter {
             return;
         }
 
-        if chunks.len() == 1 {
+        let mut first_msg_name: Option<String> = None;
+        let mut first_error: Option<String> = None;
+
+        if chunks.is_empty() {
+            // Attachments only, no text.
             let result = send_message(
                 &self.client,
                 &token,
                 &reply.channel.id,
                 reply.channel.thread_id.as_deref(),
-                text,
+                "",
                 &self.api_base,
+                &uploaded,
             )
             .await;
-
-            if let Some(ref req_id) = reply.request_id {
-                let (success, message_id, error) = match result {
-                    Ok(name) => (true, Some(name), None),
-                    Err(e) => (false, None, Some(e)),
-                };
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success,
-                    thread_id: None,
-                    message_id,
-                    error,
-                };
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    let _ = event_tx.send(json);
-                }
+            match result {
+                Ok(name) => first_msg_name = Some(name),
+                Err(e) => first_error = Some(e),
             }
         } else {
-            let mut first_msg_name: Option<String> = None;
-            let mut first_error: Option<String> = None;
-            for chunk in chunks {
-                match send_message(
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                // Attachments piggyback on the first chunk only, so the user
+                // doesn't see N copies of the same image across split messages.
+                let attachments_for_chunk: &[serde_json::Value] = if idx == 0 {
+                    &uploaded
+                } else {
+                    &[]
+                };
+                let result = send_message(
                     &self.client,
                     &token,
                     &reply.channel.id,
                     reply.channel.thread_id.as_deref(),
                     chunk,
                     &self.api_base,
+                    attachments_for_chunk,
                 )
-                .await
-                {
+                .await;
+                match result {
                     Ok(name) => {
                         if first_msg_name.is_none() {
                             first_msg_name = Some(name);
@@ -430,18 +477,30 @@ impl GoogleChatAdapter {
                     }
                 }
             }
-            if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: first_msg_name.is_some() && first_error.is_none(),
-                    thread_id: None,
-                    message_id: first_msg_name,
-                    error: first_error,
-                };
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    let _ = event_tx.send(json);
-                }
+        }
+
+        if let Some(ref req_id) = reply.request_id {
+            // text delivered AND no chunk failed; partial-upload failures alone
+            // do not flip success to false, but are surfaced via `error`.
+            let text_ok = first_msg_name.is_some() && first_error.is_none();
+            let error = match (first_error, upload_errors.is_empty()) {
+                (Some(e), _) => Some(e),
+                (None, false) => Some(format!(
+                    "attachment upload partial failure: {}",
+                    upload_errors.join("; ")
+                )),
+                (None, true) => None,
+            };
+            let resp = crate::schema::GatewayResponse {
+                schema: "openab.gateway.response.v1".into(),
+                request_id: req_id.clone(),
+                success: text_ok,
+                thread_id: None,
+                message_id: first_msg_name,
+                error,
+            };
+            if let Ok(json) = serde_json::to_string(&resp) {
+                let _ = event_tx.send(json);
             }
         }
     }
@@ -1046,6 +1105,7 @@ async fn send_message(
     thread_id: Option<&str>,
     text: &str,
     api_base: &str,
+    attachments: &[serde_json::Value],
 ) -> Result<String, String> {
     let mut url = format!("{}/{}/messages", api_base, space);
 
@@ -1053,6 +1113,10 @@ async fn send_message(
     let mut body = serde_json::json!({
         "text": formatted,
     });
+
+    if !attachments.is_empty() {
+        body["attachment"] = serde_json::Value::Array(attachments.to_vec());
+    }
 
     if let Some(thread_id) = thread_id {
         body["thread"] = serde_json::json!({
@@ -1116,6 +1180,131 @@ fn split_text(text: &str, limit: usize) -> Vec<&str> {
         start = break_at;
     }
     chunks
+}
+
+// --- Outbound attachment upload (bot → user) ---
+
+/// Returns the per-MIME outbound size cap, or None if the MIME family is not
+/// allowed for outbound. Mirrors inbound limits so the bot can send back what
+/// a user can send it. `video/*` is intentionally skipped to match inbound.
+fn outbound_mime_cap(mime: &str) -> Option<u64> {
+    let lower = mime.to_ascii_lowercase();
+    if lower.starts_with("image/") {
+        Some(OUTBOUND_IMAGE_MAX_BYTES)
+    } else if lower.starts_with("audio/") {
+        Some(OUTBOUND_AUDIO_MAX_BYTES)
+    } else if lower.starts_with("text/") {
+        Some(OUTBOUND_TEXT_MAX_BYTES)
+    } else if lower == "application/pdf" {
+        Some(OUTBOUND_PDF_MAX_BYTES)
+    } else {
+        None
+    }
+}
+
+/// Build the JSON object for a single outbound attachment entry in
+/// `messages.create` request body, from the `attachmentDataRef` returned by
+/// `media.upload`.
+fn build_attachment_payload(
+    data_ref: &serde_json::Value,
+    filename: &str,
+    mime: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "contentName": filename,
+        "contentType": mime,
+        "attachmentDataRef": data_ref,
+    })
+}
+
+/// Build a `multipart/related` body for the Google Chat Media API.
+///
+/// Google's `media.upload` requires `multipart/related` (not the
+/// `multipart/form-data` produced by `reqwest::multipart::Form`), with the
+/// metadata part first and the media part second. Returns
+/// `(content_type_header_value, body_bytes)`.
+fn build_multipart_related(metadata_json: &str, media: &[u8], media_mime: &str) -> (String, Vec<u8>) {
+    let boundary = format!("oab_gc_{}", uuid::Uuid::new_v4().simple());
+    let mut body: Vec<u8> = Vec::with_capacity(media.len() + metadata_json.len() + 256);
+    body.extend_from_slice(b"--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n");
+    body.extend_from_slice(metadata_json.as_bytes());
+    body.extend_from_slice(b"\r\n--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"\r\nContent-Type: ");
+    body.extend_from_slice(media_mime.as_bytes());
+    body.extend_from_slice(b"\r\n\r\n");
+    body.extend_from_slice(media);
+    body.extend_from_slice(b"\r\n--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"--\r\n");
+    (format!("multipart/related; boundary={}", boundary), body)
+}
+
+/// Upload a single attachment to Google Chat via the Media API
+/// (`spaces.messages.attachments.upload`) and return the `attachmentDataRef`
+/// JSON object to be embedded in a subsequent `messages.create` request.
+///
+/// Performs all client-side validation (MIME whitelist, size cap, base64
+/// decode) before any network call. Returns `Err(String)` on any failure;
+/// callers are expected to log and skip the attachment, not abort the reply.
+async fn upload_attachment(
+    client: &reqwest::Client,
+    token: &str,
+    upload_base: &str,
+    space: &str,
+    att: &crate::schema::Attachment,
+) -> Result<serde_json::Value, String> {
+    let cap = outbound_mime_cap(&att.mime_type)
+        .ok_or_else(|| format!("outbound MIME not allowed: {}", att.mime_type))?;
+
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(att.data.as_bytes())
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+
+    if (bytes.len() as u64) > cap {
+        return Err(format!(
+            "attachment size {} exceeds cap {} for mime {}",
+            bytes.len(),
+            cap,
+            att.mime_type
+        ));
+    }
+
+    let url = format!(
+        "{}/{}/attachments:upload?uploadType=multipart",
+        upload_base, space
+    );
+
+    let metadata = serde_json::json!({ "filename": att.filename }).to_string();
+    let (content_type, body) = build_multipart_related(&metadata, &bytes, &att.mime_type);
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .timeout(OUTBOUND_UPLOAD_TIMEOUT)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("upload request error: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("upload failed: {} {}", status, body));
+    }
+
+    let parsed: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("upload response parse: {e}"))?;
+    parsed
+        .get("attachmentDataRef")
+        .cloned()
+        .ok_or_else(|| "upload response missing attachmentDataRef".into())
 }
 
 // --- Attachment parsing & download ---
@@ -2420,5 +2609,321 @@ mod tests {
         )
         .await;
         assert!(result.is_none(), "oversized image must be rejected");
+    }
+
+    // --- Outbound attachment tests ---
+
+    #[test]
+    fn outbound_mime_cap_allows_image_audio_text_pdf() {
+        assert_eq!(outbound_mime_cap("image/png"), Some(OUTBOUND_IMAGE_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("image/jpeg"), Some(OUTBOUND_IMAGE_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("audio/mpeg"), Some(OUTBOUND_AUDIO_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("text/plain"), Some(OUTBOUND_TEXT_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("application/pdf"), Some(OUTBOUND_PDF_MAX_BYTES));
+    }
+
+    #[test]
+    fn outbound_mime_cap_skips_video_and_unknown() {
+        assert_eq!(outbound_mime_cap("video/mp4"), None);
+        assert_eq!(outbound_mime_cap("application/x-executable"), None);
+        assert_eq!(outbound_mime_cap("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn outbound_mime_cap_case_insensitive() {
+        assert_eq!(outbound_mime_cap("Image/PNG"), Some(OUTBOUND_IMAGE_MAX_BYTES));
+        assert_eq!(outbound_mime_cap("APPLICATION/PDF"), Some(OUTBOUND_PDF_MAX_BYTES));
+    }
+
+    #[test]
+    fn build_attachment_payload_has_expected_shape() {
+        let data_ref = serde_json::json!({
+            "resourceName": "spaces/X/attachments/AB.token",
+            "attachmentToken": "tok"
+        });
+        let payload = build_attachment_payload(&data_ref, "chart.png", "image/png");
+        assert_eq!(payload["contentName"], "chart.png");
+        assert_eq!(payload["contentType"], "image/png");
+        assert_eq!(payload["attachmentDataRef"]["resourceName"], "spaces/X/attachments/AB.token");
+    }
+
+    fn make_image_attachment(bytes: &[u8]) -> crate::schema::Attachment {
+        use base64::Engine;
+        crate::schema::Attachment {
+            attachment_type: "image".into(),
+            filename: "pixel.png".into(),
+            mime_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            size: bytes.len() as u64,
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_reply_with_image_attachment_uploads_and_sends() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "attachmentDataRef": {
+                    "resourceName": "spaces/TEST/attachments/AB.token",
+                    "attachmentToken": "tok-xyz"
+                },
+                "contentType": "image/png"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/TEST/messages/msg_abc"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig_msg".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![make_image_attachment(b"\x89PNG\r\n\x1a\n fake")],
+                text: "here you go".into(),
+            },
+            command: None,
+            request_id: Some("req_att".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let received = event_rx.try_recv().expect("expected GatewayResponse");
+        let resp: GatewayResponse = serde_json::from_str(&received).unwrap();
+        assert!(resp.success, "expected success, got error: {:?}", resp.error);
+        assert_eq!(resp.message_id, Some("spaces/TEST/messages/msg_abc".into()));
+        assert!(resp.error.is_none(), "no error expected: {:?}", resp.error);
+    }
+
+    #[tokio::test]
+    async fn handle_reply_attachment_only_no_text_still_sends() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "attachmentDataRef": {
+                    "resourceName": "spaces/T/attachments/A.tok",
+                    "attachmentToken": "t"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/T/messages/m1"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "x".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel { id: "spaces/T".into(), thread_id: None },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![make_image_attachment(b"px")],
+                text: "".into(),
+            },
+            command: None,
+            request_id: Some("req_only".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let resp: GatewayResponse = serde_json::from_str(&event_rx.try_recv().unwrap()).unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.message_id, Some("spaces/T/messages/m1".into()));
+    }
+
+    #[tokio::test]
+    async fn handle_reply_upload_failure_falls_back_to_text_only() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/T/messages/m2"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "x".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel { id: "spaces/T".into(), thread_id: None },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![make_image_attachment(b"px")],
+                text: "the text still goes out".into(),
+            },
+            command: None,
+            request_id: Some("req_partial".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let resp: GatewayResponse = serde_json::from_str(&event_rx.try_recv().unwrap()).unwrap();
+        // Text delivery succeeded, so overall success=true; but error field
+        // surfaces the attachment failure for observability.
+        assert!(resp.success);
+        let err = resp.error.expect("partial upload failure should be surfaced");
+        assert!(err.contains("partial failure"), "error should mention partial failure, got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn handle_reply_unsupported_mime_skipped_no_upload_call() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        // Upload mock must NOT be called for unsupported MIME.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/T/messages/m3"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        use base64::Engine;
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "x".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel { id: "spaces/T".into(), thread_id: None },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![crate::schema::Attachment {
+                    attachment_type: "video".into(),
+                    filename: "clip.mp4".into(),
+                    mime_type: "video/mp4".into(),
+                    data: base64::engine::general_purpose::STANDARD.encode(b"px"),
+                    size: 2,
+                }],
+                text: "video as text".into(),
+            },
+            command: None,
+            request_id: Some("req_skip".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let resp: GatewayResponse = serde_json::from_str(&event_rx.try_recv().unwrap()).unwrap();
+        assert!(resp.success);
+        let err = resp.error.expect("MIME-skip should surface as partial failure");
+        assert!(err.contains("MIME not allowed") || err.contains("partial failure"));
+    }
+
+    #[tokio::test]
+    async fn handle_reply_attachment_size_exceeds_cap_skipped() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/attachments:upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/T/messages/m4"}),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = mock_server.uri();
+        adapter.upload_base = mock_server.uri();
+
+        let oversize_bytes = vec![0u8; (OUTBOUND_IMAGE_MAX_BYTES as usize) + 1024];
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "x".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel { id: "spaces/T".into(), thread_id: None },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![make_image_attachment(&oversize_bytes)],
+                text: "still got text".into(),
+            },
+            command: None,
+            request_id: Some("req_big".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+
+        let resp: GatewayResponse = serde_json::from_str(&event_rx.try_recv().unwrap()).unwrap();
+        assert!(resp.success);
+        assert!(resp.error.unwrap().contains("exceeds cap"));
     }
 }

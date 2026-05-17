@@ -148,12 +148,18 @@ working_dir = "/home/agent"
   - Text files: only known text extensions (`.txt`, `.md`, `.json`, `.py`, `.rs`, etc.). Max 512 KB.
   - Audio: forwarded as-is for STT processing by core. Max 25 MB.
   - Drive-sourced attachments are skipped (require separate Drive API integration).
+- **Outbound attachments** — bot can send back attachments via the Google Chat Media API (`spaces.messages.attachments.upload` + `messages.create` `attachment[]`):
+  - MIME whitelist mirrors inbound: `image/*` (≤10 MB), `audio/*` (≤25 MB), `text/*` (≤1 MB), `application/pdf` (≤10 MB).
+  - Upload failures are logged and skipped — text delivery is not blocked by a failed attachment; the partial failure is reported back via the `error` field of the `GatewayResponse`.
+  - When a reply is split across multiple messages (text > 4096 chars), attachments are piggybacked on the first chunk only.
+  - `video/*` is intentionally skipped (matches inbound behavior).
+  - Uses the same `chat.bot` OAuth scope as the message API — no SA changes required.
 
 ### Not Supported
 
 - **Reactions** — Google Chat API does not support message reactions on behalf of bots
-- **Outbound attachments** — bot cannot send image/file attachments back to the user yet
-- **Drive-linked attachments** — only `UPLOADED_CONTENT` source is handled; `DRIVE_FILE` source skipped
+- **Drive-linked attachments** — only `UPLOADED_CONTENT` source is handled; `DRIVE_FILE` source skipped (both inbound and outbound)
+- **`cardsV2` image cards** — outbound supports `attachment[]` (uploaded bytes) only; rendering an external URL as an image card is not implemented
 
 ## Environment Variables (Gateway)
 
