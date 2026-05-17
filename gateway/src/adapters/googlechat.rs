@@ -94,6 +94,11 @@ pub struct GoogleChatConfig {
     /// TTL for participated-thread cache (seconds). 0 disables participation
     /// tracking, requiring every message to be a fresh @mention.
     pub session_ttl_secs: u64,
+    /// When true, the SA token request asks for the `drive.readonly` scope
+    /// in addition to `chat.bot`, allowing the adapter to download
+    /// Drive-sourced attachments (`DRIVE_FILE` source). Deployments must
+    /// pre-authorize the SA for this scope; otherwise token exchange fails.
+    pub enable_drive_attachments: bool,
 }
 
 impl Default for GoogleChatConfig {
@@ -107,6 +112,7 @@ impl Default for GoogleChatConfig {
             trusted_bot_ids: Vec::new(),
             max_bot_turns: 20,
             session_ttl_secs: 24 * 3600,
+            enable_drive_attachments: false,
         }
     }
 }
@@ -155,6 +161,9 @@ impl GoogleChatConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(24)
             * 3600;
+        let enable_drive_attachments = std::env::var("GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
 
         Self {
             allow_dm,
@@ -165,6 +174,7 @@ impl GoogleChatConfig {
             trusted_bot_ids,
             max_bot_turns,
             session_ttl_secs,
+            enable_drive_attachments,
         }
     }
 }
@@ -233,7 +243,6 @@ pub struct AttachmentDataRef {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct DriveDataRef {
     pub drive_file_id: Option<String>,
 }
@@ -251,6 +260,14 @@ pub enum GoogleChatMediaRef {
     },
     Audio {
         resource_name: String,
+        content_name: String,
+        content_type: String,
+    },
+    /// User attached a Google Drive file (not direct upload). Downloaded via
+    /// Drive API; requires `drive.readonly` SA scope (gated by
+    /// `GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS`).
+    DriveFile {
+        drive_file_id: String,
         content_name: String,
         content_type: String,
     },
@@ -409,6 +426,7 @@ pub struct GoogleChatAdapter {
     pub client: reqwest::Client,
     pub api_base: String,
     pub upload_base: String,
+    pub drive_api_base: String,
     pub config: GoogleChatConfig,
     /// Consecutive bot-to-bot turn counter, keyed by Space resource name.
     /// Reset on any human message in the Space.
@@ -436,6 +454,7 @@ impl GoogleChatAdapter {
             client: reqwest::Client::new(),
             api_base: GOOGLE_CHAT_API_BASE.into(),
             upload_base: GOOGLE_CHAT_UPLOAD_BASE.into(),
+            drive_api_base: GOOGLE_DRIVE_API_BASE.into(),
             config,
             bot_turns: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             participated_threads: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -914,6 +933,40 @@ pub async fn webhook(
                             )
                             .await
                         }
+                        GoogleChatMediaRef::DriveFile {
+                            drive_file_id,
+                            content_name,
+                            content_type,
+                        } => {
+                            if !adapter.config.enable_drive_attachments {
+                                warn!(
+                                    content_name = %content_name,
+                                    "googlechat: drive attachment skipped (GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS=false)"
+                                );
+                                continue;
+                            }
+                            let remaining = TEXT_TOTAL_CAP.saturating_sub(text_file_bytes);
+                            let att = download_googledrive_file(
+                                &adapter.client,
+                                &token,
+                                &adapter.drive_api_base,
+                                drive_file_id,
+                                content_name,
+                                content_type,
+                                remaining,
+                            )
+                            .await;
+                            let Some(att) = att else { continue };
+                            if att.attachment_type == "text_file" {
+                                if text_file_count >= TEXT_FILE_COUNT_CAP {
+                                    warn!(content_name = %content_name, cap = TEXT_FILE_COUNT_CAP, "googlechat drive text file count cap reached, skipping");
+                                    continue;
+                                }
+                                text_file_count += 1;
+                                text_file_bytes += att.size;
+                            }
+                            Some(att)
+                        }
                     };
                     if let Some(att) = attachment {
                         downloaded.push(att);
@@ -1020,12 +1073,27 @@ pub struct GoogleChatTokenCache {
     token: RwLock<Option<(String, Instant, u64)>>,
     sa_email: String,
     private_key: String,
+    /// Space-separated OAuth scopes requested in the JWT. Always includes
+    /// `chat.bot`; extra scopes (e.g. `drive.readonly`) are appended when
+    /// optional features are enabled.
+    scopes: String,
 }
 
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
+const GOOGLE_CHAT_BASE_SCOPE: &str = "https://www.googleapis.com/auth/chat.bot";
+const GOOGLE_DRIVE_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 
 impl GoogleChatTokenCache {
     pub fn new(sa_key_json: &str) -> Result<Self, String> {
+        Self::new_with_scopes(sa_key_json, &[])
+    }
+
+    /// Build a token cache requesting `chat.bot` plus any additional scopes.
+    /// Pass `&[GOOGLE_DRIVE_READONLY_SCOPE]` to enable Drive-attachment
+    /// downloads. Token exchange will fail at runtime if the deployment
+    /// hasn't authorized the SA for the requested scopes — fail-fast is
+    /// preferred over silently degrading.
+    pub fn new_with_scopes(sa_key_json: &str, extra_scopes: &[&str]) -> Result<Self, String> {
         let key: serde_json::Value =
             serde_json::from_str(sa_key_json).map_err(|e| format!("invalid SA key JSON: {e}"))?;
         let email = key
@@ -1038,10 +1106,13 @@ impl GoogleChatTokenCache {
             .and_then(|v| v.as_str())
             .ok_or("missing private_key in SA key")?
             .to_string();
+        let mut scope_list = vec![GOOGLE_CHAT_BASE_SCOPE.to_string()];
+        scope_list.extend(extra_scopes.iter().map(|s| s.to_string()));
         Ok(Self {
             token: RwLock::new(None),
             sa_email: email,
             private_key: pkey,
+            scopes: scope_list.join(" "),
         })
     }
 
@@ -1111,7 +1182,7 @@ impl GoogleChatTokenCache {
 
         let claims = serde_json::json!({
             "iss": self.sa_email,
-            "scope": "https://www.googleapis.com/auth/chat.bot",
+            "scope": self.scopes,
             "aud": "https://oauth2.googleapis.com/token",
             "iat": now,
             "exp": now + 3600,
@@ -1558,39 +1629,66 @@ const TEXT_EXTS: &[&str] = &[
 fn parse_attachments(attachments: &[GoogleChatAttachment]) -> Vec<GoogleChatMediaRef> {
     let mut refs = Vec::new();
     for att in attachments {
-        // Only handle UPLOADED_CONTENT (Drive needs separate Drive API call)
-        if att.source.as_deref() != Some("UPLOADED_CONTENT") {
-            continue;
-        }
-        let resource_name = match att
-            .attachment_data_ref
-            .as_ref()
-            .and_then(|d| d.resource_name.clone())
-        {
-            Some(rn) => rn,
-            None => continue,
-        };
         let content_type = att.content_type.clone().unwrap_or_default();
         let content_name = att.content_name.clone().unwrap_or_else(|| "file".into());
 
-        if content_type.starts_with("image/") {
-            refs.push(GoogleChatMediaRef::Image {
-                resource_name,
-                content_name,
-            });
-        } else if content_type.starts_with("audio/") {
-            refs.push(GoogleChatMediaRef::Audio {
-                resource_name,
-                content_name,
-                content_type,
-            });
-        } else if content_type.starts_with("video/") {
-            info!(content_name = %content_name, content_type = %content_type, "googlechat: video attachment skipped (not yet supported)");
-        } else {
-            refs.push(GoogleChatMediaRef::File {
-                resource_name,
-                content_name,
-            });
+        match att.source.as_deref() {
+            Some("DRIVE_FILE") => {
+                let drive_file_id = match att
+                    .drive_data_ref
+                    .as_ref()
+                    .and_then(|d| d.drive_file_id.clone())
+                {
+                    Some(id) => id,
+                    None => continue,
+                };
+                if content_type.starts_with("video/") {
+                    info!(content_name = %content_name, content_type = %content_type, "googlechat: drive video attachment skipped (not yet supported)");
+                    continue;
+                }
+                // Google-native types (Doc / Sheet / Slides) need Drive's
+                // `export` API with a target MIME, not `files.{id}?alt=media`.
+                // Out of scope for the first cut — skip with a debug log.
+                if content_type.starts_with("application/vnd.google-apps") {
+                    tracing::debug!(content_name = %content_name, content_type = %content_type, "googlechat: google-native drive type skipped (needs Drive export API)");
+                    continue;
+                }
+                refs.push(GoogleChatMediaRef::DriveFile {
+                    drive_file_id,
+                    content_name,
+                    content_type,
+                });
+            }
+            Some("UPLOADED_CONTENT") => {
+                let resource_name = match att
+                    .attachment_data_ref
+                    .as_ref()
+                    .and_then(|d| d.resource_name.clone())
+                {
+                    Some(rn) => rn,
+                    None => continue,
+                };
+                if content_type.starts_with("image/") {
+                    refs.push(GoogleChatMediaRef::Image {
+                        resource_name,
+                        content_name,
+                    });
+                } else if content_type.starts_with("audio/") {
+                    refs.push(GoogleChatMediaRef::Audio {
+                        resource_name,
+                        content_name,
+                        content_type,
+                    });
+                } else if content_type.starts_with("video/") {
+                    info!(content_name = %content_name, content_type = %content_type, "googlechat: video attachment skipped (not yet supported)");
+                } else {
+                    refs.push(GoogleChatMediaRef::File {
+                        resource_name,
+                        content_name,
+                    });
+                }
+            }
+            _ => continue,
         }
     }
     refs
@@ -1787,6 +1885,123 @@ pub async fn download_googlechat_audio(
         data,
         size: bytes.len() as u64,
     })
+}
+
+/// Base URL for Google Drive v3 API. Override only in tests.
+pub const GOOGLE_DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
+
+/// Download a Drive-sourced attachment via the Drive v3 API.
+///
+/// Routes the result into the same image/file/audio post-processing as
+/// uploaded-content attachments so the downstream agent sees a uniform
+/// `Attachment` shape regardless of source. Requires a token issued with
+/// the `drive.readonly` scope — token exchange will fail upstream if the
+/// SA hasn't been authorized for Drive.
+///
+/// Per-family caps (image 10 MB / audio 25 MB / text 1 MB per file) match
+/// the inbound `UPLOADED_CONTENT` limits.
+pub async fn download_googledrive_file(
+    client: &reqwest::Client,
+    token: &str,
+    drive_api_base: &str,
+    drive_file_id: &str,
+    content_name: &str,
+    content_type: &str,
+    remaining_text_budget: u64,
+) -> Option<crate::schema::Attachment> {
+    // Decide cap up front so we can reject oversize at Content-Length time.
+    let (cap, kind): (u64, &str) = if content_type.starts_with("image/") {
+        (IMAGE_MAX_DOWNLOAD, "image")
+    } else if content_type.starts_with("audio/") {
+        (AUDIO_MAX_DOWNLOAD, "audio")
+    } else if content_type.starts_with("text/") {
+        (FILE_MAX_DOWNLOAD.min(remaining_text_budget), "file")
+    } else {
+        // Try to treat unknown content types as text if the extension is in
+        // the inbound text whitelist; otherwise skip.
+        let ext = content_name.rsplit('.').next().unwrap_or("").to_lowercase();
+        if TEXT_EXTS.contains(&ext.as_str()) {
+            (FILE_MAX_DOWNLOAD.min(remaining_text_budget), "file")
+        } else {
+            tracing::debug!(content_name, content_type, "skipping unsupported drive content type");
+            return None;
+        }
+    };
+
+    let url = format!("{}/files/{}?alt=media", drive_api_base, drive_file_id);
+    let resp = match client
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(MEDIA_REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(content_name, error = %e, "googledrive download failed");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(content_name, status = %resp.status(), "googledrive download failed");
+        return None;
+    }
+    if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+        if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
+            if size > cap {
+                warn!(content_name, size, cap, "googledrive Content-Length exceeds cap");
+                return None;
+            }
+        }
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() as u64 > cap {
+        warn!(content_name, size = bytes.len(), cap, "googledrive payload exceeds cap");
+        return None;
+    }
+
+    match kind {
+        "image" => {
+            let (compressed, mime) = match resize_and_compress(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(content_name, error = %e, "googledrive image resize failed");
+                    return None;
+                }
+            };
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(&compressed);
+            Some(crate::schema::Attachment {
+                attachment_type: "image".into(),
+                filename: content_name.to_string(),
+                mime_type: mime,
+                data,
+                size: compressed.len() as u64,
+            })
+        }
+        "audio" => {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Some(crate::schema::Attachment {
+                attachment_type: "audio".into(),
+                filename: content_name.to_string(),
+                mime_type: content_type.to_string(),
+                data,
+                size: bytes.len() as u64,
+            })
+        }
+        _ => {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Some(crate::schema::Attachment {
+                attachment_type: "text_file".into(),
+                filename: content_name.to_string(),
+                mime_type: content_type.to_string(),
+                data,
+                size: bytes.len() as u64,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2662,7 +2877,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_attachments_skips_drive() {
+    fn parse_attachments_skips_google_native_drive_types() {
+        // Google-native types (Docs/Sheets/Slides) require Drive's export API
+        // and cannot be fetched via files.{id}?alt=media — skipped at parse.
         let atts = vec![GoogleChatAttachment {
             name: Some("spaces/SP/messages/MSG/attachments/ATT".into()),
             content_name: Some("doc".into()),
@@ -2674,6 +2891,157 @@ mod tests {
             }),
         }];
         assert_eq!(parse_attachments(&atts).len(), 0);
+    }
+
+    #[test]
+    fn parse_attachments_emits_drive_file_for_uploaded_binary() {
+        // A regular file (image, PDF, audio, text) uploaded to Drive and then
+        // attached should produce a DriveFile media ref.
+        let atts = vec![GoogleChatAttachment {
+            name: Some("spaces/SP/messages/MSG/attachments/ATT".into()),
+            content_name: Some("photo.png".into()),
+            content_type: Some("image/png".into()),
+            source: Some("DRIVE_FILE".into()),
+            attachment_data_ref: None,
+            drive_data_ref: Some(DriveDataRef {
+                drive_file_id: Some("drive_id_456".into()),
+            }),
+        }];
+        let refs = parse_attachments(&atts);
+        assert_eq!(refs.len(), 1);
+        assert!(matches!(refs[0], GoogleChatMediaRef::DriveFile { .. }));
+    }
+
+    #[test]
+    fn parse_attachments_skips_drive_file_with_missing_id() {
+        let atts = vec![GoogleChatAttachment {
+            name: Some("spaces/SP/messages/MSG/attachments/ATT".into()),
+            content_name: Some("photo.png".into()),
+            content_type: Some("image/png".into()),
+            source: Some("DRIVE_FILE".into()),
+            attachment_data_ref: None,
+            drive_data_ref: Some(DriveDataRef {
+                drive_file_id: None,
+            }),
+        }];
+        assert_eq!(parse_attachments(&atts).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn download_googledrive_file_image_succeeds() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+        // Use a minimal but valid 1x1 PNG so resize_and_compress doesn't fail.
+        let png_bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+            0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+            0x42, 0x60, 0x82,
+        ];
+        Mock::given(method("GET"))
+            .and(path("/files/drv-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(png_bytes))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googledrive_file(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "drv-abc",
+            "photo.png",
+            "image/png",
+            TEXT_TOTAL_CAP,
+        )
+        .await;
+        let att = result.expect("expected image attachment");
+        assert_eq!(att.attachment_type, "image");
+        assert_eq!(att.filename, "photo.png");
+    }
+
+    #[tokio::test]
+    async fn download_googledrive_file_rejects_oversize_via_content_length() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/files/big"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "30000000") // 30 MB > 25 MB audio cap
+                    .set_body_bytes(vec![0u8; 100]),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googledrive_file(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "big",
+            "song.mp3",
+            "audio/mpeg",
+            TEXT_TOTAL_CAP,
+        )
+        .await;
+        assert!(result.is_none(), "oversized audio must be rejected");
+    }
+
+    #[tokio::test]
+    async fn download_googledrive_file_skips_unsupported_type() {
+        // Unknown content type with no whitelisted extension → skip without
+        // hitting the network. Mock with expect(0) to enforce no request.
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path_regex};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/files/.*"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = download_googledrive_file(
+            &client,
+            "fake-token",
+            &mock_server.uri(),
+            "x",
+            "weird.bin",
+            "application/x-executable",
+            TEXT_TOTAL_CAP,
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn token_cache_default_scope_is_chat_bot() {
+        let key_json = r#"{
+            "client_email": "test@example.iam.gserviceaccount.com",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nMIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA0Z+8O1eaQ9YHGsxn\nVQQAAAAAAAA=\n-----END PRIVATE KEY-----\n"
+        }"#;
+        // Parse may fail on the dummy key but that's not what we're testing
+        // — we want to check the scope string composition when it succeeds.
+        if let Ok(cache) = GoogleChatTokenCache::new_with_scopes(key_json, &[]) {
+            assert_eq!(cache.scopes, GOOGLE_CHAT_BASE_SCOPE);
+        }
+        if let Ok(cache) = GoogleChatTokenCache::new_with_scopes(
+            key_json,
+            &[GOOGLE_DRIVE_READONLY_SCOPE],
+        ) {
+            assert_eq!(
+                cache.scopes,
+                format!("{} {}", GOOGLE_CHAT_BASE_SCOPE, GOOGLE_DRIVE_READONLY_SCOPE)
+            );
+        }
     }
 
     #[test]

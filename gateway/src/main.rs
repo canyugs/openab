@@ -283,6 +283,14 @@ async fn main() -> Result<()> {
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
     let google_chat = if google_chat_enabled {
+        let drive_enabled = std::env::var("GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let extra_scopes: Vec<&str> = if drive_enabled {
+            vec!["https://www.googleapis.com/auth/drive.readonly"]
+        } else {
+            vec![]
+        };
         let token_cache = std::env::var("GOOGLE_CHAT_SA_KEY_JSON")
             .ok()
             .or_else(|| {
@@ -291,7 +299,7 @@ async fn main() -> Result<()> {
                     .and_then(|path| std::fs::read_to_string(&path).ok())
             })
             .and_then(|json| {
-                adapters::googlechat::GoogleChatTokenCache::new(&json)
+                adapters::googlechat::GoogleChatTokenCache::new_with_scopes(&json, &extra_scopes)
                     .map_err(|e| warn!("googlechat SA key error: {e}"))
                     .ok()
             });
@@ -329,6 +337,9 @@ async fn main() -> Result<()> {
         }
         if config.allow_bots != adapters::googlechat::AllowBots::Off {
             info!(?config.allow_bots, max_turns = config.max_bot_turns, "googlechat: bot-to-bot mesh enabled");
+        }
+        if config.enable_drive_attachments {
+            info!("googlechat: Drive attachment downloads enabled (drive.readonly scope requested)");
         }
         Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier, config))
     } else {

@@ -149,7 +149,7 @@ working_dir = "/home/agent"
   - Images: resized to ≤1200px JPEG (q75); GIFs preserved. Max 10 MB.
   - Text files: only known text extensions (`.txt`, `.md`, `.json`, `.py`, `.rs`, etc.). Max 512 KB.
   - Audio: forwarded as-is for STT processing by core. Max 25 MB.
-  - Drive-sourced attachments are skipped (require separate Drive API integration).
+- **Drive-linked attachments** — opt-in via `GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS=true`. Files uploaded to Google Drive and then attached to a Chat message are fetched via the Drive v3 API and pass through the same image / file / audio post-processing as `UPLOADED_CONTENT` attachments. **Requires** the SA to be authorized for the `drive.readonly` OAuth scope. Google-native types (Docs / Sheets / Slides) are skipped — they need the Drive `export` API which is out of scope for this version.
 - **Outbound attachments** — bot can send back attachments via the Google Chat Media API (`spaces.messages.attachments.upload` + `messages.create` `attachment[]`):
   - MIME whitelist mirrors inbound: `image/*` (≤10 MB), `audio/*` (≤25 MB), `text/*` (≤1 MB), `application/pdf` (≤10 MB).
   - Upload failures are logged and skipped — text delivery is not blocked by a failed attachment; the partial failure is reported back via the `error` field of the `GatewayResponse`.
@@ -160,7 +160,8 @@ working_dir = "/home/agent"
 ### Not Supported
 
 - **Reactions** — Google Chat API does not support message reactions on behalf of bots
-- **Drive-linked attachments** — only `UPLOADED_CONTENT` source is handled; `DRIVE_FILE` source skipped (both inbound and outbound)
+- **Outbound Drive attachments** — bot replies use direct upload (`UPLOADED_CONTENT`); the bot cannot attach a file by Drive ID
+- **Google-native Drive types (Docs / Sheets / Slides)** — would need the Drive `export` API; not implemented
 - **`cardsV2` image cards** — outbound supports `attachment[]` (uploaded bytes) only; rendering an external URL as an image card is not implemented
 
 ## Environment Variables (Gateway)
@@ -193,6 +194,14 @@ working_dir = "/home/agent"
 | `GOOGLE_CHAT_MAX_BOT_TURNS` | `20` | Maximum consecutive bot-to-bot turns per Space before responses stop. Reset on any human message. Hard-capped to `10` when `GOOGLE_CHAT_ALLOW_BOTS=all`. |
 | `GOOGLE_CHAT_ALLOW_USER_MESSAGES` | `involved` | `involved` / `mentions` / `multibot-mentions` — kept for parity with `feishu`. Note: Google Chat platform forces @mention in every Space message, so these modes behave equivalently for normal Space messaging. |
 | `GOOGLE_CHAT_SESSION_TTL_HOURS` | `24` | TTL for participated-thread cache (hours). `0` disables participation tracking. |
+
+### Drive attachments (opt-in)
+
+| Variable | Default | Description |
+|---|---|---|
+| `GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS` | `false` | Set to `true` to download Drive-sourced attachments. **Requires the SA to be authorized for the `https://www.googleapis.com/auth/drive.readonly` scope** — see SA scope note below. Token exchange will fail with a 401/403 if the SA hasn't been pre-authorized. |
+
+**SA scope note**: When `GOOGLE_CHAT_ENABLE_DRIVE_ATTACHMENTS=true`, the SA JWT requests `chat.bot drive.readonly`. For a deployment that hasn't already authorized the SA for Drive, this is a **breaking change at token-exchange time**, not at handler time — once the flag is on, the SA must be re-authorized via Workspace Admin's Domain-wide Delegation page or the Drive API will reject the OAuth token request entirely. Leave the flag off if your deployment doesn't need Drive attachments.
 
 ## Security: Webhook Verification
 
