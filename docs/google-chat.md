@@ -127,8 +127,10 @@ working_dir = "/home/agent"
 
 ### Supported
 
-- **DM chat** — send a direct message to the bot, get an AI agent response
-- **Space chat** — add the bot to a Google Chat Space, @mention it to start a conversation
+- **DM chat** — opt-in via `GOOGLE_CHAT_ALLOW_DM=true`; send a direct message to the bot, get an AI agent response
+- **Space chat** — add the bot to a Google Chat Space, @mention it to start a conversation; optionally restricted via `GOOGLE_CHAT_ALLOWED_SPACES`
+- **Access control** — `GOOGLE_CHAT_ALLOWED_USERS` gates which human senders the bot will respond to (empty = all)
+- **Bot-to-bot mesh** — `GOOGLE_CHAT_ALLOW_BOTS` + `_TRUSTED_BOT_IDS` + `_MAX_BOT_TURNS` (mirrors `feishu`); off by default. Hard safety cap of 10 turns when `allow_bots=all`
 - **Thread replies** — in Spaces, bot replies are posted in the same thread as the user's message (note: @mention is required for every message in a Space, even within a thread — this is a Google Chat platform limitation)
 - **`argument_text` extraction** — strips the @mention prefix to get the clean user message
 - **Bot message filtering** — bot messages (`user_type: "BOT"`) are filtered at the gateway level
@@ -163,6 +165,8 @@ working_dir = "/home/agent"
 
 ## Environment Variables (Gateway)
 
+### Core
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GOOGLE_CHAT_ENABLED` | Yes | `false` | Set to `true` or `1` to enable the adapter |
@@ -171,6 +175,24 @@ working_dir = "/home/agent"
 | `GOOGLE_CHAT_SA_KEY_FILE` | No | — | Path to service account key JSON file (alternative to `SA_KEY_JSON`) |
 | `GOOGLE_CHAT_ACCESS_TOKEN` | No | — | Static OAuth2 access token (fallback, expires in 1 hour) |
 | `GOOGLE_CHAT_WEBHOOK_PATH` | No | `/webhook/googlechat` | Webhook endpoint path |
+
+### Access control (`messaging.md` Layer 0–1)
+
+| Variable | Default | Description |
+|---|---|---|
+| `GOOGLE_CHAT_ALLOW_DM` | `false` | Set to `true` to forward DM (direct message) conversations. **Off by default** — DMs are opt-in (Layer 0). |
+| `GOOGLE_CHAT_ALLOWED_SPACES` | — (allow all) | CSV of Space resource names (`spaces/AAAA...`) that may reach the agent. Empty = all Spaces allowed. |
+| `GOOGLE_CHAT_ALLOWED_USERS` | — (allow all) | CSV of user IDs (stripped of `users/` prefix) that may message the bot. Empty = all users. Applies to **human** senders only; bot senders go through the mesh gates below. |
+
+### Bot-to-bot mesh (`messaging.md` Layer 4)
+
+| Variable | Default | Description |
+|---|---|---|
+| `GOOGLE_CHAT_ALLOW_BOTS` | `off` | `off` / `mentions` / `all`. `off` (default) blocks all bot→bot messages. `mentions` and `all` are functionally equivalent on Google Chat because the platform only delivers Space messages to a bot when @mentioned. |
+| `GOOGLE_CHAT_TRUSTED_BOT_IDS` | — (any bot) | CSV of bot user IDs (stripped of `users/` prefix). When non-empty, only listed bots may participate (applies under `mentions`/`all`). |
+| `GOOGLE_CHAT_MAX_BOT_TURNS` | `20` | Maximum consecutive bot-to-bot turns per Space before responses stop. Reset on any human message. Hard-capped to `10` when `GOOGLE_CHAT_ALLOW_BOTS=all`. |
+| `GOOGLE_CHAT_ALLOW_USER_MESSAGES` | `involved` | `involved` / `mentions` / `multibot-mentions` — kept for parity with `feishu`. Note: Google Chat platform forces @mention in every Space message, so these modes behave equivalently for normal Space messaging. |
+| `GOOGLE_CHAT_SESSION_TTL_HOURS` | `24` | TTL for participated-thread cache (hours). `0` disables participation tracking. |
 
 ## Security: Webhook Verification
 

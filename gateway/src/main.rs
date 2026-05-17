@@ -317,7 +317,20 @@ async fn main() -> Result<()> {
             warn!("GOOGLE_CHAT_AUDIENCE not set — webhook requests are NOT authenticated (insecure)");
         }
 
-        Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier))
+        let config = adapters::googlechat::GoogleChatConfig::from_env();
+        if config.allow_dm {
+            info!("googlechat: DM mode enabled (GOOGLE_CHAT_ALLOW_DM=true)");
+        }
+        if !config.allowed_spaces.is_empty() {
+            info!(count = config.allowed_spaces.len(), "googlechat: space allowlist active");
+        }
+        if !config.allowed_users.is_empty() {
+            info!(count = config.allowed_users.len(), "googlechat: user allowlist active");
+        }
+        if config.allow_bots != adapters::googlechat::AllowBots::Off {
+            info!(?config.allow_bots, max_turns = config.max_bot_turns, "googlechat: bot-to-bot mesh enabled");
+        }
+        Some(adapters::googlechat::GoogleChatAdapter::new(token_cache, access_token, jwt_verifier, config))
     } else {
         None
     };

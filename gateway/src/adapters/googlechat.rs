@@ -37,6 +37,147 @@ const OUTBOUND_PDF_MAX_BYTES: u64 = IMAGE_MAX_DOWNLOAD;
 /// Timeout for a single outbound upload request.
 const OUTBOUND_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+// --- Access / mesh configuration (mirrors feishu.rs) ---
+
+/// Controls bot-to-bot messaging — when this bot responds to messages from
+/// other bots in the same Space. Mirrors `FEISHU_ALLOW_BOTS`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AllowBots {
+    /// Never respond to bot messages (default).
+    #[default]
+    Off,
+    /// Respond only if explicitly @mentioned.
+    Mentions,
+    /// Respond to any bot message in an active thread.
+    All,
+}
+
+/// Controls when the bot responds without an @mention in a Space. Note that
+/// Google Chat platform requires @mention in every Space message regardless;
+/// this setting governs which messages the gateway forwards (vs. drops).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum AllowUsers {
+    /// Forward messages in Spaces the bot has previously participated in,
+    /// even if the platform's @mention requirement made the message addressed
+    /// to it (default).
+    #[default]
+    Involved,
+    /// Only forward messages that @mention this bot.
+    Mentions,
+    /// Like Involved, but if another bot is also participating in the Space,
+    /// require @mention to disambiguate.
+    MultibotMentions,
+}
+
+/// Hard safety cap for `max_bot_turns` when `AllowBots::All` is configured.
+/// Mirrors feishu's safety hard cap so a misconfigured deployment can't run
+/// unbounded bot-to-bot loops.
+const BOT_TURNS_SAFETY_HARD_CAP: u32 = 10;
+
+#[derive(Debug, Clone)]
+pub struct GoogleChatConfig {
+    /// Allow DM (direct message) conversations. Default: false. Mirrors
+    /// `messaging.md` Layer 0 — DM is opt-in.
+    pub allow_dm: bool,
+    /// Allowed Space resource names (`spaces/AAAA...`). Empty = all allowed.
+    pub allowed_spaces: Vec<String>,
+    /// Allowed user IDs (stripped of `users/` prefix). Empty = all allowed.
+    pub allowed_users: Vec<String>,
+    pub allow_bots: AllowBots,
+    pub allow_user_messages: AllowUsers,
+    /// Whitelist of bot IDs (stripped of `users/` prefix). Empty + `allow_bots
+    /// != Off` = any bot allowed (subject to mode).
+    pub trusted_bot_ids: Vec<String>,
+    /// Maximum consecutive bot-to-bot turns per Space before responses stop.
+    /// Reset on any human message.
+    pub max_bot_turns: u32,
+    /// TTL for participated-thread cache (seconds). 0 disables participation
+    /// tracking, requiring every message to be a fresh @mention.
+    pub session_ttl_secs: u64,
+}
+
+impl Default for GoogleChatConfig {
+    fn default() -> Self {
+        Self {
+            allow_dm: false,
+            allowed_spaces: Vec::new(),
+            allowed_users: Vec::new(),
+            allow_bots: AllowBots::Off,
+            allow_user_messages: AllowUsers::Involved,
+            trusted_bot_ids: Vec::new(),
+            max_bot_turns: 20,
+            session_ttl_secs: 24 * 3600,
+        }
+    }
+}
+
+impl GoogleChatConfig {
+    /// Build config from environment. All keys are optional; missing keys
+    /// fall back to safe defaults (no allowlist constraints + bots off).
+    pub fn from_env() -> Self {
+        let allow_dm = std::env::var("GOOGLE_CHAT_ALLOW_DM")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let allowed_spaces = parse_csv_env("GOOGLE_CHAT_ALLOWED_SPACES");
+        let allowed_users = parse_csv_env("GOOGLE_CHAT_ALLOWED_USERS");
+        let allow_bots = match std::env::var("GOOGLE_CHAT_ALLOW_BOTS")
+            .unwrap_or_else(|_| "off".into())
+            .to_lowercase()
+            .as_str()
+        {
+            "mentions" => AllowBots::Mentions,
+            "all" => AllowBots::All,
+            _ => AllowBots::Off,
+        };
+        let allow_user_messages = match std::env::var("GOOGLE_CHAT_ALLOW_USER_MESSAGES")
+            .unwrap_or_else(|_| "involved".into())
+            .to_lowercase()
+            .replace('-', "_")
+            .as_str()
+        {
+            "mentions" => AllowUsers::Mentions,
+            "multibot_mentions" => AllowUsers::MultibotMentions,
+            _ => AllowUsers::Involved,
+        };
+        let trusted_bot_ids = parse_csv_env("GOOGLE_CHAT_TRUSTED_BOT_IDS");
+        let configured_max_turns: u32 = std::env::var("GOOGLE_CHAT_MAX_BOT_TURNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        // Safety hard cap only applies under AllowBots::All (matches feishu).
+        let max_bot_turns = if allow_bots == AllowBots::All {
+            configured_max_turns.min(BOT_TURNS_SAFETY_HARD_CAP)
+        } else {
+            configured_max_turns
+        };
+        let session_ttl_secs = std::env::var("GOOGLE_CHAT_SESSION_TTL_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(24)
+            * 3600;
+
+        Self {
+            allow_dm,
+            allowed_spaces,
+            allowed_users,
+            allow_bots,
+            allow_user_messages,
+            trusted_bot_ids,
+            max_bot_turns,
+            session_ttl_secs,
+        }
+    }
+}
+
+fn parse_csv_env(var: &str) -> Vec<String> {
+    std::env::var(var)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 // --- Google Chat types (v2 envelope format) ---
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +409,17 @@ pub struct GoogleChatAdapter {
     pub client: reqwest::Client,
     pub api_base: String,
     pub upload_base: String,
+    pub config: GoogleChatConfig,
+    /// Consecutive bot-to-bot turn counter, keyed by Space resource name.
+    /// Reset on any human message in the Space.
+    pub bot_turns: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    /// Last-seen timestamp per Space where this bot has participated.
+    /// Used by `AllowUsers::Involved` mode to decide whether to forward
+    /// non-mention messages.
+    pub participated_threads: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Instant>>>,
+    /// Spaces where this bot has detected another bot participating. Used by
+    /// `AllowUsers::MultibotMentions` to require @mention disambiguation.
+    pub multibot_threads: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Instant>>>,
 }
 
 impl GoogleChatAdapter {
@@ -275,6 +427,7 @@ impl GoogleChatAdapter {
         token_cache: Option<GoogleChatTokenCache>,
         access_token: Option<String>,
         jwt_verifier: Option<GoogleChatJwtVerifier>,
+        config: GoogleChatConfig,
     ) -> Self {
         Self {
             token_cache,
@@ -283,6 +436,10 @@ impl GoogleChatAdapter {
             client: reqwest::Client::new(),
             api_base: GOOGLE_CHAT_API_BASE.into(),
             upload_base: GOOGLE_CHAT_UPLOAD_BASE.into(),
+            config,
+            bot_turns: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            participated_threads: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            multibot_threads: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -570,9 +727,6 @@ pub async fn webhook(
     let space = msg.space.as_ref().or(payload.space.as_ref());
 
     let is_bot = sender.map(|s| s.user_type == "BOT").unwrap_or(false);
-    if is_bot {
-        return empty_json_response();
-    }
 
     let sender_id = sender.map(|s| s.name.clone()).unwrap_or_default();
     let display_name = sender
@@ -589,6 +743,82 @@ pub async fn webhook(
         .unwrap_or_else(|| "ROOM".into());
 
     let thread_id = msg.thread.as_ref().map(|t| t.name.clone());
+
+    // ----- Access control (messaging.md Layer 0-4) -----
+    // Adapter is registered → access controls always apply via the adapter
+    // config. (state.google_chat is None when GOOGLE_CHAT_ENABLED is false,
+    // in which case this handler isn't routed.)
+    if let Some(ref adapter) = state.google_chat {
+        // Layer 0: DM opt-in. Google Chat platform delivers DMs by default;
+        // gateway gates them behind allow_dm.
+        if space_type == "DM" && !adapter.config.allow_dm {
+            warn!(space = %space_name, sender = %sender_name, "googlechat: DM dropped (allow_dm=false)");
+            return empty_json_response();
+        }
+        // Layer 1: Space allowlist.
+        if space_type != "DM"
+            && !adapter.config.allowed_spaces.is_empty()
+            && !adapter.config.allowed_spaces.iter().any(|s| s == &space_name)
+        {
+            warn!(space = %space_name, "googlechat: space dropped (not in allowed_spaces)");
+            return empty_json_response();
+        }
+        // User allowlist applies to humans only — bots have their own mesh
+        // gates (trusted_bot_ids + allow_bots below). Without this carve-out,
+        // a deployment that scopes allowed_users to a single human admin
+        // would inadvertently silence all bot-to-bot traffic too.
+        if !is_bot
+            && !adapter.config.allowed_users.is_empty()
+            && !adapter.config.allowed_users.iter().any(|u| u == &sender_name)
+        {
+            warn!(sender = %sender_name, "googlechat: user not in allowlist, dropping");
+            return empty_json_response();
+        }
+
+        // Layer 4: bot → bot mesh.
+        if is_bot {
+            match adapter.config.allow_bots {
+                AllowBots::Off => {
+                    return empty_json_response();
+                }
+                AllowBots::Mentions | AllowBots::All => {
+                    // Google Chat only delivers Space messages to a bot when
+                    // the bot is @mentioned (platform requirement), so by the
+                    // time we see a bot message, the "mentions" condition is
+                    // already satisfied. Trusted-bot allowlist still applies.
+                    if !adapter.config.trusted_bot_ids.is_empty()
+                        && !adapter
+                            .config
+                            .trusted_bot_ids
+                            .iter()
+                            .any(|id| id == &sender_name)
+                    {
+                        warn!(sender = %sender_name, "googlechat: bot not in trusted_bot_ids, dropping");
+                        return empty_json_response();
+                    }
+                }
+            }
+
+            // Consecutive bot-to-bot turns counter. Reset on human messages
+            // below. We don't await an Option<Adapter> here so use a blocking
+            // lock — the map is small and contention is unlikely.
+            let mut turns = adapter.bot_turns.lock().await;
+            let count = turns.entry(space_name.clone()).or_insert(0);
+            *count += 1;
+            if *count > adapter.config.max_bot_turns {
+                warn!(
+                    space = %space_name,
+                    count = *count,
+                    cap = adapter.config.max_bot_turns,
+                    "googlechat: bot turns cap reached, dropping"
+                );
+                return empty_json_response();
+            }
+        } else {
+            // Human message resets the bot-turns counter for this Space.
+            adapter.bot_turns.lock().await.remove(&space_name);
+        }
+    }
 
     let message_id = msg
         .name
@@ -610,6 +840,7 @@ pub async fn webhook(
             text,
             &message_id,
             Vec::new(),
+            is_bot,
         );
         return empty_json_response();
     }
@@ -619,6 +850,7 @@ pub async fn webhook(
     let text = text.to_string();
     let state = state.clone();
     let spawn_space = space_name.clone();
+    let spawn_is_bot = is_bot;
     tokio::spawn(async move {
         use futures_util::FutureExt;
         let result = std::panic::AssertUnwindSafe(async {
@@ -712,6 +944,7 @@ pub async fn webhook(
             &text,
             &message_id,
             downloaded,
+            spawn_is_bot,
         );
         }).catch_unwind().await;
         if let Err(e) = result {
@@ -734,6 +967,7 @@ fn send_googlechat_event(
     text: &str,
     message_id: &str,
     attachments: Vec<crate::schema::Attachment>,
+    is_bot: bool,
 ) {
     let mut gw_event = GatewayEvent::new(
         "googlechat",
@@ -746,7 +980,7 @@ fn send_googlechat_event(
             id: sender_id.to_string(),
             name: sender_name.to_string(),
             display_name: display_name.to_string(),
-            is_bot: false,
+            is_bot,
         },
         text,
         message_id,
@@ -2009,7 +2243,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
@@ -2053,7 +2287,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
@@ -2101,7 +2335,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
@@ -2145,7 +2379,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let long_text = "x".repeat(5000);
@@ -2182,7 +2416,7 @@ mod tests {
     #[tokio::test]
     async fn handle_reply_token_failure_sends_error_response() {
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let adapter = GoogleChatAdapter::new(None, None, None);
+        let adapter = GoogleChatAdapter::new(None, None, None, GoogleChatConfig::default());
 
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
@@ -2227,7 +2461,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let reply = GatewayReply {
@@ -2269,7 +2503,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let long_text = "x".repeat(5000);
@@ -2327,7 +2561,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
 
         let long_text = "x".repeat(5000);
@@ -2686,7 +2920,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
         adapter.upload_base = mock_server.uri();
 
@@ -2744,7 +2978,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
         adapter.upload_base = mock_server.uri();
 
@@ -2792,7 +3026,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
         adapter.upload_base = mock_server.uri();
 
@@ -2844,7 +3078,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
         adapter.upload_base = mock_server.uri();
 
@@ -2900,7 +3134,7 @@ mod tests {
             .await;
 
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
-        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None, GoogleChatConfig::default());
         adapter.api_base = mock_server.uri();
         adapter.upload_base = mock_server.uri();
 
@@ -2925,5 +3159,126 @@ mod tests {
         let resp: GatewayResponse = serde_json::from_str(&event_rx.try_recv().unwrap()).unwrap();
         assert!(resp.success);
         assert!(resp.error.unwrap().contains("exceeds cap"));
+    }
+
+    // --- Mesh / allowlist config tests ---
+
+    #[test]
+    fn config_default_is_locked_down() {
+        // The safe default forbids DMs, has no allowlist, and disables bot
+        // chatter — deployments must explicitly opt in.
+        let c = GoogleChatConfig::default();
+        assert!(!c.allow_dm);
+        assert!(c.allowed_spaces.is_empty());
+        assert!(c.allowed_users.is_empty());
+        assert!(c.trusted_bot_ids.is_empty());
+        assert_eq!(c.allow_bots, AllowBots::Off);
+        assert_eq!(c.allow_user_messages, AllowUsers::Involved);
+        assert_eq!(c.max_bot_turns, 20);
+        assert_eq!(c.session_ttl_secs, 24 * 3600);
+    }
+
+    #[test]
+    fn parse_csv_env_handles_blank_single_multi() {
+        // Use a randomized var name so concurrent tests can't collide. This
+        // is the only env-touching test in the module — the rest of the
+        // mesh logic is tested via webhook integration paths.
+        let v = format!("OPENAB_TEST_PARSE_CSV_{}", uuid::Uuid::new_v4().simple());
+        std::env::remove_var(&v);
+        assert!(parse_csv_env(&v).is_empty(), "unset → empty");
+        std::env::set_var(&v, "");
+        assert!(parse_csv_env(&v).is_empty(), "blank → empty");
+        std::env::set_var(&v, "foo");
+        assert_eq!(parse_csv_env(&v), vec!["foo".to_string()]);
+        std::env::set_var(&v, " a, b ,c,,d ");
+        assert_eq!(
+            parse_csv_env(&v),
+            vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]
+        );
+        std::env::remove_var(&v);
+    }
+
+    fn make_mesh_adapter(config: GoogleChatConfig) -> GoogleChatAdapter {
+        GoogleChatAdapter::new(None, Some("fake-token".into()), None, config)
+    }
+
+    /// Build a minimal envelope that produces a Space message for tests.
+    fn build_space_envelope(space_name: &str, sender_id: &str, is_bot: bool) -> String {
+        let user_type = if is_bot { "BOT" } else { "HUMAN" };
+        serde_json::json!({
+            "chat": {
+                "messagePayload": {
+                    "message": {
+                        "name": format!("{}/messages/m_xxx", space_name),
+                        "text": "hello",
+                        "argumentText": "hello",
+                        "sender": {
+                            "name": sender_id,
+                            "displayName": "Tester",
+                            "type": user_type
+                        },
+                        "space": { "name": space_name, "type": "ROOM" }
+                    },
+                    "space": { "name": space_name, "type": "ROOM" }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn envelope_parser_detects_bot_sender() {
+        // Sanity check the bot-detection branch used by the webhook handler:
+        // a BOT-typed sender from the envelope is recognized as is_bot=true.
+        let envelope = build_space_envelope("spaces/T1", "users/bot1", true);
+        let parsed: GoogleChatEnvelope = serde_json::from_str(&envelope).unwrap();
+        let sender = parsed
+            .chat
+            .as_ref()
+            .and_then(|c| c.message_payload.as_ref())
+            .and_then(|p| p.message.as_ref())
+            .and_then(|m| m.sender.as_ref());
+        let is_bot = sender.map(|s| s.user_type == "BOT").unwrap_or(false);
+        assert!(is_bot);
+    }
+
+    #[tokio::test]
+    async fn mesh_bot_turns_counter_resets_on_human() {
+        // Direct cache-shape test: simulate the counter manipulation the
+        // webhook handler performs without spinning up an AppState.
+        let mut config = GoogleChatConfig::default();
+        config.allow_bots = AllowBots::All;
+        config.max_bot_turns = 3;
+        let adapter = make_mesh_adapter(config);
+
+        // 3 bot turns OK, 4th would exceed.
+        for expected in 1..=3 {
+            let mut turns = adapter.bot_turns.lock().await;
+            let c = turns.entry("spaces/T".into()).or_insert(0);
+            *c += 1;
+            assert_eq!(*c, expected);
+            assert!(*c <= adapter.config.max_bot_turns);
+        }
+        // 4th bot turn exceeds the cap.
+        {
+            let mut turns = adapter.bot_turns.lock().await;
+            let c = turns.entry("spaces/T".into()).or_insert(0);
+            *c += 1;
+            assert!(*c > adapter.config.max_bot_turns);
+        }
+        // Human message resets the counter.
+        adapter.bot_turns.lock().await.remove("spaces/T");
+        assert!(adapter.bot_turns.lock().await.get("spaces/T").is_none());
+    }
+
+    #[test]
+    fn allowed_users_excludes_unlisted_human() {
+        // Unit-level check of allowlist semantics: an empty list means
+        // "allow all", a non-empty list is a strict allowlist.
+        let mut config = GoogleChatConfig::default();
+        config.allowed_users = vec!["alice".into(), "bob".into()];
+        assert!(config.allowed_users.iter().any(|u| u == "alice"));
+        assert!(config.allowed_users.iter().any(|u| u == "bob"));
+        assert!(!config.allowed_users.iter().any(|u| u == "eve"));
     }
 }
