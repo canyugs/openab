@@ -110,6 +110,14 @@ working_dir = "/home/agent"
 # # Supports 30+ providers (xAI Grok OAuth, Anthropic, OpenAI Codex, Gemini, etc.)
 # # Provider switching: kubectl exec -it <pod> -- hermes model
 
+# [agent]
+# command = "openclaw"
+# args = ["acp", "--url", "ws://openclaw-gateway:18789", "--session", "agent:main:main"]
+# working_dir = "/home/node"
+# env = { OPENCLAW_GATEWAY_TOKEN = "${OPENCLAW_GATEWAY_TOKEN}" }
+# # Requires a separately-running openclaw gateway — see docs/openclaw.md.
+# # Model selection lives on the gateway side, not via OpenAB's /model command.
+
 [pool]
 max_sessions = 10
 session_ttl_hours = 24
