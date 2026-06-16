@@ -25,7 +25,14 @@ Be direct and concise. Execute tasks immediately rather than explaining what you
 // from the LLM and produced the "fs is disconnected, I give up" failure
 // mode observed in the F1 PoC.
 
-const MAX_TOOL_LOOPS: usize = 50;
+const DEFAULT_MAX_TOOL_LOOPS: usize = 50;
+
+fn max_tool_loops() -> usize {
+    std::env::var("OPENAB_AGENT_MAX_TOOL_LOOPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_TOOL_LOOPS)
+}
 /// Maximum number of messages to keep in context. When exceeded, oldest
 /// messages (excluding the first user message) are dropped.
 const MAX_CONTEXT_MESSAGES: usize = 100;
@@ -137,8 +144,10 @@ impl Agent {
         });
 
         let mut final_text = String::new();
+        let max_loops = max_tool_loops();
+        info!("max_tool_loops={max_loops}");
 
-        for iteration in 0..MAX_TOOL_LOOPS {
+        for iteration in 0..max_loops {
             debug!("agent loop iteration {iteration}");
 
             // Truncate context to prevent unbounded growth / token limit
@@ -219,7 +228,7 @@ impl Agent {
 
         if final_text.is_empty() {
             return Err(anyhow::anyhow!(
-                "agent exceeded maximum tool loop iterations ({MAX_TOOL_LOOPS})"
+                "agent exceeded maximum tool loop iterations ({max_loops})"
             ));
         }
 
