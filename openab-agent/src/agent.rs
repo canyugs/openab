@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::Deserialize;
 use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
 use crate::mcp::{self, McpRuntimeManager};
@@ -28,11 +28,30 @@ Be direct and concise. Execute tasks immediately rather than explaining what you
 const DEFAULT_MAX_TOOL_LOOPS: usize = 50;
 
 fn max_tool_loops() -> usize {
-    std::env::var("OPENAB_AGENT_MAX_TOOL_LOOPS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_TOOL_LOOPS)
+    let raw = match std::env::var("OPENAB_AGENT_MAX_TOOL_LOOPS") {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(
+                    "OPENAB_AGENT_MAX_TOOL_LOOPS={val:?} is not valid ({e}), \
+                     falling back to {DEFAULT_MAX_TOOL_LOOPS}"
+                );
+                DEFAULT_MAX_TOOL_LOOPS
+            }
+        },
+        Err(_) => DEFAULT_MAX_TOOL_LOOPS,
+    };
+    if raw == 0 {
+        warn!(
+            "OPENAB_AGENT_MAX_TOOL_LOOPS=0 would prevent the agent from running; \
+             using minimum value of 1"
+        );
+        1
+    } else {
+        raw
+    }
 }
+
 /// Maximum number of messages to keep in context. When exceeded, oldest
 /// messages (excluding the first user message) are dropped.
 const MAX_CONTEXT_MESSAGES: usize = 100;
