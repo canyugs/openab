@@ -164,7 +164,11 @@ impl Agent {
 
         let mut final_text = String::new();
         let max_loops = max_tool_loops();
-        info!("max_tool_loops={max_loops}");
+        if max_loops != DEFAULT_MAX_TOOL_LOOPS {
+            info!("max_tool_loops={max_loops} (overridden)");
+        } else {
+            debug!("max_tool_loops={max_loops}");
+        }
 
         for iteration in 0..max_loops {
             debug!("agent loop iteration {iteration}");
