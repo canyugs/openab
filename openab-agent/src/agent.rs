@@ -494,4 +494,32 @@ mod tests {
         let content = std::fs::read_to_string(tmp.path().join("out.txt")).unwrap();
         assert_eq!(content, "hello");
     }
+
+    #[test]
+    fn test_max_tool_loops_default() {
+        temp_env::with_var("OPENAB_AGENT_MAX_TOOL_LOOPS", None::<&str>, || {
+            assert_eq!(max_tool_loops(), DEFAULT_MAX_TOOL_LOOPS);
+        });
+    }
+
+    #[test]
+    fn test_max_tool_loops_custom_value() {
+        temp_env::with_var("OPENAB_AGENT_MAX_TOOL_LOOPS", Some("200"), || {
+            assert_eq!(max_tool_loops(), 200);
+        });
+    }
+
+    #[test]
+    fn test_max_tool_loops_invalid_falls_back() {
+        temp_env::with_var("OPENAB_AGENT_MAX_TOOL_LOOPS", Some("abc"), || {
+            assert_eq!(max_tool_loops(), DEFAULT_MAX_TOOL_LOOPS);
+        });
+    }
+
+    #[test]
+    fn test_max_tool_loops_zero_clamps_to_one() {
+        temp_env::with_var("OPENAB_AGENT_MAX_TOOL_LOOPS", Some("0"), || {
+            assert_eq!(max_tool_loops(), 1);
+        });
+    }
 }
