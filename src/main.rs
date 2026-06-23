@@ -495,9 +495,19 @@ async fn main() -> anyhow::Result<()> {
             | GatewayIntents::GUILDS
             | GatewayIntents::DIRECT_MESSAGES;
 
-        let mut client = Client::builder(&discord_cfg.bot_token, intents)
-            .event_handler(handler)
-            .await?;
+        let mut client = if let Some(ref proxy) = discord_cfg.proxy {
+            let http = serenity::http::HttpBuilder::new(&discord_cfg.bot_token)
+                .proxy(proxy)
+                .ratelimiter_disabled(true)
+                .build();
+            serenity::all::ClientBuilder::new_with_http(http, intents)
+                .event_handler(handler)
+                .await?
+        } else {
+            Client::builder(&discord_cfg.bot_token, intents)
+                .event_handler(handler)
+                .await?
+        };
 
         // Graceful Discord shutdown on ctrl_c
         let shard_manager = client.shard_manager.clone();
