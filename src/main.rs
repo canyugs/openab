@@ -496,6 +496,7 @@ async fn main() -> anyhow::Result<()> {
             | GatewayIntents::DIRECT_MESSAGES;
 
         let mut client = if let Some(ref proxy) = discord_cfg.proxy {
+            info!(proxy = %proxy, "discord adapter using API proxy");
             let http = serenity::http::HttpBuilder::new(&discord_cfg.bot_token)
                 .proxy(proxy)
                 .ratelimiter_disabled(true)
