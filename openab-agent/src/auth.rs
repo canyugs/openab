@@ -689,8 +689,9 @@ fn accept_callback_code(listener: &TcpListener, expected_state: &str) -> Result<
     Ok(code)
 }
 
-/// Anthropic OAuth (Claude Pro/Max). PKCE with the verifier doubling as `state`
-/// (Pi's convention) and a JSON token exchange against `platform.claude.com`.
+/// Anthropic OAuth (Claude Pro/Max). PKCE with an independent random CSRF
+/// `state` (verifier stays back-channel-only) and a JSON token exchange against
+/// `platform.claude.com`.
 pub async fn login_anthropic_browser_flow(no_browser: bool) -> Result<()> {
     let (verifier, challenge) = generate_pkce();
     // Independent random CSRF state — keep the PKCE verifier back-channel-only.
