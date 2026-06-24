@@ -204,7 +204,7 @@ impl AcpServer {
         // through `out_tx` into this one drain task, preserving the
         // one-writer invariant the HostBridge relies on.
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        tokio::spawn(async move {
+        let drain = tokio::spawn(async move {
             let mut stdout = io::stdout();
             while let Some(line) = out_rx.recv().await {
                 let _ = writeln!(stdout, "{}", line);
@@ -268,6 +268,16 @@ impl AcpServer {
                 let _ = out_tx.send(line);
             }
         }
+
+        // Shutdown: stdin hit EOF and the dispatch loop ended. Drop our senders
+        // so the drain task can flush any queued output and finish before this
+        // returns — otherwise `#[tokio::main]` aborts the detached drain on
+        // return and the last response can be lost (the ACP `initialize` smoke
+        // test depends on this). Bounded await so a lingering sender (e.g. an
+        // MCP background task holding an `out_tx` clone) can't wedge shutdown.
+        drop(bridge);
+        drop(out_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain).await;
     }
 
     fn handle_initialize(&self, id: u64) -> String {
