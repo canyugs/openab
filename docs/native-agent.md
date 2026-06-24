@@ -31,6 +31,7 @@ env = { OPENAB_AGENT_OPENAI_MODEL = "gpt-5.4-mini" }
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `OPENAB_AGENT_MODEL` | — (required for Anthropic) | Anthropic model id (e.g. `claude-opus-4-8`). No hardcoded default — dateless 4.6+ IDs are fixed canonical IDs that retire each generation, so the agent fails loud if unset rather than pin a model that will eventually 404. |
 | `OPENAB_AGENT_OPENAI_MODEL` | `gpt-5.4-mini` | Model to use (must be supported by your ChatGPT plan — see [Supported Models](#supported-models-chatgpt-subscription)) |
 | `OPENAB_AGENT_OPENAI_BASE_URL` | `https://chatgpt.com/backend-api` | API base URL |
 | `OPENAB_AGENT_PROVIDER` | auto-detect | Force provider (`anthropic`, `openai`, `codex`) |

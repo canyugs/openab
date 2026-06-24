@@ -149,8 +149,13 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
 }
 
-fn anthropic_model_from_env() -> String {
-    std::env::var("OPENAB_AGENT_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string())
+/// Resolve the Anthropic model from `OPENAB_AGENT_MODEL`. No hardcoded default:
+/// dateless 4.6+ IDs are fixed canonical IDs (not evergreen pointers), so a
+/// pinned default is a per-generation 404 timebomb. Require an explicit choice
+/// and fail loud instead.
+fn anthropic_model() -> Result<String, String> {
+    std::env::var("OPENAB_AGENT_MODEL")
+        .map_err(|_| "no model configured; set OPENAB_AGENT_MODEL or select a model".to_string())
 }
 
 fn anthropic_max_tokens() -> u32 {
@@ -188,50 +193,60 @@ fn from_claude_code_name(name: &str) -> String {
 }
 
 impl AnthropicProvider {
-    pub fn from_env() -> Result<Self, String> {
+    fn build(auth: AnthropicAuth, model: String) -> Self {
+        Self {
+            auth,
+            model,
+            max_tokens: anthropic_max_tokens(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn api_key_from_env() -> Result<String, String> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| "ANTHROPIC_API_KEY not set".to_string())?;
         if api_key.is_empty() {
             return Err("ANTHROPIC_API_KEY is empty".to_string());
         }
-        Ok(Self {
-            auth: AnthropicAuth::ApiKey(api_key),
-            model: anthropic_model_from_env(),
-            max_tokens: anthropic_max_tokens(),
-            client: reqwest::Client::new(),
-        })
+        Ok(api_key)
     }
 
-    /// Claude Pro/Max OAuth. Verifies a stored `anthropic-oauth` token exists;
-    /// the live token is fetched (and refreshed) at call time.
-    pub fn from_oauth_store() -> Result<Self, String> {
+    /// Verify the `anthropic-oauth` tenant has a stored token; the live token is
+    /// fetched (and refreshed) at call time.
+    fn ensure_oauth_token() -> Result<(), String> {
         crate::auth::load_tokens_for(crate::auth::ANTHROPIC_NAMESPACE)
-            .map_err(|e| e.to_string())?;
-        Ok(Self {
-            auth: AnthropicAuth::OAuth,
-            model: anthropic_model_from_env(),
-            max_tokens: anthropic_max_tokens(),
-            client: reqwest::Client::new(),
-        })
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Claude Pro/Max OAuth.
+    pub fn from_oauth_store() -> Result<Self, String> {
+        Self::ensure_oauth_token()?;
+        Ok(Self::build(AnthropicAuth::OAuth, anthropic_model()?))
     }
 
     /// Prefer an explicit API key, else a stored Claude subscription OAuth token.
+    /// When a key is present its own errors (e.g. missing model) surface rather
+    /// than falling through to an unrelated OAuth-token error.
     pub fn auto() -> Result<Self, String> {
-        Self::from_env().or_else(|_| Self::from_oauth_store())
+        match Self::api_key_from_env() {
+            Ok(key) => Ok(Self::build(AnthropicAuth::ApiKey(key), anthropic_model()?)),
+            Err(_) => Self::from_oauth_store(),
+        }
     }
 
-    /// `auto()` with an explicit model override.
+    /// `auto()` with an explicit model override. The override replaces
+    /// `OPENAB_AGENT_MODEL`, so it does not require that env var to be set.
     pub fn auto_with_model(model: &str) -> Result<Self, String> {
-        let mut p = Self::auto()?;
-        p.model = model.to_string();
-        Ok(p)
+        Self::api_key_from_env()
+            .map(|key| Self::build(AnthropicAuth::ApiKey(key), model.to_string()))
+            .or_else(|_| Self::from_oauth_store_with_model(model))
     }
 
     /// `from_oauth_store()` with an explicit model override.
     pub fn from_oauth_store_with_model(model: &str) -> Result<Self, String> {
-        let mut p = Self::from_oauth_store()?;
-        p.model = model.to_string();
-        Ok(p)
+        Self::ensure_oauth_token()?;
+        Ok(Self::build(AnthropicAuth::OAuth, model.to_string()))
     }
 
     fn build_request_body(&self, system: &str, messages: &[Message], tools: &[ToolDef]) -> Value {

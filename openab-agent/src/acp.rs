@@ -366,27 +366,13 @@ impl AcpServer {
                 }
             };
 
+        // The provider already resolved its model (explicit override →
+        // OPENAB_AGENT_MODEL, validated at construction). Use it as the
+        // authoritative reported model instead of a separate hardcoded default.
+        let model_name = provider.model().to_string();
         let agent = Agent::new_boxed(provider, self.working_dir.clone(), self.mcp_manager.clone());
         self.sessions.insert(session_id.clone(), agent);
 
-        let model_name = self
-            .active_model
-            .clone()
-            .or_else(|| {
-                if active_provider == "openai" {
-                    std::env::var("OPENAB_AGENT_OPENAI_MODEL").ok()
-                } else {
-                    None
-                }
-            })
-            .or_else(|| std::env::var("OPENAB_AGENT_MODEL").ok())
-            .unwrap_or_else(|| {
-                if active_provider == "anthropic" {
-                    "claude-opus-4-8".to_string()
-                } else {
-                    "gpt-5.4-mini".to_string()
-                }
-            });
         self.active_model = Some(model_name.clone());
         self.active_provider = Some(active_provider.to_string());
         self.model_options = Self::available_models().await;
@@ -439,13 +425,11 @@ impl AcpServer {
             self.model_options = Self::available_models().await;
         }
 
-        let model_name = self.active_model.clone().unwrap_or_else(|| {
-            if self.active_provider.as_deref() == Some("openai") {
-                "gpt-5.4-mini".to_string()
-            } else {
-                "claude-opus-4-8".to_string()
-            }
-        });
+        // Report the loaded session's actual model (no hardcoded default).
+        let model_name = self
+            .active_model
+            .clone()
+            .unwrap_or_else(|| self.sessions[session_id].provider_model());
 
         self.ok_response(
             id,
@@ -699,10 +683,14 @@ mod tests {
     #[tokio::test]
     async fn test_session_new() {
         let _guard = ENV_LOCK.lock().unwrap();
-        // Set a fake key so from_env() succeeds in CI
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
+        // Set a fake key + model so provider construction succeeds in CI
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+            std::env::set_var("OPENAB_AGENT_MODEL", "claude-sonnet-4-6");
+        }
         let mut server = AcpServer::new();
         let resp_str = server.handle_session_new(2).await;
+        unsafe { std::env::remove_var("OPENAB_AGENT_MODEL") };
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 2);
@@ -712,6 +700,7 @@ mod tests {
         assert!(!config_options.is_empty());
         assert_eq!(config_options[0]["id"], "model");
         assert_eq!(config_options[0]["category"], "model");
+        assert_eq!(config_options[0]["currentValue"], "claude-sonnet-4-6");
         assert!(!config_options[0]["options"].as_array().unwrap().is_empty());
     }
 
@@ -809,6 +798,30 @@ mod tests {
             .contains("ANTHROPIC_API_KEY"));
     }
 
+    #[tokio::test]
+    async fn test_session_new_requires_model() {
+        // No hardcoded default: a forced anthropic provider without
+        // OPENAB_AGENT_MODEL must fail loud.
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("OPENAB_AGENT_PROVIDER", "anthropic");
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+            std::env::remove_var("OPENAB_AGENT_MODEL");
+        }
+        let mut server = AcpServer::new();
+        let resp_str = server.handle_session_new(7).await;
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("OPENAB_AGENT_PROVIDER");
+        }
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp["error"].is_object());
+        assert!(resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no model configured"));
+    }
+
     #[test]
     fn test_set_config_option_accepts_cached_dynamic_model() {
         let mut server = AcpServer::new();
@@ -867,11 +880,15 @@ mod tests {
     #[tokio::test]
     async fn test_model_switch_preserves_session_history() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+            std::env::set_var("OPENAB_AGENT_MODEL", "claude-sonnet-4-6");
+        }
         let mut server = AcpServer::new();
 
         // Create a session
         let resp_str = server.handle_session_new(10).await;
+        unsafe { std::env::remove_var("OPENAB_AGENT_MODEL") };
         let resp: Value = serde_json::from_str(&resp_str).unwrap();
         let session_id = resp["result"]["sessionId"].as_str().unwrap().to_string();
 
@@ -974,11 +991,15 @@ mod tests {
     #[tokio::test]
     async fn test_session_load_returns_config_options() {
         let _guard = ENV_LOCK.lock().unwrap();
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+            std::env::set_var("OPENAB_AGENT_MODEL", "claude-sonnet-4-6");
+        }
         let mut server = AcpServer::new();
 
         // Create a session first
         let new_resp_str = server.handle_session_new(10).await;
+        unsafe { std::env::remove_var("OPENAB_AGENT_MODEL") };
         let new_resp: Value = serde_json::from_str(&new_resp_str).unwrap();
         let session_id = new_resp["result"]["sessionId"].as_str().unwrap();
 
