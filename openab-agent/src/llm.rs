@@ -68,6 +68,13 @@ pub trait LlmProvider: Send + Sync {
     /// `CreateMessageResult.model` when serving MCP sampling so the requesting
     /// server learns which model produced the response.
     fn model(&self) -> &str;
+
+    /// True if this provider authenticates via OAuth rather than an API key.
+    /// Lets a session rebuild (model switch) preserve its auth mode instead of
+    /// silently falling back to `ANTHROPIC_API_KEY`.
+    fn is_oauth(&self) -> bool {
+        false
+    }
 }
 
 /// Shared, cloneable handle to an `LlmProvider`. A newtype over
@@ -227,10 +234,6 @@ impl AnthropicProvider {
         Ok(p)
     }
 
-    fn is_oauth(&self) -> bool {
-        matches!(self.auth, AnthropicAuth::OAuth)
-    }
-
     fn build_request_body(&self, system: &str, messages: &[Message], tools: &[ToolDef]) -> Value {
         let oauth = self.is_oauth();
         let msgs: Vec<Value> =
@@ -313,6 +316,10 @@ impl LlmProvider for AnthropicProvider {
         &self.model
     }
 
+    fn is_oauth(&self) -> bool {
+        matches!(self.auth, AnthropicAuth::OAuth)
+    }
+
     fn chat<'a>(
         &'a self,
         system: &'a str,
@@ -361,9 +368,10 @@ impl LlmProvider for AnthropicProvider {
                 }
 
                 // 401 on OAuth: token may have expired mid-request; force a
-                // refresh and retry once before surfacing the error.
+                // refresh and retry once. Surface a failed refresh instead of
+                // retrying with the stale token.
                 if oauth && status.as_u16() == 401 && attempt < max_retries {
-                    let _ = crate::auth::force_refresh_for(crate::auth::ANTHROPIC_NAMESPACE).await;
+                    crate::auth::force_refresh_for(crate::auth::ANTHROPIC_NAMESPACE).await?;
                     continue;
                 }
 
@@ -797,6 +805,14 @@ mod tests {
             max_tokens: 4096,
             client: reqwest::Client::new(),
         }
+    }
+
+    #[test]
+    fn test_is_oauth_reflects_auth_mode() {
+        // Guards the ACP model-switch rebuild: an OAuth session must report
+        // OAuth so it isn't silently rebuilt against ANTHROPIC_API_KEY.
+        assert!(test_provider(AnthropicAuth::OAuth).is_oauth());
+        assert!(!test_provider(AnthropicAuth::ApiKey("k".to_string())).is_oauth());
     }
 
     #[test]

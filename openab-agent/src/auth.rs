@@ -247,14 +247,20 @@ fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> 
     Ok(())
 }
 
-/// Load the LLM token stored under `namespace` (`codex` / `anthropic-oauth`).
-pub fn load_tokens_for(namespace: &str) -> Result<TokenStore> {
-    let path = auth_path();
-    let cmd = if namespace == ANTHROPIC_NAMESPACE {
+/// CLI subcommand that (re)authenticates a tenant `namespace`. Used in
+/// credential-error messages so the user runs the right login.
+fn auth_subcommand(namespace: &str) -> &'static str {
+    if namespace == ANTHROPIC_NAMESPACE {
         "openab-agent auth anthropic-oauth"
     } else {
         "openab-agent auth codex-oauth"
-    };
+    }
+}
+
+/// Load the LLM token stored under `namespace` (`codex` / `anthropic-oauth`).
+pub fn load_tokens_for(namespace: &str) -> Result<TokenStore> {
+    let path = auth_path();
+    let cmd = auth_subcommand(namespace);
     // Preserve the underlying read/parse error for debugging.
     let map = read_auth_file(&path).map_err(|e| {
         anyhow!(
@@ -428,7 +434,8 @@ async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         return Err(anyhow!(
-            "Token refresh failed (HTTP {status}): {body}. Run `openab-agent auth` again."
+            "Token refresh failed (HTTP {status}): {body}. Run `{}` again.",
+            auth_subcommand(&store.provider)
         ));
     }
     let payload: serde_json::Value = resp.json().await?;

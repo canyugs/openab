@@ -611,8 +611,14 @@ impl AcpServer {
 
         // Rebuild the current session's provider so the switch takes effect immediately
         if !session_id.is_empty() && self.sessions.contains_key(session_id) {
+            // Preserve the session's auth mode: an OAuth-forced session must not
+            // silently fall back to ANTHROPIC_API_KEY (which `auto_*` prefers).
+            let session_is_oauth = self.sessions[session_id].provider_is_oauth();
             let new_provider: Result<Box<dyn crate::llm::LlmProvider>, String> = match provider_name
             {
+                "anthropic" if session_is_oauth => {
+                    AnthropicProvider::from_oauth_store_with_model(value).map(|p| Box::new(p) as _)
+                }
                 "anthropic" => AnthropicProvider::auto_with_model(value).map(|p| Box::new(p) as _),
                 _ => crate::llm::OpenAiProvider::from_auth_store_with_model(value)
                     .map(|p| Box::new(p) as _),

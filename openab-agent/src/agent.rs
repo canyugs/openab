@@ -107,6 +107,12 @@ impl Agent {
         self.provider = provider;
     }
 
+    /// True if the current provider authenticates via OAuth. Used on model
+    /// switch to rebuild with the same auth mode.
+    pub fn provider_is_oauth(&self) -> bool {
+        self.provider.is_oauth()
+    }
+
     /// Update working directory and rebuild system prompt.
     pub fn set_working_dir(&mut self, cwd: String) {
         self.system_prompt = Self::build_system_prompt(&cwd, self.mcp_manager.as_ref());
