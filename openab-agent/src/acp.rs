@@ -302,10 +302,14 @@ impl AcpServer {
         let model_override = self.active_model.as_deref();
         let (provider, active_provider): (Box<dyn crate::llm::LlmProvider>, &str) =
             match provider_choice.as_str() {
-                "anthropic" => {
-                    let res = match model_override {
-                        Some(m) => AnthropicProvider::from_env_with_model(m),
-                        None => AnthropicProvider::from_env(),
+                // `auto*` covers both ANTHROPIC_API_KEY and a stored Claude
+                // subscription OAuth token; `anthropic-oauth` forces the latter.
+                "anthropic" | "anthropic-oauth" | "claude" => {
+                    let res = match (provider_choice.as_str(), model_override) {
+                        ("anthropic", Some(m)) => AnthropicProvider::auto_with_model(m),
+                        ("anthropic", None) => AnthropicProvider::auto(),
+                        (_, Some(m)) => AnthropicProvider::from_oauth_store_with_model(m),
+                        (_, None) => AnthropicProvider::from_oauth_store(),
                     };
                     match res {
                         Ok(p) => (Box::new(p), "anthropic"),
@@ -323,10 +327,10 @@ impl AcpServer {
                     }
                 }
                 _ => {
-                    // Auto-detect: try API key first, then OAuth token
+                    // Auto-detect: Anthropic (API key or OAuth) first, then codex.
                     let anthropic_res = match model_override {
-                        Some(m) => AnthropicProvider::from_env_with_model(m),
-                        None => AnthropicProvider::from_env(),
+                        Some(m) => AnthropicProvider::auto_with_model(m),
+                        None => AnthropicProvider::auto(),
                     };
                     match anthropic_res {
                         Ok(p) => (Box::new(p), "anthropic"),
@@ -343,7 +347,7 @@ impl AcpServer {
                                     return self.error_response(
                                         id,
                                         -32000,
-                                        &format!("No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"),
+                                        &format!("No credentials: set ANTHROPIC_API_KEY, or run `openab-agent auth anthropic-oauth` / `auth codex-oauth`. {e}"),
                                     )
                                 }
                             }
@@ -457,7 +461,9 @@ impl AcpServer {
 
     fn static_available_models() -> Vec<ModelOption> {
         let mut models = Vec::new();
-        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        if std::env::var("ANTHROPIC_API_KEY").is_ok()
+            || crate::auth::load_tokens_for(crate::auth::ANTHROPIC_NAMESPACE).is_ok()
+        {
             models.extend(Self::static_anthropic_models());
         }
         if crate::auth::load_tokens().is_ok() {
@@ -598,7 +604,7 @@ impl AcpServer {
             let new_provider: Result<Box<dyn crate::llm::LlmProvider>, String> = match provider_name
             {
                 "anthropic" => {
-                    AnthropicProvider::from_env_with_model(value).map(|p| Box::new(p) as _)
+                    AnthropicProvider::auto_with_model(value).map(|p| Box::new(p) as _)
                 }
                 _ => crate::llm::OpenAiProvider::from_auth_store_with_model(value)
                     .map(|p| Box::new(p) as _),
@@ -918,7 +924,7 @@ mod tests {
 
         // Insert a dummy session using anthropic key
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key") };
-        let provider = AnthropicProvider::from_env_with_model("claude-sonnet-4-20250514").unwrap();
+        let provider = AnthropicProvider::auto_with_model("claude-sonnet-4-20250514").unwrap();
         let agent = Agent::new_boxed(Box::new(provider), "/tmp".to_string(), None);
         server.sessions.insert("test-session".to_string(), agent);
 

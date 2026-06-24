@@ -91,20 +91,22 @@ impl std::ops::Deref for SharedLlmProvider {
 }
 
 /// Select an `LlmProvider` from an explicit `choice` (`anthropic` /
-/// `openai` / `codex`) or, for any other value, auto-detect (Anthropic API
-/// key first, then codex OAuth). Shared by the ACP session path and MCP
-/// sampling so both honor the same `OPENAB_AGENT_PROVIDER` selection and
-/// credential fallback.
+/// `anthropic-oauth` / `openai` / `codex`) or, for any other value, auto-detect
+/// (Anthropic API key, then Claude subscription OAuth, then codex OAuth). The
+/// `anthropic` choice itself auto-falls-back from API key to OAuth. Shared by
+/// the ACP session path and MCP sampling so both honor the same
+/// `OPENAB_AGENT_PROVIDER` selection and credential fallback.
 pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
     match choice {
-        "anthropic" => Ok(Box::new(AnthropicProvider::from_env()?)),
+        "anthropic" => Ok(Box::new(AnthropicProvider::auto()?)),
+        "anthropic-oauth" | "claude" => Ok(Box::new(AnthropicProvider::from_oauth_store()?)),
         "openai" | "codex" => Ok(Box::new(OpenAiProvider::from_auth_store()?)),
-        _ => match AnthropicProvider::from_env() {
+        _ => match AnthropicProvider::auto() {
             Ok(p) => Ok(Box::new(p)),
             Err(_) => match OpenAiProvider::from_auth_store() {
                 Ok(p) => Ok(Box::new(p)),
                 Err(e) => Err(format!(
-                    "No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"
+                    "No credentials: set ANTHROPIC_API_KEY, or run `openab-agent auth anthropic-oauth` / `auth codex-oauth`. {e}"
                 )),
             },
         },
@@ -122,13 +124,60 @@ pub fn default_provider() -> Option<SharedLlmProvider> {
         .map(|b| SharedLlmProvider(Arc::from(b)))
 }
 
+/// How an `AnthropicProvider` authenticates to the Messages API.
+enum AnthropicAuth {
+    /// `ANTHROPIC_API_KEY` → `x-api-key`, plain system prompt.
+    ApiKey(String),
+    /// Claude Pro/Max subscription OAuth → `Bearer` + Claude Code identity
+    /// headers/system block. The live token is fetched (and refreshed) per call
+    /// from the `anthropic-oauth` tenant in auth.json.
+    OAuth,
+}
+
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
-    api_key: String,
+    auth: AnthropicAuth,
     model: String,
-    #[allow(dead_code)]
     max_tokens: u32,
     client: reqwest::Client,
+}
+
+fn anthropic_model_from_env() -> String {
+    std::env::var("OPENAB_AGENT_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string())
+}
+
+fn anthropic_max_tokens() -> u32 {
+    std::env::var("OPENAB_AGENT_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192)
+}
+
+/// openab-agent's built-in tools mapped to Claude Code's canonical casing. The
+/// `claude-code-20250219` beta (sent with OAuth tokens) expects these names, so
+/// they're rewritten on the way out and restored on the way back. Unknown names
+/// (e.g. MCP tools) pass through unchanged, matching Pi's behaviour.
+const CC_TOOL_NAMES: &[(&str, &str)] = &[
+    ("read", "Read"),
+    ("write", "Write"),
+    ("edit", "Edit"),
+    ("bash", "Bash"),
+];
+
+fn to_claude_code_name(name: &str) -> String {
+    CC_TOOL_NAMES
+        .iter()
+        .find(|(lc, _)| *lc == name)
+        .map(|(_, cc)| (*cc).to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn from_claude_code_name(name: &str) -> String {
+    CC_TOOL_NAMES
+        .iter()
+        .find(|(_, cc)| *cc == name)
+        .map(|(lc, _)| (*lc).to_string())
+        .unwrap_or_else(|| name.to_string())
 }
 
 impl AnthropicProvider {
@@ -139,25 +188,51 @@ impl AnthropicProvider {
             return Err("ANTHROPIC_API_KEY is empty".to_string());
         }
         Ok(Self {
-            api_key,
-            model: std::env::var("OPENAB_AGENT_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
-            max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(8192),
+            auth: AnthropicAuth::ApiKey(api_key),
+            model: anthropic_model_from_env(),
+            max_tokens: anthropic_max_tokens(),
             client: reqwest::Client::new(),
         })
     }
 
-    /// Create provider with a specific model override.
-    pub fn from_env_with_model(model: &str) -> Result<Self, String> {
-        let mut p = Self::from_env()?;
+    /// Claude Pro/Max OAuth. Verifies a stored `anthropic-oauth` token exists;
+    /// the live token is fetched (and refreshed) at call time.
+    pub fn from_oauth_store() -> Result<Self, String> {
+        crate::auth::load_tokens_for(crate::auth::ANTHROPIC_NAMESPACE)
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            auth: AnthropicAuth::OAuth,
+            model: anthropic_model_from_env(),
+            max_tokens: anthropic_max_tokens(),
+            client: reqwest::Client::new(),
+        })
+    }
+
+    /// Prefer an explicit API key, else a stored Claude subscription OAuth token.
+    pub fn auto() -> Result<Self, String> {
+        Self::from_env().or_else(|_| Self::from_oauth_store())
+    }
+
+    /// `auto()` with an explicit model override.
+    pub fn auto_with_model(model: &str) -> Result<Self, String> {
+        let mut p = Self::auto()?;
         p.model = model.to_string();
         Ok(p)
     }
 
+    /// `from_oauth_store()` with an explicit model override.
+    pub fn from_oauth_store_with_model(model: &str) -> Result<Self, String> {
+        let mut p = Self::from_oauth_store()?;
+        p.model = model.to_string();
+        Ok(p)
+    }
+
+    fn is_oauth(&self) -> bool {
+        matches!(self.auth, AnthropicAuth::OAuth)
+    }
+
     fn build_request_body(&self, system: &str, messages: &[Message], tools: &[ToolDef]) -> Value {
+        let oauth = self.is_oauth();
         let msgs: Vec<Value> = messages
             .iter()
             .map(|m| {
@@ -167,6 +242,7 @@ impl AnthropicProvider {
                     .map(|b| match b {
                         ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
                         ContentBlock::ToolUse { id, name, input } => {
+                            let name = if oauth { to_claude_code_name(name) } else { name.clone() };
                             json!({ "type": "tool_use", "id": id, "name": name, "input": input })
                         }
                         ContentBlock::ToolResult {
@@ -194,15 +270,27 @@ impl AnthropicProvider {
             "model": &self.model,
             "max_tokens": self.max_tokens,
             "messages": msgs,
-            "system": system,
         });
+
+        // OAuth tokens MUST carry the Claude Code identity as the first system
+        // block, with the real prompt appended. API-key callers send a plain
+        // string (unchanged behaviour).
+        if oauth {
+            body["system"] = json!([
+                { "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." },
+                { "type": "text", "text": system },
+            ]);
+        } else {
+            body["system"] = json!(system);
+        }
 
         if !tools.is_empty() {
             let tool_defs: Vec<Value> = tools
                 .iter()
                 .map(|t| {
+                    let name = if oauth { to_claude_code_name(&t.name) } else { t.name.clone() };
                     json!({
-                        "name": &t.name,
+                        "name": name,
                         "description": &t.description,
                         "input_schema": &t.input_schema
                     })
@@ -228,15 +316,32 @@ impl LlmProvider for AnthropicProvider {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<LlmEvent>>> + Send + 'a>> {
         Box::pin(async move {
             let body = self.build_request_body(system, messages, tools);
+            let oauth = self.is_oauth();
             let max_retries = 3u32;
 
             for attempt in 0..=max_retries {
-                let resp = self
+                let mut req = self
                     .client
                     .post("https://api.anthropic.com/v1/messages")
-                    .header("x-api-key", &self.api_key)
                     .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json")
+                    .header("content-type", "application/json");
+                req = match &self.auth {
+                    AnthropicAuth::ApiKey(key) => req.header("x-api-key", key),
+                    AnthropicAuth::OAuth => {
+                        // Claude Pro/Max: Bearer + Claude Code identity headers.
+                        let token = crate::auth::get_valid_token_for(
+                            crate::auth::ANTHROPIC_NAMESPACE,
+                        )
+                        .await?;
+                        req.header("authorization", format!("Bearer {token}"))
+                            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+                            .header("user-agent", "claude-cli/1.0.0")
+                            .header("x-app", "cli")
+                            .header("anthropic-dangerous-direct-browser-access", "true")
+                    }
+                };
+
+                let resp = req
                     .json(&body)
                     .send()
                     .await
@@ -251,6 +356,14 @@ impl LlmProvider for AnthropicProvider {
                     continue;
                 }
 
+                // 401 on OAuth: token may have expired mid-request; force a
+                // refresh and retry once before surfacing the error.
+                if oauth && status.as_u16() == 401 && attempt < max_retries {
+                    let _ =
+                        crate::auth::force_refresh_for(crate::auth::ANTHROPIC_NAMESPACE).await;
+                    continue;
+                }
+
                 if !status.is_success() {
                     let text = resp.text().await.unwrap_or_default();
                     return Err(anyhow!("Anthropic API error {status}: {text}"));
@@ -261,7 +374,17 @@ impl LlmProvider for AnthropicProvider {
                     .await
                     .map_err(|e| anyhow!("Failed to parse response: {e}"))?;
 
-                return parse_anthropic_response(&response);
+                let mut events = parse_anthropic_response(&response)?;
+                // Restore openab-agent's lowercase tool names from the Claude
+                // Code canonical casing the model echoes back under OAuth.
+                if oauth {
+                    for ev in &mut events {
+                        if let LlmEvent::ToolUse { name, .. } = ev {
+                            *name = from_claude_code_name(name);
+                        }
+                    }
+                }
+                return Ok(events);
             }
 
             Err(anyhow!("Anthropic API: max retries exceeded"))
@@ -664,14 +787,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_request_body() {
-        let provider = AnthropicProvider {
-            api_key: "test".to_string(),
+    fn test_provider(auth: AnthropicAuth) -> AnthropicProvider {
+        AnthropicProvider {
+            auth,
             model: "claude-sonnet-4-20250514".to_string(),
             max_tokens: 4096,
             client: reqwest::Client::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn test_build_request_body() {
+        let provider = test_provider(AnthropicAuth::ApiKey("test".to_string()));
         let messages = vec![Message {
             role: "user".to_string(),
             content: vec![ContentBlock::Text {
@@ -681,8 +808,46 @@ mod tests {
         let body = provider.build_request_body("system prompt", &messages, &[]);
         assert_eq!(body["model"], "claude-sonnet-4-20250514");
         assert_eq!(body["max_tokens"], 4096);
+        // API-key mode keeps the plain-string system prompt.
         assert_eq!(body["system"], "system prompt");
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn test_build_request_body_oauth_injects_claude_code_identity_and_caps_tools() {
+        let provider = test_provider(AnthropicAuth::OAuth);
+        let messages = vec![Message {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "tu_1".to_string(),
+                name: "read".to_string(),
+                input: json!({"path": "/tmp/x"}),
+            }],
+        }];
+        let tools = vec![ToolDef {
+            name: "bash".to_string(),
+            description: "run".to_string(),
+            input_schema: json!({}),
+        }];
+        let body = provider.build_request_body("real prompt", &messages, &tools);
+        // system[0] must be the Claude Code identity, real prompt appended.
+        assert_eq!(
+            body["system"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(body["system"][1]["text"], "real prompt");
+        // tool def + assistant tool_use names normalised to CC casing.
+        assert_eq!(body["tools"][0]["name"], "Bash");
+        assert_eq!(body["messages"][0]["content"][0]["name"], "Read");
+    }
+
+    #[test]
+    fn test_claude_code_name_round_trip_and_passthrough() {
+        assert_eq!(to_claude_code_name("read"), "Read");
+        assert_eq!(from_claude_code_name("Read"), "read");
+        // unknown (e.g. MCP) names pass through unchanged both ways.
+        assert_eq!(to_claude_code_name("linear_search"), "linear_search");
+        assert_eq!(from_claude_code_name("linear_search"), "linear_search");
     }
 
     #[test]

@@ -86,6 +86,12 @@ enum AuthProvider {
     },
     /// OpenAI Codex via device code (headless servers)
     CodexDevice,
+    /// Anthropic Claude Pro/Max via browser PKCE flow
+    AnthropicOauth {
+        /// Print URL and paste the redirect instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Show stored credentials
     Status,
 }
@@ -114,6 +120,12 @@ async fn main() {
             }
             AuthProvider::CodexDevice => {
                 if let Err(e) = auth::login_codex_device_flow().await {
+                    eprintln!("❌ Authentication failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            AuthProvider::AnthropicOauth { no_browser } => {
+                if let Err(e) = auth::login_anthropic_browser_flow(no_browser).await {
                     eprintln!("❌ Authentication failed: {e}");
                     std::process::exit(1);
                 }
