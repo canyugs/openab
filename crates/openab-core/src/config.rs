@@ -344,6 +344,16 @@ pub struct DiscordConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+    /// HTTP proxy URL for Discord API calls (e.g. "http://openab-hub:8080").
+    /// When set, all REST and Gateway requests go through this proxy instead of
+    /// discord.com — used to point the bot at a Discord-compatible server, or an
+    /// API proxy that centralises rate limiting across a fleet.
+    ///
+    /// Setting this also disables serenity's built-in rate limiter, because
+    /// serenity only honours the proxy on the ratelimiter-disabled code path
+    /// (the ratelimiter builds requests with `proxy = None`). Rate limiting is
+    /// therefore expected to be handled by the proxy / target.
+    pub proxy: Option<String>,
 }
 
 fn default_max_bot_turns() -> u32 {
