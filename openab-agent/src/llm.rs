@@ -143,7 +143,7 @@ pub struct AnthropicProvider {
 }
 
 fn anthropic_model_from_env() -> String {
-    std::env::var("OPENAB_AGENT_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string())
+    std::env::var("OPENAB_AGENT_MODEL").unwrap_or_else(|_| "claude-opus-4-8".to_string())
 }
 
 fn anthropic_max_tokens() -> u32 {
