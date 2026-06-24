@@ -715,11 +715,15 @@ pub async fn login_anthropic_browser_flow(no_browser: bool) -> Result<()> {
         if input.is_empty() {
             return Err(anyhow!("No URL provided"));
         }
-        // Accept either a full redirect URL or a bare `code` / `code#state`.
+        // Accept either a full redirect URL or a bare `code#state`. Require the
+        // `#state` form so CSRF state is always verified — a bare code can't be
+        // checked and is rejected rather than trusted.
         if let Ok(url) = url::Url::parse(input) {
             code_from_redirect(&url, &state)?
         } else {
-            let (code, st) = input.split_once('#').unwrap_or((input, state.as_str()));
+            let (code, st) = input.split_once('#').ok_or_else(|| {
+                anyhow!("Paste the full `code#state` value (or the redirect URL) so the state can be verified")
+            })?;
             if st != state {
                 return Err(anyhow!("State mismatch"));
             }
