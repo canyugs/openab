@@ -1,11 +1,5 @@
 # --- Build stage ---
-ARG BUILD_MODE=default
-ARG FEATURES=""
-
 FROM rust:1-bookworm AS builder
-ARG BUILD_MODE
-ARG FEATURES
-
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
@@ -18,29 +12,19 @@ RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src \
     && rm -rf src crates/openab-core/src crates/openab-gateway/src
 COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && \
-    if [ "$BUILD_MODE" = "unified" ]; then \
-      cargo build --release --features unified; \
-    elif [ -n "$FEATURES" ]; then \
-      cargo build --release --no-default-features --features "$FEATURES"; \
-    else \
-      cargo build --release; \
-    fi
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs && cargo build --release
 
 # --- Runtime stage ---
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
+FROM node:22-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini bubblewrap socat unzip && rm -rf /var/lib/apt/lists/*
 
-# Install kiro-cli (auto-detect arch, copy binary directly)
-ARG KIRO_CLI_VERSION=2.8.1
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ]; then URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
-    else URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-x86_64-linux.zip"; fi && \
-    curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 "$URL" -o /tmp/kirocli.zip && \
-    unzip /tmp/kirocli.zip -d /tmp && \
-    cp /tmp/kirocli/bin/* /usr/local/bin/ && \
-    chmod +x /usr/local/bin/kiro-cli* && \
-    rm -rf /tmp/kirocli /tmp/kirocli.zip
+# Install claude-agent-acp adapter and Claude Code CLI.
+# Without CLAUDE_CODE_EXECUTABLE the adapter uses its own bundled SDK cli.js,
+# ignoring the globally installed claude-code binary (see #418).
+ARG CLAUDE_AGENT_ACP_VERSION=0.45.0
+ARG CLAUDE_CODE_VERSION=2.1.179
+RUN npm install -g @agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION} @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} --retry 3
+ENV CLAUDE_CODE_EXECUTABLE=/usr/local/bin/claude
 
 # Install gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -50,19 +34,23 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -s /bin/bash -u 1000 agent
-RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
-    chown -R agent:agent /home/agent
-ENV HOME=/home/agent
-WORKDIR /home/agent
+ENV HOME=/home/node
+WORKDIR /home/node
 
-COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
+COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
 
-USER agent
+RUN mkdir -p /home/node/.claude && chown -R node:node /home/node
+
+# Bake a default config for openab-hub test bots (env-expanded at runtime).
+# Only used when no config is mounted at this path.
+RUN mkdir -p /etc/openab
+COPY deploy/hubbot.config.toml /etc/openab/config.toml
+
+USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
-ENV OPENAB_AGENT_COMMAND="kiro-cli acp --trust-all-tools"
-ENV OPENAB_AGENT_AUTH_COMMAND="kiro-cli login --use-device-flow"
+ENV OPENAB_AGENT_COMMAND="claude"
+ENV OPENAB_AGENT_AUTH_COMMAND="claude auth login"
 
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
