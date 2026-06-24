@@ -347,7 +347,7 @@ impl AcpServer {
                                     return self.error_response(
                                         id,
                                         -32000,
-                                        &format!("No credentials: set ANTHROPIC_API_KEY, or run `openab-agent auth anthropic-oauth` / `auth codex-oauth`. {e}"),
+                                        &format!("No credentials: set ANTHROPIC_API_KEY, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth`. {e}"),
                                     )
                                 }
                             }
@@ -603,9 +603,7 @@ impl AcpServer {
         if !session_id.is_empty() && self.sessions.contains_key(session_id) {
             let new_provider: Result<Box<dyn crate::llm::LlmProvider>, String> = match provider_name
             {
-                "anthropic" => {
-                    AnthropicProvider::auto_with_model(value).map(|p| Box::new(p) as _)
-                }
+                "anthropic" => AnthropicProvider::auto_with_model(value).map(|p| Box::new(p) as _),
                 _ => crate::llm::OpenAiProvider::from_auth_store_with_model(value)
                     .map(|p| Box::new(p) as _),
             };
