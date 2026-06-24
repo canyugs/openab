@@ -41,16 +41,15 @@ COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bi
 
 RUN mkdir -p /home/node/.claude && chown -R node:node /home/node
 
-# Bake a default config for openab-hub test bots (env-expanded at runtime).
-# Only used when no config is mounted at this path.
-RUN mkdir -p /etc/openab
-COPY deploy/hubbot.config.toml /etc/openab/config.toml
-
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENV OPENAB_AGENT_COMMAND="claude"
 ENV OPENAB_AGENT_AUTH_COMMAND="claude auth login"
 
+# Config source is env-driven: defaults to the mounted file, but set
+# OPENAB_CONFIG to a URL (http/https/s3) to load config remotely — e.g. from
+# openab-hub's /bot-config endpoint, no file mount needed.
+ENV OPENAB_CONFIG="/etc/openab/config.toml"
 ENTRYPOINT ["tini", "--"]
-CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
+CMD ["sh", "-c", "exec openab run -c \"$OPENAB_CONFIG\""]
