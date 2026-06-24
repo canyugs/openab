@@ -1,0 +1,16 @@
+# Baked config for openab-hub test bots. Secrets/ids come from env at runtime
+# (OpenAB expands ${VAR}). proxy points at openab-hub on the project's internal network.
+[discord]
+bot_token = "${DISCORD_BOT_TOKEN}"
+proxy = "http://openab-hub.zeabur.internal:8080"
+allow_all_channels = true
+allow_all_users = true
+allow_bot_messages = "mentions"
+
+[agent]
+command = "claude-agent-acp"
+working_dir = "/home/node"
+
+[pool]
+max_sessions = 1
+session_ttl_hours = 2
