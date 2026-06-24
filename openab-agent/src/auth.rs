@@ -51,8 +51,9 @@ fn anthropic_redirect_uri() -> String {
     format!("http://localhost:{ANTHROPIC_REDIRECT_PORT}/callback")
 }
 
-/// Build the Anthropic authorize URL. Pure so it can be unit-tested. Pi reuses
-/// the PKCE verifier as the `state` value, so callers pass `state == verifier`.
+/// Build the Anthropic authorize URL. Pure so it can be unit-tested. `state` is
+/// an independent random CSRF value (kept distinct from the PKCE verifier, which
+/// stays back-channel-only) — the AS just echoes it back.
 fn anthropic_authorize_url(challenge: &str, state: &str) -> String {
     let client_id = anthropic_client_id();
     let redirect = anthropic_redirect_uri();
@@ -249,16 +250,22 @@ fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> 
 /// Load the LLM token stored under `namespace` (`codex` / `anthropic-oauth`).
 pub fn load_tokens_for(namespace: &str) -> Result<TokenStore> {
     let path = auth_path();
-    let map = read_auth_file(&path).map_err(|_| {
+    let cmd = if namespace == ANTHROPIC_NAMESPACE {
+        "openab-agent auth anthropic-oauth"
+    } else {
+        "openab-agent auth codex-oauth"
+    };
+    // Preserve the underlying read/parse error for debugging.
+    let map = read_auth_file(&path).map_err(|e| {
         anyhow!(
-            "No credentials found at {}. Run `openab-agent auth` first.",
+            "No credentials at {} ({e}). Run `{cmd}` first.",
             path.display()
         )
     })?;
     match map.get(namespace) {
         Some(AuthEntry::Token(t)) => Ok(t.clone()),
         _ => Err(anyhow!(
-            "No {namespace} credentials in {}. Run `openab-agent auth` first.",
+            "No {namespace} credentials in {}. Run `{cmd}` first.",
             path.display()
         )),
     }
@@ -420,7 +427,9 @@ async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Token refresh failed (HTTP {status}): {body}. Run `openab-agent auth` again."));
+        return Err(anyhow!(
+            "Token refresh failed (HTTP {status}): {body}. Run `openab-agent auth` again."
+        ));
     }
     let payload: serde_json::Value = resp.json().await?;
     let access_token = payload["access_token"]
@@ -654,8 +663,8 @@ fn code_from_redirect(url: &url::Url, expected_state: &str) -> Result<String> {
 }
 
 /// Block on the loopback listener for the OAuth redirect, reply 200, return the
-/// authorization code. ponytail: the Codex flow above predates this helper and
-/// still inlines the same logic; fold it in if that path is ever touched again.
+/// authorization code. Note: the Codex flow above predates this helper and still
+/// inlines the same logic; fold it in if that path is ever touched again.
 fn accept_callback_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
     listener.set_nonblocking(false)?;
     let (mut stream, _) = listener
@@ -677,12 +686,20 @@ fn accept_callback_code(listener: &TcpListener, expected_state: &str) -> Result<
 /// (Pi's convention) and a JSON token exchange against `platform.claude.com`.
 pub async fn login_anthropic_browser_flow(no_browser: bool) -> Result<()> {
     let (verifier, challenge) = generate_pkce();
-    let state = verifier.clone(); // Pi reuses the verifier as the state value
+    // Independent random CSRF state — keep the PKCE verifier back-channel-only.
+    // 32 bytes: claude.ai's authorize rejects a short state ("Invalid request
+    // format"); matching the verifier's length keeps it happy while the value
+    // stays independent (full PKCE strength).
+    let mut state_buf = [0u8; 32];
+    getrandom::fill(&mut state_buf).expect("getrandom failed");
+    let state = URL_SAFE_NO_PAD.encode(state_buf);
     let auth_url = anthropic_authorize_url(&challenge, &state);
 
     let code = if no_browser {
         println!("Open this URL in your browser:\n\n  {auth_url}\n");
-        println!("After approving, copy the full redirect URL (or just the code) and paste it here:\n");
+        println!(
+            "After approving, copy the full redirect URL (or just the code) and paste it here:\n"
+        );
         let mut input = String::new();
         std::io::stdin()
             .read_line(&mut input)

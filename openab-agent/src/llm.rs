@@ -106,7 +106,7 @@ pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
             Err(_) => match OpenAiProvider::from_auth_store() {
                 Ok(p) => Ok(Box::new(p)),
                 Err(e) => Err(format!(
-                    "No credentials: set ANTHROPIC_API_KEY, or run `openab-agent auth anthropic-oauth` / `auth codex-oauth`. {e}"
+                    "No credentials: set ANTHROPIC_API_KEY, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth`. {e}"
                 )),
             },
         },
@@ -233,10 +233,11 @@ impl AnthropicProvider {
 
     fn build_request_body(&self, system: &str, messages: &[Message], tools: &[ToolDef]) -> Value {
         let oauth = self.is_oauth();
-        let msgs: Vec<Value> = messages
-            .iter()
-            .map(|m| {
-                let content: Vec<Value> = m
+        let msgs: Vec<Value> =
+            messages
+                .iter()
+                .map(|m| {
+                    let content: Vec<Value> = m
                     .content
                     .iter()
                     .map(|b| match b {
@@ -262,9 +263,9 @@ impl AnthropicProvider {
                         }
                     })
                     .collect();
-                json!({ "role": &m.role, "content": content })
-            })
-            .collect();
+                    json!({ "role": &m.role, "content": content })
+                })
+                .collect();
 
         let mut body = json!({
             "model": &self.model,
@@ -288,7 +289,11 @@ impl AnthropicProvider {
             let tool_defs: Vec<Value> = tools
                 .iter()
                 .map(|t| {
-                    let name = if oauth { to_claude_code_name(&t.name) } else { t.name.clone() };
+                    let name = if oauth {
+                        to_claude_code_name(&t.name)
+                    } else {
+                        t.name.clone()
+                    };
                     json!({
                         "name": name,
                         "description": &t.description,
@@ -329,10 +334,9 @@ impl LlmProvider for AnthropicProvider {
                     AnthropicAuth::ApiKey(key) => req.header("x-api-key", key),
                     AnthropicAuth::OAuth => {
                         // Claude Pro/Max: Bearer + Claude Code identity headers.
-                        let token = crate::auth::get_valid_token_for(
-                            crate::auth::ANTHROPIC_NAMESPACE,
-                        )
-                        .await?;
+                        let token =
+                            crate::auth::get_valid_token_for(crate::auth::ANTHROPIC_NAMESPACE)
+                                .await?;
                         req.header("authorization", format!("Bearer {token}"))
                             .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
                             .header("user-agent", "claude-cli/1.0.0")
@@ -359,8 +363,7 @@ impl LlmProvider for AnthropicProvider {
                 // 401 on OAuth: token may have expired mid-request; force a
                 // refresh and retry once before surfacing the error.
                 if oauth && status.as_u16() == 401 && attempt < max_retries {
-                    let _ =
-                        crate::auth::force_refresh_for(crate::auth::ANTHROPIC_NAMESPACE).await;
+                    let _ = crate::auth::force_refresh_for(crate::auth::ANTHROPIC_NAMESPACE).await;
                     continue;
                 }
 
