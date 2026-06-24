@@ -372,7 +372,7 @@ impl AcpServer {
             .or_else(|| std::env::var("OPENAB_AGENT_MODEL").ok())
             .unwrap_or_else(|| {
                 if active_provider == "anthropic" {
-                    "claude-sonnet-4-20250514".to_string()
+                    "claude-opus-4-8".to_string()
                 } else {
                     "gpt-5.4-mini".to_string()
                 }
@@ -433,7 +433,7 @@ impl AcpServer {
             if self.active_provider.as_deref() == Some("openai") {
                 "gpt-5.4-mini".to_string()
             } else {
-                "claude-sonnet-4-20250514".to_string()
+                "claude-opus-4-8".to_string()
             }
         });
 
