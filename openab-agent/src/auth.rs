@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Namespace key for the existing Codex single-tenant credential.
 /// Lives next to future `mcp:<server>` entries inside `auth.json`.
 const CODEX_NAMESPACE: &str = "codex";
+/// Namespace key for the Anthropic (Claude Pro/Max) OAuth credential.
+pub const ANTHROPIC_NAMESPACE: &str = "anthropic-oauth";
 
 const REFRESH_SKEW_SECONDS: u64 = 120;
 
@@ -22,13 +24,43 @@ const CODEX_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/devic
 const CODEX_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const REDIRECT_PORT: u16 = 1455;
 
+// Anthropic OAuth (Claude Pro/Max). Values mirror Claude Code's public client so
+// `platform.claude.com` accepts the flow. Token bodies are JSON (Codex uses form)
+// and the refresh body omits `scope` (Pi #2169).
+const ANTHROPIC_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+const ANTHROPIC_REDIRECT_PORT: u16 = 53692;
+const ANTHROPIC_SCOPE: &str =
+    "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+
 fn codex_client_id() -> String {
     std::env::var("OPENAB_AGENT_OAUTH_CLIENT_ID")
         .unwrap_or_else(|_| "app_EMoamEEZ73f0CkXaXp7hrann".to_string())
 }
 
+fn anthropic_client_id() -> String {
+    std::env::var("OPENAB_AGENT_ANTHROPIC_CLIENT_ID")
+        .unwrap_or_else(|_| "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string())
+}
+
 fn redirect_uri() -> String {
     format!("http://localhost:{REDIRECT_PORT}/auth/callback")
+}
+
+fn anthropic_redirect_uri() -> String {
+    format!("http://localhost:{ANTHROPIC_REDIRECT_PORT}/callback")
+}
+
+/// Build the Anthropic authorize URL. Pure so it can be unit-tested. Pi reuses
+/// the PKCE verifier as the `state` value, so callers pass `state == verifier`.
+fn anthropic_authorize_url(challenge: &str, state: &str) -> String {
+    let client_id = anthropic_client_id();
+    let redirect = anthropic_redirect_uri();
+    let redir = urlencoding::encode(&redirect);
+    let scope = urlencoding::encode(ANTHROPIC_SCOPE);
+    format!(
+        "{ANTHROPIC_AUTHORIZE_URL}?code=true&client_id={client_id}&response_type=code&redirect_uri={redir}&scope={scope}&code_challenge={challenge}&code_challenge_method=S256&state={state}"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,28 +246,35 @@ fn write_auth_file(path: &Path, map: &HashMap<String, AuthEntry>) -> Result<()> 
     Ok(())
 }
 
-pub fn load_tokens() -> Result<TokenStore> {
+/// Load the LLM token stored under `namespace` (`codex` / `anthropic-oauth`).
+pub fn load_tokens_for(namespace: &str) -> Result<TokenStore> {
     let path = auth_path();
     let map = read_auth_file(&path).map_err(|_| {
         anyhow!(
-            "No credentials found at {}. Run `openab-agent auth codex-oauth` first.",
+            "No credentials found at {}. Run `openab-agent auth` first.",
             path.display()
         )
     })?;
-    match map.get(CODEX_NAMESPACE) {
+    match map.get(namespace) {
         Some(AuthEntry::Token(t)) => Ok(t.clone()),
         _ => Err(anyhow!(
-            "No codex credentials in {}. Run `openab-agent auth codex-oauth` first.",
+            "No {namespace} credentials in {}. Run `openab-agent auth` first.",
             path.display()
         )),
     }
 }
 
-fn save_tokens(store: &TokenStore) -> Result<()> {
+/// Save a token under its own `provider` field as the namespace key, leaving
+/// every other tenant in `auth.json` untouched.
+fn save_tokens_for(store: &TokenStore) -> Result<()> {
     let path = auth_path();
     let mut map = read_auth_file(&path).unwrap_or_default();
-    map.insert(CODEX_NAMESPACE.to_string(), AuthEntry::Token(store.clone()));
+    map.insert(store.provider.clone(), AuthEntry::Token(store.clone()));
     write_auth_file(&path, &map)
+}
+
+pub fn load_tokens() -> Result<TokenStore> {
+    load_tokens_for(CODEX_NAMESPACE)
 }
 
 /// rmcp [`CredentialStore`] backed by the shared `auth.json` file (ADR §6.1
@@ -328,38 +367,60 @@ impl CredentialStore for McpCredentialStore {
     }
 }
 
-pub async fn get_valid_token() -> Result<String> {
-    let mut store = load_tokens()?;
+pub async fn get_valid_token_for(namespace: &str) -> Result<String> {
+    let mut store = load_tokens_for(namespace)?;
     if store.is_expired() {
         store = refresh_token(&store).await?;
-        save_tokens(&store)?;
+        save_tokens_for(&store)?;
     }
     Ok(store.access_token)
 }
 
-pub async fn force_refresh() -> Result<String> {
-    let store = load_tokens()?;
+pub async fn force_refresh_for(namespace: &str) -> Result<String> {
+    let store = load_tokens_for(namespace)?;
     let new_store = refresh_token(&store).await?;
-    save_tokens(&new_store)?;
+    save_tokens_for(&new_store)?;
     Ok(new_store.access_token)
 }
 
+pub async fn get_valid_token() -> Result<String> {
+    get_valid_token_for(CODEX_NAMESPACE).await
+}
+
+pub async fn force_refresh() -> Result<String> {
+    force_refresh_for(CODEX_NAMESPACE).await
+}
+
 async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
-    let client_id = codex_client_id();
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&store.token_endpoint)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", store.refresh_token.as_str()),
-            ("client_id", client_id.as_str()),
-        ])
-        .send()
-        .await?;
+    // Anthropic's token endpoint takes a JSON body and rejects a `scope` field
+    // on refresh (Pi #2169); Codex takes a form body. Branch on the stored
+    // provider so each tenant refreshes the way its AS expects.
+    let resp = if store.provider == ANTHROPIC_NAMESPACE {
+        client
+            .post(&store.token_endpoint)
+            .json(&serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": store.refresh_token,
+                "client_id": anthropic_client_id(),
+            }))
+            .send()
+            .await?
+    } else {
+        client
+            .post(&store.token_endpoint)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", store.refresh_token.as_str()),
+                ("client_id", codex_client_id().as_str()),
+            ])
+            .send()
+            .await?
+    };
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Token refresh failed (HTTP {status}): {body}. Run `openab-agent auth codex-oauth` again."));
+        return Err(anyhow!("Token refresh failed (HTTP {status}): {body}. Run `openab-agent auth` again."));
     }
     let payload: serde_json::Value = resp.json().await?;
     let access_token = payload["access_token"]
@@ -474,7 +535,7 @@ pub async fn login_browser_flow(no_browser: bool) -> Result<()> {
             token_endpoint: CODEX_TOKEN_URL.to_string(),
             provider: "codex".to_string(),
         };
-        save_tokens(&store)?;
+        save_tokens_for(&store)?;
         println!(
             "\n\u{2705} Login successful! Token saved to {:?}",
             auth_path()
@@ -557,12 +618,146 @@ pub async fn login_browser_flow(no_browser: bool) -> Result<()> {
         token_endpoint: CODEX_TOKEN_URL.to_string(),
         provider: "codex".to_string(),
     };
-    save_tokens(&store)?;
+    save_tokens_for(&store)?;
     println!(
         "\n\u{2705} Login successful! Token saved to {:?}",
         auth_path()
     );
     Ok(())
+}
+
+/// Extract the OAuth `code` from a parsed redirect URL, validating `state`.
+/// Shared by every loopback-callback OAuth flow.
+fn code_from_redirect(url: &url::Url, expected_state: &str) -> Result<String> {
+    let code = url
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.to_string())
+        .ok_or_else(|| {
+            let error = url
+                .query_pairs()
+                .find(|(k, _)| k == "error")
+                .map(|(_, v)| v.to_string());
+            anyhow!(
+                "No code in redirect. Error: {}",
+                error.unwrap_or_else(|| "unknown".into())
+            )
+        })?;
+    let cb_state = url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.to_string());
+    if cb_state.as_deref() != Some(expected_state) {
+        return Err(anyhow!("State mismatch"));
+    }
+    Ok(code)
+}
+
+/// Block on the loopback listener for the OAuth redirect, reply 200, return the
+/// authorization code. ponytail: the Codex flow above predates this helper and
+/// still inlines the same logic; fold it in if that path is ever touched again.
+fn accept_callback_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
+    listener.set_nonblocking(false)?;
+    let (mut stream, _) = listener
+        .accept()
+        .map_err(|e| anyhow!("Failed to accept callback: {e}"))?;
+    let mut reader = std::io::BufReader::new(&stream);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let path = request_line.split_whitespace().nth(1).unwrap_or("");
+    let url = url::Url::parse(&format!("http://localhost{path}"))
+        .map_err(|_| anyhow!("Invalid callback URL"))?;
+    let code = code_from_redirect(&url, expected_state)?;
+    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body><h1>Authentication successful!</h1><p>You can close this tab.</p></body></html>";
+    let _ = stream.write_all(response.as_bytes());
+    Ok(code)
+}
+
+/// Anthropic OAuth (Claude Pro/Max). PKCE with the verifier doubling as `state`
+/// (Pi's convention) and a JSON token exchange against `platform.claude.com`.
+pub async fn login_anthropic_browser_flow(no_browser: bool) -> Result<()> {
+    let (verifier, challenge) = generate_pkce();
+    let state = verifier.clone(); // Pi reuses the verifier as the state value
+    let auth_url = anthropic_authorize_url(&challenge, &state);
+
+    let code = if no_browser {
+        println!("Open this URL in your browser:\n\n  {auth_url}\n");
+        println!("After approving, copy the full redirect URL (or just the code) and paste it here:\n");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| anyhow!("Failed to read input: {e}"))?;
+        let input = input.trim();
+        if input.is_empty() {
+            return Err(anyhow!("No URL provided"));
+        }
+        // Accept either a full redirect URL or a bare `code` / `code#state`.
+        if let Ok(url) = url::Url::parse(input) {
+            code_from_redirect(&url, &state)?
+        } else {
+            let (code, st) = input.split_once('#').unwrap_or((input, state.as_str()));
+            if st != state {
+                return Err(anyhow!("State mismatch"));
+            }
+            code.to_string()
+        }
+    } else {
+        let listener = TcpListener::bind(format!("127.0.0.1:{ANTHROPIC_REDIRECT_PORT}")).map_err(
+            |e| {
+                anyhow!("Failed to bind port {ANTHROPIC_REDIRECT_PORT}: {e}. Is another instance running?")
+            },
+        )?;
+        println!("Opening browser for authentication...\n");
+        if open::that(&auth_url).is_err() {
+            println!("Could not open browser. Open this URL manually:\n\n  {auth_url}\n");
+        }
+        println!("Waiting for callback...");
+        accept_callback_code(&listener, &state)?
+    };
+
+    let store = exchange_anthropic_code(&code, &state, &verifier).await?;
+    save_tokens_for(&store)?;
+    println!(
+        "\n\u{2705} Login successful! Token saved to {:?}",
+        auth_path()
+    );
+    Ok(())
+}
+
+async fn exchange_anthropic_code(code: &str, state: &str, verifier: &str) -> Result<TokenStore> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(ANTHROPIC_TOKEN_URL)
+        .json(&serde_json::json!({
+            "grant_type": "authorization_code",
+            "client_id": anthropic_client_id(),
+            "code": code,
+            "state": state,
+            "redirect_uri": anthropic_redirect_uri(),
+            "code_verifier": verifier,
+        }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Token exchange failed: {body}"));
+    }
+    let payload: serde_json::Value = resp.json().await?;
+    let access_token = payload["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No access_token"))?;
+    let refresh_token_val = payload["refresh_token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No refresh_token"))?;
+    let expires_in = payload["expires_in"].as_u64().unwrap_or(3600);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    Ok(TokenStore {
+        access_token: access_token.to_string(),
+        refresh_token: refresh_token_val.to_string(),
+        expires_at: now + expires_in,
+        token_endpoint: ANTHROPIC_TOKEN_URL.to_string(),
+        provider: ANTHROPIC_NAMESPACE.to_string(),
+    })
 }
 
 // Device code flow
@@ -649,7 +844,7 @@ pub async fn login_codex_device_flow() -> Result<()> {
                 token_endpoint: CODEX_TOKEN_URL.to_string(),
                 provider: "codex".to_string(),
             };
-            save_tokens(&store)?;
+            save_tokens_for(&store)?;
             println!(
                 "\n\u{2705} Login successful! Token saved to {:?}",
                 auth_path()
@@ -681,31 +876,49 @@ pub async fn login_codex_device_flow() -> Result<()> {
 }
 
 pub fn show_status() {
-    match load_tokens() {
-        Ok(store) => {
-            let expired = store.is_expired();
-            let masked = if store.access_token.len() > 12 {
-                format!(
-                    "{}...{}",
-                    &store.access_token[..8],
-                    &store.access_token[store.access_token.len() - 4..]
-                )
-            } else {
-                "****".to_string()
-            };
-            println!("Provider:  {}", store.provider);
-            println!("Token:     {}", masked);
-            println!(
-                "Expires:   {} ({})",
-                store.expires_at,
-                if expired { "EXPIRED" } else { "valid" }
-            );
-            println!("File:      {:?}", auth_path());
-        }
-        Err(e) => {
-            println!("Not authenticated: {e}\nRun: openab-agent auth codex-oauth");
-        }
+    let path = auth_path();
+    let tokens: Vec<TokenStore> = read_auth_file(&path)
+        .map(|map| {
+            let mut v: Vec<TokenStore> = map
+                .into_values()
+                .filter_map(|e| match e {
+                    AuthEntry::Token(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            v.sort_by(|a, b| a.provider.cmp(&b.provider));
+            v
+        })
+        .unwrap_or_default();
+
+    if tokens.is_empty() {
+        println!(
+            "Not authenticated.\nRun: openab-agent auth codex-oauth  |  openab-agent auth anthropic-oauth"
+        );
+        return;
     }
+
+    for store in tokens {
+        let expired = store.is_expired();
+        let masked = if store.access_token.len() > 12 {
+            format!(
+                "{}...{}",
+                &store.access_token[..8],
+                &store.access_token[store.access_token.len() - 4..]
+            )
+        } else {
+            "****".to_string()
+        };
+        println!("Provider:  {}", store.provider);
+        println!("Token:     {}", masked);
+        println!(
+            "Expires:   {} ({})",
+            store.expires_at,
+            if expired { "EXPIRED" } else { "valid" }
+        );
+        println!();
+    }
+    println!("File:      {:?}", path);
 }
 
 #[cfg(test)]
@@ -777,6 +990,44 @@ mod tests {
         assert!(!verifier.is_empty());
         let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         assert_eq!(challenge, expected);
+    }
+
+    #[test]
+    fn test_anthropic_authorize_url_carries_required_params() {
+        temp_env::with_var("OPENAB_AGENT_ANTHROPIC_CLIENT_ID", None::<&str>, || {
+            let url = anthropic_authorize_url("CHAL", "STATE");
+            assert!(url.starts_with("https://claude.ai/oauth/authorize?"));
+            assert!(url.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"));
+            assert!(url.contains("response_type=code"));
+            assert!(url.contains("code_challenge=CHAL"));
+            assert!(url.contains("code_challenge_method=S256"));
+            assert!(url.contains("state=STATE"));
+            // scope is url-encoded; spot-check one encoded scope token
+            assert!(url.contains("user%3Ainference"));
+            // redirect must be the loopback callback on the Anthropic port
+            assert!(url.contains("localhost%3A53692%2Fcallback"));
+        });
+    }
+
+    #[test]
+    fn test_anthropic_save_uses_provider_as_key_disjoint_from_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut codex = make_store(1);
+        codex.provider = "codex".to_string();
+        let mut anth = make_store(2);
+        anth.provider = ANTHROPIC_NAMESPACE.to_string();
+        anth.access_token = "sk-ant-oat-xyz".to_string();
+        let mut input = HashMap::new();
+        input.insert(codex.provider.clone(), AuthEntry::Token(codex));
+        input.insert(anth.provider.clone(), AuthEntry::Token(anth));
+        write_auth_file(&path, &input).unwrap();
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(token_of(map.get("codex")).expires_at, 1);
+        assert_eq!(
+            token_of(map.get(ANTHROPIC_NAMESPACE)).access_token,
+            "sk-ant-oat-xyz"
+        );
     }
 
     fn token_of(entry: Option<&AuthEntry>) -> &TokenStore {
