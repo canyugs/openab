@@ -786,9 +786,20 @@ async fn main() -> anyhow::Result<()> {
             | GatewayIntents::DIRECT_MESSAGES
             | GatewayIntents::GUILD_MESSAGE_REACTIONS;
 
-        let mut client = Client::builder(&discord_cfg.bot_token, intents)
-            .event_handler(handler)
-            .await?;
+        let mut client = if let Some(ref proxy) = discord_cfg.proxy {
+            info!(proxy = %proxy, "discord adapter using API proxy");
+            let http = serenity::http::HttpBuilder::new(&discord_cfg.bot_token)
+                .proxy(proxy)
+                .ratelimiter_disabled(true)
+                .build();
+            serenity::all::ClientBuilder::new_with_http(http, intents)
+                .event_handler(handler)
+                .await?
+        } else {
+            Client::builder(&discord_cfg.bot_token, intents)
+                .event_handler(handler)
+                .await?
+        };
 
         let shard_manager = client.shard_manager.clone();
         tokio::spawn(async move {
