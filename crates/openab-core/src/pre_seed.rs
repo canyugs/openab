@@ -222,7 +222,7 @@ fn extract_zip_budgeted(
 
     for i in 0..file_count {
         // Cooperative deadline check per file
-        if i % 100 == 0 && Instant::now() >= deadline {
+        if i.is_multiple_of(100) && Instant::now() >= deadline {
             anyhow::bail!("hooks.pre_seed: timed out during extraction at entry {i}");
         }
 
@@ -286,7 +286,7 @@ fn extract_tarball_with_limits(data: &[u8], dest: &Path, deadline: Instant) -> a
         }
 
         // Cooperative deadline check every 10 files
-        if file_count % 10 == 0 && Instant::now() >= deadline {
+        if file_count.is_multiple_of(10) && Instant::now() >= deadline {
             anyhow::bail!("hooks.pre_seed: timed out during tarball extraction at entry {file_count}");
         }
 
