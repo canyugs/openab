@@ -307,8 +307,7 @@ impl AcpServer {
         let provider_choice = self
             .active_provider
             .clone()
-            .or_else(|| std::env::var("OPENAB_AGENT_PROVIDER").ok())
-            .unwrap_or_default();
+            .unwrap_or_else(crate::llm::resolve_provider_choice);
         let model_override = self.active_model.as_deref();
         let (provider, active_provider): (Box<dyn crate::llm::LlmProvider>, &str) =
             match provider_choice.as_str() {

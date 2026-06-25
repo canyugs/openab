@@ -97,6 +97,44 @@ impl std::ops::Deref for SharedLlmProvider {
     }
 }
 
+/// A model reference, optionally provider-qualified. Accepts the canonical
+/// `provider/model_id` form (e.g. `anthropic/claude-sonnet-4-6`) as well as a
+/// bare `model_id` (provider then inferred from credentials). Model IDs never
+/// contain `/`, so the first `/` cleanly separates the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRef {
+    pub provider: Option<String>,
+    pub model: String,
+}
+
+impl ModelRef {
+    pub fn parse(input: &str) -> Self {
+        match input.split_once('/') {
+            Some((p, m)) if !p.is_empty() && !m.is_empty() => ModelRef {
+                provider: Some(p.to_string()),
+                model: m.to_string(),
+            },
+            _ => ModelRef {
+                provider: None,
+                model: input.to_string(),
+            },
+        }
+    }
+}
+
+/// The provider the user asked for: explicit `OPENAB_AGENT_PROVIDER`, else the
+/// `provider/` prefix of `OPENAB_AGENT_MODEL` (e.g. `openai/gpt-5.4` selects
+/// OpenAI even when an Anthropic key is also present), else empty (auto-detect).
+pub fn resolve_provider_choice() -> String {
+    match std::env::var("OPENAB_AGENT_PROVIDER") {
+        Ok(p) if !p.is_empty() => p,
+        _ => std::env::var("OPENAB_AGENT_MODEL")
+            .ok()
+            .and_then(|m| ModelRef::parse(&m).provider)
+            .unwrap_or_default(),
+    }
+}
+
 /// Select an `LlmProvider` from an explicit `choice` (`anthropic` /
 /// `anthropic-oauth` / `openai` / `codex`) or, for any other value, auto-detect
 /// (Anthropic API key, then Claude subscription OAuth, then codex OAuth). The
@@ -125,7 +163,7 @@ pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
 /// credentials are available so the caller can simply decline to advertise
 /// the `sampling` capability rather than fail.
 pub fn default_provider() -> Option<SharedLlmProvider> {
-    let choice = std::env::var("OPENAB_AGENT_PROVIDER").unwrap_or_default();
+    let choice = resolve_provider_choice();
     select_provider(&choice)
         .ok()
         .map(|b| SharedLlmProvider(Arc::from(b)))
@@ -196,7 +234,9 @@ impl AnthropicProvider {
     fn build(auth: AnthropicAuth, model: String) -> Self {
         Self {
             auth,
-            model,
+            // Accept a provider-qualified ref (`anthropic/claude-…`); the API
+            // wants the bare model id.
+            model: ModelRef::parse(&model).model,
             max_tokens: anthropic_max_tokens(),
             client: reqwest::Client::new(),
         }
@@ -481,9 +521,12 @@ impl OpenAiProvider {
         Ok(Self {
             base_url: std::env::var("OPENAB_AGENT_OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
-            model: std::env::var("OPENAB_AGENT_OPENAI_MODEL")
-                .or_else(|_| std::env::var("OPENAB_AGENT_MODEL"))
-                .unwrap_or_else(|_| "gpt-5.4-mini".to_string()),
+            model: ModelRef::parse(
+                &std::env::var("OPENAB_AGENT_OPENAI_MODEL")
+                    .or_else(|_| std::env::var("OPENAB_AGENT_MODEL"))
+                    .unwrap_or_else(|_| "gpt-5.4-mini".to_string()),
+            )
+            .model,
             max_tokens: std::env::var("OPENAB_AGENT_MAX_TOKENS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -495,7 +538,7 @@ impl OpenAiProvider {
     /// Create provider with a specific model override.
     pub fn from_auth_store_with_model(model: &str) -> Result<Self, String> {
         let mut p = Self::from_auth_store()?;
-        p.model = model.to_string();
+        p.model = ModelRef::parse(model).model;
         Ok(p)
     }
 }
@@ -777,6 +820,33 @@ fn parse_openai_response(response: &Value) -> Result<Vec<LlmEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_model_ref_parse() {
+        // Provider-qualified form splits on the first slash.
+        let r = ModelRef::parse("anthropic/claude-sonnet-4-6");
+        assert_eq!(r.provider.as_deref(), Some("anthropic"));
+        assert_eq!(r.model, "claude-sonnet-4-6");
+
+        // Bare model id → no provider, model unchanged.
+        let r = ModelRef::parse("claude-sonnet-4-6");
+        assert_eq!(r.provider, None);
+        assert_eq!(r.model, "claude-sonnet-4-6");
+
+        // Degenerate slashes fall back to bare (no empty provider/model).
+        assert_eq!(ModelRef::parse("/gpt-5.4").provider, None);
+        assert_eq!(ModelRef::parse("openai/").model, "openai/");
+    }
+
+    #[test]
+    fn test_provider_build_strips_prefix() {
+        // A qualified ref reaches the API as the bare model id.
+        let p = AnthropicProvider::build(
+            AnthropicAuth::ApiKey("k".to_string()),
+            "anthropic/claude-opus-4-8".to_string(),
+        );
+        assert_eq!(p.model(), "claude-opus-4-8");
+    }
 
     #[test]
     fn test_parse_text_response() {
