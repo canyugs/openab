@@ -385,6 +385,7 @@ impl LlmProvider for AnthropicProvider {
             let body = self.build_request_body(system, messages, tools);
             let oauth = self.is_oauth();
             let max_retries = 3u32;
+            let mut oauth_refreshed = false;
 
             for attempt in 0..=max_retries {
                 let mut req = self
@@ -425,7 +426,8 @@ impl LlmProvider for AnthropicProvider {
                 // 401 on OAuth: token may have expired mid-request; force a
                 // refresh and retry once. Surface a failed refresh instead of
                 // retrying with the stale token.
-                if oauth && status.as_u16() == 401 && attempt < max_retries {
+                if oauth && status.as_u16() == 401 && !oauth_refreshed {
+                    oauth_refreshed = true;
                     crate::auth::force_refresh_for(crate::auth::ANTHROPIC_NAMESPACE).await?;
                     continue;
                 }
