@@ -193,9 +193,29 @@ pub fn truncate_chars_tail(s: &str, limit: usize) -> String {
     s.chars().skip(total - limit).collect()
 }
 
+/// Render a byte count as a human-readable string, e.g. `humanize_bytes(1536)` → "1.5 KB".
+pub fn humanize_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    format!("{size:.1} {}", UNITS[unit])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn humanize_bytes_basic() {
+        assert_eq!(humanize_bytes(0), "0.0 B");
+        assert_eq!(humanize_bytes(512), "512.0 B");
+        assert_eq!(humanize_bytes(1536), "1.5 KB");
+        assert_eq!(humanize_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
 
     /// Helper: assert every chunk respects the limit.
     fn assert_length_invariant(chunks: &[String], limit: usize) {
