@@ -156,12 +156,24 @@ pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
         "openai" | "codex" => Ok(Box::new(OpenAiProvider::from_auth_store()?)),
         _ => match AnthropicProvider::auto() {
             Ok(p) => Ok(Box::new(p)),
-            Err(_) => match OpenAiProvider::from_auth_store() {
-                Ok(p) => Ok(Box::new(p)),
-                Err(e) => Err(format!(
-                    "No credentials: set ANTHROPIC_API_KEY, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth`. {e}"
-                )),
-            },
+            // F3 — don't let a *present-but-misconfigured* Anthropic credential
+            // silently fall through to Codex. If a credential exists, the failure
+            // is a real config error (e.g. a credential set but no model): fail
+            // loud with it. Only fall through to Codex when no Anthropic
+            // credential exists at all.
+            Err(anthropic_err) => {
+                if AnthropicProvider::credential_present() {
+                    Err(format!(
+                        "Anthropic credential present but unusable: {anthropic_err}"
+                    ))
+                } else {
+                    OpenAiProvider::from_auth_store()
+                        .map(|p| Box::new(p) as Box<dyn LlmProvider>)
+                        .map_err(|codex_err| format!(
+                            "No credentials: set ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, or run `openab-agent auth anthropic-oauth` / `openab-agent auth codex-oauth`. ({codex_err})"
+                        ))
+                }
+            }
         },
     }
 }
@@ -296,6 +308,16 @@ impl AnthropicProvider {
     fn from_oauth_env_with_model(model: &str) -> Result<Self, String> {
         let token = Self::oauth_env_token().ok_or_else(|| "CLAUDE_CODE_OAUTH_TOKEN not set".to_string())?;
         Ok(Self::build(AnthropicAuth::OAuthEnv(token), model.to_string()))
+    }
+
+    /// True when *some* Anthropic credential source exists (API key, env OAuth
+    /// token, or stored tenant). Lets `select_provider` tell a real config error
+    /// ("credential present but `auto()` failed" → fail loud) from "no Anthropic
+    /// credentials" (legitimately fall through to Codex) — review F3.
+    pub fn credential_present() -> bool {
+        Self::api_key_from_env().is_ok()
+            || Self::oauth_env_token().is_some()
+            || crate::auth::load_tokens_for(crate::auth::ANTHROPIC_NAMESPACE).is_ok()
     }
 
     /// Apply the Claude Pro/Max OAuth `Bearer` + Claude Code identity headers.
@@ -1003,6 +1025,29 @@ mod tests {
                 let p = AnthropicProvider::auto().unwrap();
                 assert!(matches!(p.auth, AnthropicAuth::OAuthEnv(_)));
                 assert!(p.is_oauth());
+            },
+        );
+    }
+
+    #[test]
+    fn select_provider_fails_loud_on_misconfigured_anthropic() {
+        // F3: an Anthropic credential is present (API key) but no model is set, so
+        // auto() fails for a config reason. select_provider must surface that
+        // error, not silently fall through to Codex.
+        temp_env::with_vars(
+            [
+                ("ANTHROPIC_API_KEY", Some("sk-ant-test")),
+                ("CLAUDE_CODE_OAUTH_TOKEN", None),
+                ("OPENAB_AGENT_MODEL", None),
+                ("OPENAB_AGENT_PROVIDER", None),
+            ],
+            || {
+                // `Box<dyn LlmProvider>` isn't Debug, so match rather than unwrap_err.
+                let err = match select_provider("") {
+                    Ok(_) => panic!("expected a fail-loud error, got a provider"),
+                    Err(e) => e,
+                };
+                assert!(err.contains("present but unusable"), "got: {err}");
             },
         );
     }
