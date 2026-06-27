@@ -1849,4 +1849,74 @@ mod tests {
             "acquire succeeds once the holder releases"
         );
     }
+
+    #[test]
+    fn with_auth_locked_merges_anthropic_tenant_no_lost_update() {
+        // The §5.4 lost-update guarantee must hold for the `anthropic-oauth`
+        // tenant too: a concurrent codex write must not clobber a just-written
+        // Anthropic token (proves the new tenant rides the same locked funnel).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        let mut anth = make_store(7);
+        anth.provider = ANTHROPIC_NAMESPACE.to_string();
+        with_auth_locked(&path, |m| {
+            m.insert(ANTHROPIC_NAMESPACE.to_string(), AuthEntry::Token(anth));
+        })
+        .unwrap();
+        with_auth_locked(&path, |m| {
+            m.insert("codex".to_string(), AuthEntry::Token(make_store(1)));
+        })
+        .unwrap();
+
+        let map = read_auth_file(&path).unwrap();
+        assert_eq!(map.len(), 2, "second write merged, did not lost-update");
+        assert_eq!(token_of(map.get(ANTHROPIC_NAMESPACE)).expires_at, 7);
+        assert_eq!(token_of(map.get("codex")).expires_at, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lock_tenant_refresh_fails_closed_for_anthropic_and_is_per_tenant() {
+        // §5.4 (b) proven for the `anthropic-oauth` tenant: while one holder keeps
+        // its refresh lock, a second acquire fails closed (`TimedOut`) — single-
+        // flight for the new tenant, not just codex.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        let held = lock_tenant_refresh(&path, ANTHROPIC_NAMESPACE).await;
+        assert!(
+            matches!(held, RefreshLock::Held(_)),
+            "anthropic acquire holds"
+        );
+
+        let contended = lock_tenant_refresh_until(
+            &path,
+            ANTHROPIC_NAMESPACE,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(
+            matches!(contended, RefreshLock::TimedOut),
+            "second anthropic acquire fails closed while held"
+        );
+
+        // Per-tenant isolation: the locks are keyed per tenant, so holding the
+        // Anthropic lock must NOT block codex — a slow Anthropic refresh never
+        // head-of-line-blocks another tenant's refresh (the reason §5.4 uses a
+        // per-tenant lock rather than the global one).
+        let codex = lock_tenant_refresh(&path, "codex").await;
+        assert!(
+            matches!(codex, RefreshLock::Held(_)),
+            "codex acquire is independent of the held anthropic lock"
+        );
+
+        drop(held);
+        drop(codex);
+        let after = lock_tenant_refresh(&path, ANTHROPIC_NAMESPACE).await;
+        assert!(
+            matches!(after, RefreshLock::Held(_)),
+            "anthropic acquire succeeds once released"
+        );
+    }
 }
