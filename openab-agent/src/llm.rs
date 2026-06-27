@@ -97,10 +97,18 @@ impl std::ops::Deref for SharedLlmProvider {
     }
 }
 
+/// Provider prefixes [`ModelRef::parse`] recognizes. A `prefix/rest` model
+/// splits into `(provider, model)` ONLY when `prefix` is one of these. Otherwise
+/// the whole string is the model id — so a HuggingFace-style `org/model` id
+/// (e.g. `meta-llama/Llama-3-8B`) for a custom/OpenAI-compatible endpoint stays
+/// intact instead of mis-parsing `org` as a provider. Extend as vendors land.
+const KNOWN_PROVIDERS: &[&str] = &["anthropic", "anthropic-oauth", "claude", "openai", "codex"];
+
 /// A model reference, optionally provider-qualified. Accepts the canonical
 /// `provider/model_id` form (e.g. `anthropic/claude-sonnet-4-6`) as well as a
-/// bare `model_id` (provider then inferred from credentials). Model IDs never
-/// contain `/`, so the first `/` cleanly separates the two.
+/// bare `model_id` (provider then inferred from credentials). Only a *known*
+/// provider prefix is split off (see [`KNOWN_PROVIDERS`]), so model ids that
+/// themselves contain `/` (HuggingFace `org/model`) are preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRef {
     pub provider: Option<String>,
@@ -110,7 +118,7 @@ pub struct ModelRef {
 impl ModelRef {
     pub fn parse(input: &str) -> Self {
         match input.split_once('/') {
-            Some((p, m)) if !p.is_empty() && !m.is_empty() => ModelRef {
+            Some((p, m)) if KNOWN_PROVIDERS.contains(&p) && !m.is_empty() => ModelRef {
                 provider: Some(p.to_string()),
                 model: m.to_string(),
             },
@@ -886,6 +894,19 @@ mod tests {
         // Degenerate slashes fall back to bare (no empty provider/model).
         assert_eq!(ModelRef::parse("/gpt-5.4").provider, None);
         assert_eq!(ModelRef::parse("openai/").model, "openai/");
+
+        // F4: a HuggingFace-style `org/model` id is NOT a known provider, so the
+        // whole string stays the model id (the `/` is part of the id).
+        let r = ModelRef::parse("meta-llama/Llama-3-8B-Instruct");
+        assert_eq!(r.provider, None);
+        assert_eq!(r.model, "meta-llama/Llama-3-8B-Instruct");
+
+        // Every known provider prefix still splits.
+        for prov in KNOWN_PROVIDERS {
+            let r = ModelRef::parse(&format!("{prov}/some-model"));
+            assert_eq!(r.provider.as_deref(), Some(*prov));
+            assert_eq!(r.model, "some-model");
+        }
     }
 
     #[test]
