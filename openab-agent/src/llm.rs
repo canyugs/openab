@@ -169,7 +169,8 @@ pub fn default_provider() -> Option<SharedLlmProvider> {
         .map(|b| SharedLlmProvider(Arc::from(b)))
 }
 
-/// How an `AnthropicProvider` authenticates to the Messages API.
+/// How an `AnthropicProvider` authenticates to the Messages API
+/// (credential-source precedence per ADR §5.3).
 enum AnthropicAuth {
     /// `ANTHROPIC_API_KEY` → `x-api-key`, plain system prompt.
     ApiKey(String),
@@ -177,6 +178,11 @@ enum AnthropicAuth {
     /// headers/system block. The live token is fetched (and refreshed) per call
     /// from the `anthropic-oauth` tenant in auth.json.
     OAuth,
+    /// Pre-provisioned long-lived subscription OAuth token via
+    /// `CLAUDE_CODE_OAUTH_TOKEN` (ADR §5.3 fleet route). Same `Bearer` + Claude
+    /// Code identity path as `OAuth`, but the token comes from the env, never
+    /// touches `auth.json`, and is never refreshed (ops re-mints it).
+    OAuthEnv(String),
 }
 
 /// Anthropic Claude provider.
@@ -265,22 +271,60 @@ impl AnthropicProvider {
         Ok(Self::build(AnthropicAuth::OAuth, anthropic_model()?))
     }
 
-    /// Prefer an explicit API key, else a stored Claude subscription OAuth token.
-    /// When a key is present its own errors (e.g. missing model) surface rather
-    /// than falling through to an unrelated OAuth-token error.
+    /// Pre-provisioned long-lived subscription OAuth token from
+    /// `CLAUDE_CODE_OAUTH_TOKEN` (ADR §5.3). No `auth.json`, no refresh.
+    fn oauth_env_token() -> Option<String> {
+        std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Build from the `CLAUDE_CODE_OAUTH_TOKEN` env route.
+    pub fn from_oauth_env() -> Result<Self, String> {
+        let token = Self::oauth_env_token().ok_or_else(|| "CLAUDE_CODE_OAUTH_TOKEN not set".to_string())?;
+        Ok(Self::build(AnthropicAuth::OAuthEnv(token), anthropic_model()?))
+    }
+
+    fn from_oauth_env_with_model(model: &str) -> Result<Self, String> {
+        let token = Self::oauth_env_token().ok_or_else(|| "CLAUDE_CODE_OAUTH_TOKEN not set".to_string())?;
+        Ok(Self::build(AnthropicAuth::OAuthEnv(token), model.to_string()))
+    }
+
+    /// Apply the Claude Pro/Max OAuth `Bearer` + Claude Code identity headers.
+    /// Shared by the stored-tenant (`OAuth`) and env-token (`OAuthEnv`) paths.
+    fn oauth_headers(req: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+        req.header("authorization", format!("Bearer {token}"))
+            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+            .header("user-agent", "claude-cli/1.0.0")
+            .header("x-app", "cli")
+            .header("anthropic-dangerous-direct-browser-access", "true")
+    }
+
+    /// Credential-source precedence (ADR §5.3): explicit `ANTHROPIC_API_KEY` →
+    /// pre-provisioned `CLAUDE_CODE_OAUTH_TOKEN` env route → stored interactive
+    /// `anthropic-oauth` tenant. When a source is present its own errors (e.g. a
+    /// missing model) surface rather than falling through to an unrelated
+    /// lower-precedence credential error.
     pub fn auto() -> Result<Self, String> {
-        match Self::api_key_from_env() {
-            Ok(key) => Ok(Self::build(AnthropicAuth::ApiKey(key), anthropic_model()?)),
-            Err(_) => Self::from_oauth_store(),
+        if let Ok(key) = Self::api_key_from_env() {
+            return Ok(Self::build(AnthropicAuth::ApiKey(key), anthropic_model()?));
         }
+        if Self::oauth_env_token().is_some() {
+            return Self::from_oauth_env();
+        }
+        Self::from_oauth_store()
     }
 
     /// `auto()` with an explicit model override. The override replaces
     /// `OPENAB_AGENT_MODEL`, so it does not require that env var to be set.
     pub fn auto_with_model(model: &str) -> Result<Self, String> {
-        Self::api_key_from_env()
-            .map(|key| Self::build(AnthropicAuth::ApiKey(key), model.to_string()))
-            .or_else(|_| Self::from_oauth_store_with_model(model))
+        if let Ok(key) = Self::api_key_from_env() {
+            return Ok(Self::build(AnthropicAuth::ApiKey(key), model.to_string()));
+        }
+        if Self::oauth_env_token().is_some() {
+            return Self::from_oauth_env_with_model(model);
+        }
+        Self::from_oauth_store_with_model(model)
     }
 
     /// `from_oauth_store()` with an explicit model override.
@@ -372,7 +416,10 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn is_oauth(&self) -> bool {
-        matches!(self.auth, AnthropicAuth::OAuth)
+        matches!(
+            self.auth,
+            AnthropicAuth::OAuth | AnthropicAuth::OAuthEnv(_)
+        )
     }
 
     fn chat<'a>(
@@ -384,6 +431,10 @@ impl LlmProvider for AnthropicProvider {
         Box::pin(async move {
             let body = self.build_request_body(system, messages, tools);
             let oauth = self.is_oauth();
+            // Only the stored `anthropic-oauth` tenant can be refreshed on a 401;
+            // the `CLAUDE_CODE_OAUTH_TOKEN` env route has no tenant to refresh
+            // (a 401 there means the pre-provisioned token is bad → surface it).
+            let refreshable = matches!(self.auth, AnthropicAuth::OAuth);
             let max_retries = 3u32;
             let mut oauth_refreshed = false;
 
@@ -396,16 +447,13 @@ impl LlmProvider for AnthropicProvider {
                 req = match &self.auth {
                     AnthropicAuth::ApiKey(key) => req.header("x-api-key", key),
                     AnthropicAuth::OAuth => {
-                        // Claude Pro/Max: Bearer + Claude Code identity headers.
+                        // Claude Pro/Max: live token from the stored tenant.
                         let token =
                             crate::auth::get_valid_token_for(crate::auth::ANTHROPIC_NAMESPACE)
                                 .await?;
-                        req.header("authorization", format!("Bearer {token}"))
-                            .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-                            .header("user-agent", "claude-cli/1.0.0")
-                            .header("x-app", "cli")
-                            .header("anthropic-dangerous-direct-browser-access", "true")
+                        Self::oauth_headers(req, &token)
                     }
+                    AnthropicAuth::OAuthEnv(token) => Self::oauth_headers(req, token),
                 };
 
                 let resp = req
@@ -426,7 +474,7 @@ impl LlmProvider for AnthropicProvider {
                 // 401 on OAuth: token may have expired mid-request; force a
                 // refresh and retry once. Surface a failed refresh instead of
                 // retrying with the stale token.
-                if oauth && status.as_u16() == 401 && !oauth_refreshed {
+                if refreshable && status.as_u16() == 401 && !oauth_refreshed {
                     oauth_refreshed = true;
                     crate::auth::force_refresh_for(crate::auth::ANTHROPIC_NAMESPACE).await?;
                     continue;
@@ -897,9 +945,45 @@ mod tests {
     #[test]
     fn test_is_oauth_reflects_auth_mode() {
         // Guards the ACP model-switch rebuild: an OAuth session must report
-        // OAuth so it isn't silently rebuilt against ANTHROPIC_API_KEY.
+        // OAuth so it isn't silently rebuilt against ANTHROPIC_API_KEY. The env
+        // route is OAuth too — it uses the same Claude Code identity path.
         assert!(test_provider(AnthropicAuth::OAuth).is_oauth());
+        assert!(test_provider(AnthropicAuth::OAuthEnv("oat".to_string())).is_oauth());
         assert!(!test_provider(AnthropicAuth::ApiKey("k".to_string())).is_oauth());
+    }
+
+    #[test]
+    fn auto_prefers_api_key_over_env_token() {
+        // ADR §5.3 precedence: ANTHROPIC_API_KEY wins over CLAUDE_CODE_OAUTH_TOKEN.
+        temp_env::with_vars(
+            [
+                ("ANTHROPIC_API_KEY", Some("sk-ant-test")),
+                ("CLAUDE_CODE_OAUTH_TOKEN", Some("oat-test")),
+                ("OPENAB_AGENT_MODEL", Some("anthropic/claude-sonnet-4-6")),
+            ],
+            || {
+                let p = AnthropicProvider::auto().unwrap();
+                assert!(matches!(p.auth, AnthropicAuth::ApiKey(_)));
+            },
+        );
+    }
+
+    #[test]
+    fn auto_uses_env_token_when_no_api_key() {
+        // No API key → the CLAUDE_CODE_OAUTH_TOKEN env route, not the stored tenant
+        // (this builds without reading auth.json).
+        temp_env::with_vars(
+            [
+                ("ANTHROPIC_API_KEY", None),
+                ("CLAUDE_CODE_OAUTH_TOKEN", Some("oat-test")),
+                ("OPENAB_AGENT_MODEL", Some("anthropic/claude-sonnet-4-6")),
+            ],
+            || {
+                let p = AnthropicProvider::auto().unwrap();
+                assert!(matches!(p.auth, AnthropicAuth::OAuthEnv(_)));
+                assert!(p.is_oauth());
+            },
+        );
     }
 
     #[test]
