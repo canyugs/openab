@@ -33,35 +33,247 @@ const ANTHROPIC_REDIRECT_PORT: u16 = 53692;
 const ANTHROPIC_SCOPE: &str =
     "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
-fn codex_client_id() -> String {
-    std::env::var("OPENAB_AGENT_OAUTH_CLIENT_ID")
-        .unwrap_or_else(|_| "app_EMoamEEZ73f0CkXaXp7hrann".to_string())
+// ── OAuthVendor (auth axis — ADR §5.1) ──────────────────────────────────────
+//
+// A subscription-OAuth provider is one static `OAuthVendor` descriptor; the
+// shared driver below (`build_authorize_url`, `exchange_authorization_code`,
+// `refresh_token`) does PKCE/CSRF/exchange/refresh by reading the descriptor, so
+// adding a vendor is a new descriptor — not a new hand-rolled flow. Token bodies
+// and a few authorize-URL quirks are the only per-vendor variation, expressed as
+// trait methods rather than forked code paths.
+//
+// NOTE (ADR §4.2): the ADR specifies building this driver on the official
+// `oauth2` crate (as `mcp/runtime.rs` already does via `BasicClient` + a custom
+// reqwest http hook). This pass keeps the proven reqwest flows and only
+// parameterises them by descriptor; swapping the engine onto `oauth2::BasicClient`
+// is a follow-up internal change invisible to vendor authors (the descriptor
+// surface is unchanged). The device-code grant (non-standard `device_auth_id`)
+// and Anthropic's JSON token body are why the swap is staged, not done blind.
+
+/// Token-request body encoding. Codex/OpenAI use form-encoding; Anthropic's AS
+/// takes JSON (and rejects a `scope` field on refresh — Pi #2169).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenBodyFormat {
+    Form,
+    Json,
 }
 
-fn anthropic_client_id() -> String {
-    std::env::var("OPENAB_AGENT_ANTHROPIC_CLIENT_ID")
-        .unwrap_or_else(|_| "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string())
+/// OAuth grant a vendor's *primary* login uses. Codex additionally exposes a
+/// device-code subcommand, but its browser login — like Anthropic's — is PKCE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `DeviceCode` lands with the first device-primary vendor (copilot/kiro).
+enum AuthGrant {
+    Pkce,
+    DeviceCode,
 }
 
-fn redirect_uri() -> String {
-    format!("http://localhost:{REDIRECT_PORT}/auth/callback")
+/// Static per-vendor OAuth descriptor (ADR §5.1, auth axis). Signatures mirror
+/// the ADR verbatim so future vendors (gemini/grok/agy) slot in as descriptors.
+/// `Send + Sync` so a boxed vendor can be held across the refresh `await` inside
+/// the `Send` provider futures.
+trait OAuthVendor: Send + Sync {
+    /// `auth.json` tenant key (`codex` / `anthropic-oauth` / …).
+    fn namespace(&self) -> &str;
+    fn client_id(&self) -> String;
+    /// Bundled installed-app secret (gemini/agy); `None` for public PKCE clients.
+    /// ADR §5.1 surface — first consumer is the gemini/agy vendor (encode-at-rest
+    /// per §9 Q2); unused until then.
+    #[allow(dead_code)]
+    fn client_secret(&self) -> Option<String> {
+        None
+    }
+    fn authorize_url(&self) -> &str;
+    fn token_url(&self) -> &str;
+    /// Loopback `(port, path)` for PKCE; `None` for device flow (no redirect endpoint).
+    fn redirect(&self) -> Option<(u16, &'static str)> {
+        None
+    }
+    fn scope(&self) -> &str;
+    /// Extra authorize-URL query params (Codex's simplified-flow hints; Anthropic's `code=true`).
+    fn extra_authorize_params(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+    fn token_body(&self) -> TokenBodyFormat {
+        TokenBodyFormat::Form
+    }
+    /// ADR §5.1 surface — `DeviceCode` lands with the first device-primary vendor
+    /// (copilot/kiro); both current vendors log in via PKCE, so unused until then.
+    #[allow(dead_code)]
+    fn grant(&self) -> AuthGrant {
+        AuthGrant::Pkce
+    }
+    /// Full loopback redirect URI, derived from `redirect()`.
+    fn redirect_uri(&self) -> Option<String> {
+        self.redirect()
+            .map(|(port, path)| format!("http://localhost:{port}{path}"))
+    }
 }
 
-fn anthropic_redirect_uri() -> String {
-    format!("http://localhost:{ANTHROPIC_REDIRECT_PORT}/callback")
+struct CodexVendor;
+impl OAuthVendor for CodexVendor {
+    fn namespace(&self) -> &str {
+        CODEX_NAMESPACE
+    }
+    fn client_id(&self) -> String {
+        std::env::var("OPENAB_AGENT_OAUTH_CLIENT_ID")
+            .unwrap_or_else(|_| "app_EMoamEEZ73f0CkXaXp7hrann".to_string())
+    }
+    fn authorize_url(&self) -> &str {
+        CODEX_AUTHORIZE_URL
+    }
+    fn token_url(&self) -> &str {
+        CODEX_TOKEN_URL
+    }
+    fn redirect(&self) -> Option<(u16, &'static str)> {
+        Some((REDIRECT_PORT, "/auth/callback"))
+    }
+    fn scope(&self) -> &str {
+        "openid profile email offline_access"
+    }
+    fn extra_authorize_params(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("id_token_add_organizations", "true"),
+            ("codex_cli_simplified_flow", "true"),
+            ("originator", "openab-agent"),
+        ]
+    }
 }
 
-/// Build the Anthropic authorize URL. Pure so it can be unit-tested. `state` is
-/// an independent random CSRF value (kept distinct from the PKCE verifier, which
+struct AnthropicVendor;
+impl OAuthVendor for AnthropicVendor {
+    fn namespace(&self) -> &str {
+        ANTHROPIC_NAMESPACE
+    }
+    fn client_id(&self) -> String {
+        std::env::var("OPENAB_AGENT_ANTHROPIC_CLIENT_ID")
+            .unwrap_or_else(|_| "9d1c250a-e61b-44d9-88ed-5944d1962f5e".to_string())
+    }
+    fn authorize_url(&self) -> &str {
+        ANTHROPIC_AUTHORIZE_URL
+    }
+    fn token_url(&self) -> &str {
+        ANTHROPIC_TOKEN_URL
+    }
+    fn redirect(&self) -> Option<(u16, &'static str)> {
+        Some((ANTHROPIC_REDIRECT_PORT, "/callback"))
+    }
+    fn scope(&self) -> &str {
+        ANTHROPIC_SCOPE
+    }
+    fn extra_authorize_params(&self) -> &'static [(&'static str, &'static str)] {
+        &[("code", "true")]
+    }
+    fn token_body(&self) -> TokenBodyFormat {
+        TokenBodyFormat::Json
+    }
+}
+
+/// Resolve a vendor descriptor by `auth.json` namespace. `None` for non-OAuth
+/// tenants (e.g. `mcp:<server>`, whose refresh rmcp owns).
+fn vendor_for(namespace: &str) -> Option<Box<dyn OAuthVendor>> {
+    match namespace {
+        CODEX_NAMESPACE => Some(Box::new(CodexVendor)),
+        ANTHROPIC_NAMESPACE => Some(Box::new(AnthropicVendor)),
+        _ => None,
+    }
+}
+
+/// Build a vendor's PKCE authorize URL. Pure (unit-testable). `state` is an
+/// independent random CSRF value kept distinct from the PKCE verifier (which
 /// stays back-channel-only) — the AS just echoes it back.
-fn anthropic_authorize_url(challenge: &str, state: &str) -> String {
-    let client_id = anthropic_client_id();
-    let redirect = anthropic_redirect_uri();
+fn build_authorize_url(vendor: &dyn OAuthVendor, challenge: &str, state: &str) -> Result<String> {
+    let redirect = vendor.redirect_uri().ok_or_else(|| {
+        anyhow!(
+            "{} has no loopback redirect (not a PKCE vendor)",
+            vendor.namespace()
+        )
+    })?;
     let redir = urlencoding::encode(&redirect);
-    let scope = urlencoding::encode(ANTHROPIC_SCOPE);
-    format!(
-        "{ANTHROPIC_AUTHORIZE_URL}?code=true&client_id={client_id}&response_type=code&redirect_uri={redir}&scope={scope}&code_challenge={challenge}&code_challenge_method=S256&state={state}"
-    )
+    let scope = urlencoding::encode(vendor.scope());
+    let client_id = vendor.client_id();
+    let mut url = format!(
+        "{}?client_id={client_id}&response_type=code&redirect_uri={redir}&scope={scope}&code_challenge={challenge}&code_challenge_method=S256&state={state}",
+        vendor.authorize_url()
+    );
+    for (k, v) in vendor.extra_authorize_params() {
+        url.push('&');
+        url.push_str(k);
+        url.push('=');
+        url.push_str(v);
+    }
+    Ok(url)
+}
+
+/// Exchange an authorization `code` for tokens against `vendor`, encoding the
+/// body per `token_body()`. The JSON path also carries `state` (Anthropic
+/// echoes it); the form path omits it (Codex).
+async fn exchange_authorization_code(
+    vendor: &dyn OAuthVendor,
+    code: &str,
+    state: &str,
+    verifier: &str,
+) -> Result<TokenStore> {
+    let redirect = vendor
+        .redirect_uri()
+        .ok_or_else(|| anyhow!("{} has no loopback redirect", vendor.namespace()))?;
+    let client_id = vendor.client_id();
+    let client = reqwest::Client::new();
+    let req = client.post(vendor.token_url());
+    let resp = match vendor.token_body() {
+        TokenBodyFormat::Json => {
+            req.json(&serde_json::json!({
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "code": code,
+                "state": state,
+                "redirect_uri": redirect,
+                "code_verifier": verifier,
+            }))
+            .send()
+            .await?
+        }
+        TokenBodyFormat::Form => {
+            req.form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", client_id.as_str()),
+                ("code", code),
+                ("code_verifier", verifier),
+                ("redirect_uri", redirect.as_str()),
+            ])
+            .send()
+            .await?
+        }
+    };
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Token exchange failed: {body}"));
+    }
+    let payload: serde_json::Value = resp.json().await?;
+    token_store_from_payload(&payload, vendor.token_url(), vendor.namespace())
+}
+
+/// Build a `TokenStore` from an OAuth token response, requiring `access_token`
+/// and `refresh_token`. Shared by every login + exchange path.
+fn token_store_from_payload(
+    payload: &serde_json::Value,
+    token_endpoint: &str,
+    provider: &str,
+) -> Result<TokenStore> {
+    let access_token = payload["access_token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No access_token"))?;
+    let refresh_token_val = payload["refresh_token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No refresh_token"))?;
+    let expires_in = payload["expires_in"].as_u64().unwrap_or(3600);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    Ok(TokenStore {
+        access_token: access_token.to_string(),
+        refresh_token: refresh_token_val.to_string(),
+        expires_at: now + expires_in,
+        token_endpoint: token_endpoint.to_string(),
+        provider: provider.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -718,34 +930,36 @@ pub async fn force_refresh() -> Result<String> {
 }
 
 async fn refresh_token(store: &TokenStore) -> Result<TokenStore> {
+    let vendor = vendor_for(&store.provider)
+        .ok_or_else(|| anyhow!("No OAuth vendor for provider `{}`", store.provider))?;
+    let client_id = vendor.client_id();
     // Bound the refresh so the per-tenant lock (held across this call) is provably
     // released before another process's lock deadline — see REFRESH_HTTP_TIMEOUT.
     let client = reqwest::Client::builder()
         .timeout(REFRESH_HTTP_TIMEOUT)
         .build()?;
-    // Anthropic's token endpoint takes a JSON body and rejects a `scope` field
-    // on refresh (Pi #2169); Codex takes a form body. Branch on the stored
-    // provider so each tenant refreshes the way its AS expects.
-    let resp = if store.provider == ANTHROPIC_NAMESPACE {
-        client
-            .post(&store.token_endpoint)
-            .json(&serde_json::json!({
+    // Body encoding comes from the vendor descriptor: Anthropic takes JSON (and
+    // rejects a `scope` field on refresh — Pi #2169); Codex takes a form body.
+    let req = client.post(&store.token_endpoint);
+    let resp = match vendor.token_body() {
+        TokenBodyFormat::Json => {
+            req.json(&serde_json::json!({
                 "grant_type": "refresh_token",
                 "refresh_token": store.refresh_token,
-                "client_id": anthropic_client_id(),
+                "client_id": client_id,
             }))
             .send()
             .await?
-    } else {
-        client
-            .post(&store.token_endpoint)
-            .form(&[
+        }
+        TokenBodyFormat::Form => {
+            req.form(&[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", store.refresh_token.as_str()),
-                ("client_id", codex_client_id().as_str()),
+                ("client_id", client_id.as_str()),
             ])
             .send()
             .await?
+        }
     };
     if !resp.status().is_success() {
         let status = resp.status();
@@ -781,27 +995,29 @@ pub fn generate_pkce() -> (String, String) {
     (verifier, challenge)
 }
 
-// Browser PKCE flow
-pub async fn login_browser_flow(no_browser: bool) -> Result<()> {
-    let client_id = codex_client_id();
-    let (code_verifier, code_challenge) = generate_pkce();
-    let mut state_buf = [0u8; 16];
+/// Shared PKCE browser/paste login driver (ADR §5.1). The authorize URL,
+/// loopback redirect, and token-body encoding all come from the `vendor`
+/// descriptor, so every PKCE vendor reuses this one flow. Folds the codex flow
+/// into the `accept_callback_code` / `code_from_redirect` helpers (the
+/// long-standing TODO) and unifies the `127.0.0.1` bind across vendors.
+async fn login_pkce_flow(vendor: &dyn OAuthVendor, no_browser: bool) -> Result<()> {
+    let (port, _path) = vendor
+        .redirect()
+        .ok_or_else(|| anyhow!("{} is not a PKCE vendor", vendor.namespace()))?;
+    let (verifier, challenge) = generate_pkce();
+    // Independent random CSRF state, kept distinct from the PKCE verifier (which
+    // stays back-channel-only). 32 bytes: claude.ai's authorize rejects a short
+    // state ("Invalid request format") — long enough for every vendor.
+    let mut state_buf = [0u8; 32];
     getrandom::fill(&mut state_buf).expect("getrandom failed");
     let state = URL_SAFE_NO_PAD.encode(state_buf);
-    let redir_str = redirect_uri();
-    let redir = urlencoding::encode(&redir_str);
-    let auth_url = format!("{CODEX_AUTHORIZE_URL}?client_id={client_id}&redirect_uri={redir}&response_type=code&scope=openid+profile+email+offline_access&code_challenge={code_challenge}&code_challenge_method=S256&state={state}&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=openab-agent");
+    let auth_url = build_authorize_url(vendor, &challenge, &state)?;
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{REDIRECT_PORT}")).map_err(|e| {
-        anyhow!("Failed to bind port {REDIRECT_PORT}: {e}. Is another instance running?")
-    })?;
-
-    if no_browser {
-        println!("Open this URL in your browser:\n");
-        println!("  {auth_url}\n");
-        println!("After approving, your browser will redirect to a localhost URL.");
-        println!("Copy the full URL from the browser address bar and paste it here:\n");
-
+    let code = if no_browser {
+        println!("Open this URL in your browser:\n\n  {auth_url}\n");
+        println!(
+            "After approving, copy the full redirect URL (or just the `code#state`) and paste it here:\n"
+        );
         let mut input = String::new();
         std::io::stdin()
             .read_line(&mut input)
@@ -810,153 +1026,44 @@ pub async fn login_browser_flow(no_browser: bool) -> Result<()> {
         if input.is_empty() {
             return Err(anyhow!("No URL provided"));
         }
-        let url = url::Url::parse(input).map_err(|_| anyhow!("Invalid URL: {input}"))?;
-
-        // Skip TCP listener for paste flow
-        let code = url
-            .query_pairs()
-            .find(|(k, _)| k == "code")
-            .map(|(_, v)| v.to_string())
-            .ok_or_else(|| {
-                let error = url
-                    .query_pairs()
-                    .find(|(k, _)| k == "error")
-                    .map(|(_, v)| v.to_string());
-                anyhow!(
-                    "No code in URL. Error: {}",
-                    error.unwrap_or_else(|| "unknown".into())
-                )
+        // Accept either a full redirect URL or a bare `code#state`. Require the
+        // `#state` form so CSRF state is always verified — a bare code can't be
+        // checked and is rejected rather than trusted.
+        if let Ok(url) = url::Url::parse(input) {
+            code_from_redirect(&url, &state)?
+        } else {
+            let (code, st) = input.split_once('#').ok_or_else(|| {
+                anyhow!("Paste the full `code#state` value (or the redirect URL) so the state can be verified")
             })?;
-        let cb_state = url
-            .query_pairs()
-            .find(|(k, _)| k == "state")
-            .map(|(_, v)| v.to_string());
-        if cb_state.as_deref() != Some(&state) {
-            return Err(anyhow!("State mismatch"));
+            if st != state {
+                return Err(anyhow!("State mismatch"));
+            }
+            code.to_string()
         }
-
-        // Exchange code for tokens
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(CODEX_TOKEN_URL)
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("client_id", client_id.as_str()),
-                ("code", code.as_str()),
-                ("code_verifier", code_verifier.as_str()),
-                ("redirect_uri", redirect_uri().as_str()),
-            ])
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Token exchange failed: {body}"));
-        }
-        let payload: serde_json::Value = resp.json().await?;
-        let access_token = payload["access_token"]
-            .as_str()
-            .ok_or_else(|| anyhow!("No access_token"))?;
-        let refresh_token_val = payload["refresh_token"]
-            .as_str()
-            .ok_or_else(|| anyhow!("No refresh_token"))?;
-        let expires_in = payload["expires_in"].as_u64().unwrap_or(3600);
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let store = TokenStore {
-            access_token: access_token.to_string(),
-            refresh_token: refresh_token_val.to_string(),
-            expires_at: now + expires_in,
-            token_endpoint: CODEX_TOKEN_URL.to_string(),
-            provider: "codex".to_string(),
-        };
-        save_tokens_for(&store)?;
-        println!(
-            "\n\u{2705} Login successful! Token saved to {:?}",
-            auth_path()
-        );
-        return Ok(());
     } else {
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}")).map_err(|e| {
+            anyhow!("Failed to bind port {port}: {e}. Is another instance running?")
+        })?;
         println!("Opening browser for authentication...\n");
         if open::that(&auth_url).is_err() {
-            println!("Could not open browser. Open this URL manually:\n");
-            println!("  {auth_url}\n");
+            println!("Could not open browser. Open this URL manually:\n\n  {auth_url}\n");
         }
         println!("Waiting for callback...");
-    }
-
-    listener.set_nonblocking(false)?;
-    let (mut stream, _) = listener
-        .accept()
-        .map_err(|e| anyhow!("Failed to accept callback: {e}"))?;
-    let mut reader = std::io::BufReader::new(&stream);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-
-    let path = request_line.split_whitespace().nth(1).unwrap_or("");
-    let url = url::Url::parse(&format!("http://localhost{path}"))
-        .map_err(|_| anyhow!("Invalid callback URL"))?;
-    let code = url
-        .query_pairs()
-        .find(|(k, _)| k == "code")
-        .map(|(_, v)| v.to_string())
-        .ok_or_else(|| {
-            let error = url
-                .query_pairs()
-                .find(|(k, _)| k == "error")
-                .map(|(_, v)| v.to_string());
-            anyhow!(
-                "No code in callback. Error: {}",
-                error.unwrap_or_else(|| "unknown".into())
-            )
-        })?;
-    let cb_state = url
-        .query_pairs()
-        .find(|(k, _)| k == "state")
-        .map(|(_, v)| v.to_string());
-    if cb_state.as_deref() != Some(&state) {
-        return Err(anyhow!("State mismatch in callback"));
-    }
-
-    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body><h1>Authentication successful!</h1><p>You can close this tab.</p></body></html>";
-    let _ = stream.write_all(response.as_bytes());
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(CODEX_TOKEN_URL)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("client_id", client_id.as_str()),
-            ("code", code.as_str()),
-            ("code_verifier", code_verifier.as_str()),
-            ("redirect_uri", redirect_uri().as_str()),
-        ])
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Token exchange failed: {body}"));
-    }
-    let payload: serde_json::Value = resp.json().await?;
-    let access_token = payload["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No access_token"))?;
-    let refresh_token_val = payload["refresh_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No refresh_token"))?;
-    let expires_in = payload["expires_in"].as_u64().unwrap_or(3600);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let store = TokenStore {
-        access_token: access_token.to_string(),
-        refresh_token: refresh_token_val.to_string(),
-        expires_at: now + expires_in,
-        token_endpoint: CODEX_TOKEN_URL.to_string(),
-        provider: "codex".to_string(),
+        accept_callback_code(&listener, &state)?
     };
+
+    let store = exchange_authorization_code(vendor, &code, &state, &verifier).await?;
     save_tokens_for(&store)?;
     println!(
         "\n\u{2705} Login successful! Token saved to {:?}",
         auth_path()
     );
     Ok(())
+}
+
+/// Codex (OpenAI) browser PKCE login.
+pub async fn login_browser_flow(no_browser: bool) -> Result<()> {
+    login_pkce_flow(&CodexVendor, no_browser).await
 }
 
 /// Extract the OAuth `code` from a parsed redirect URL, validating `state`.
@@ -1006,111 +1113,17 @@ fn accept_callback_code(listener: &TcpListener, expected_state: &str) -> Result<
     Ok(code)
 }
 
-/// Anthropic OAuth (Claude Pro/Max). PKCE with an independent random CSRF
-/// `state` (verifier stays back-channel-only) and a JSON token exchange against
-/// `platform.claude.com`.
+/// Anthropic OAuth (Claude Pro/Max) browser PKCE login. JSON token exchange
+/// against `platform.claude.com`; all vendor specifics live in `AnthropicVendor`.
 pub async fn login_anthropic_browser_flow(no_browser: bool) -> Result<()> {
-    let (verifier, challenge) = generate_pkce();
-    // Independent random CSRF state — keep the PKCE verifier back-channel-only.
-    // 32 bytes: claude.ai's authorize rejects a short state ("Invalid request
-    // format"); matching the verifier's length keeps it happy while the value
-    // stays independent (full PKCE strength).
-    let mut state_buf = [0u8; 32];
-    getrandom::fill(&mut state_buf).expect("getrandom failed");
-    let state = URL_SAFE_NO_PAD.encode(state_buf);
-    let auth_url = anthropic_authorize_url(&challenge, &state);
-
-    let code = if no_browser {
-        println!("Open this URL in your browser:\n\n  {auth_url}\n");
-        println!(
-            "After approving, copy the full redirect URL (or just the code) and paste it here:\n"
-        );
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| anyhow!("Failed to read input: {e}"))?;
-        let input = input.trim();
-        if input.is_empty() {
-            return Err(anyhow!("No URL provided"));
-        }
-        // Accept either a full redirect URL or a bare `code#state`. Require the
-        // `#state` form so CSRF state is always verified — a bare code can't be
-        // checked and is rejected rather than trusted.
-        if let Ok(url) = url::Url::parse(input) {
-            code_from_redirect(&url, &state)?
-        } else {
-            let (code, st) = input.split_once('#').ok_or_else(|| {
-                anyhow!("Paste the full `code#state` value (or the redirect URL) so the state can be verified")
-            })?;
-            if st != state {
-                return Err(anyhow!("State mismatch"));
-            }
-            code.to_string()
-        }
-    } else {
-        let listener = TcpListener::bind(format!("127.0.0.1:{ANTHROPIC_REDIRECT_PORT}")).map_err(
-            |e| {
-                anyhow!("Failed to bind port {ANTHROPIC_REDIRECT_PORT}: {e}. Is another instance running?")
-            },
-        )?;
-        println!("Opening browser for authentication...\n");
-        if open::that(&auth_url).is_err() {
-            println!("Could not open browser. Open this URL manually:\n\n  {auth_url}\n");
-        }
-        println!("Waiting for callback...");
-        accept_callback_code(&listener, &state)?
-    };
-
-    let store = exchange_anthropic_code(&code, &state, &verifier).await?;
-    save_tokens_for(&store)?;
-    println!(
-        "\n\u{2705} Login successful! Token saved to {:?}",
-        auth_path()
-    );
-    Ok(())
-}
-
-async fn exchange_anthropic_code(code: &str, state: &str, verifier: &str) -> Result<TokenStore> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(ANTHROPIC_TOKEN_URL)
-        .json(&serde_json::json!({
-            "grant_type": "authorization_code",
-            "client_id": anthropic_client_id(),
-            "code": code,
-            "state": state,
-            "redirect_uri": anthropic_redirect_uri(),
-            "code_verifier": verifier,
-        }))
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("Token exchange failed: {body}"));
-    }
-    let payload: serde_json::Value = resp.json().await?;
-    let access_token = payload["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No access_token"))?;
-    let refresh_token_val = payload["refresh_token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("No refresh_token"))?;
-    let expires_in = payload["expires_in"].as_u64().unwrap_or(3600);
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    Ok(TokenStore {
-        access_token: access_token.to_string(),
-        refresh_token: refresh_token_val.to_string(),
-        expires_at: now + expires_in,
-        token_endpoint: ANTHROPIC_TOKEN_URL.to_string(),
-        provider: ANTHROPIC_NAMESPACE.to_string(),
-    })
+    login_pkce_flow(&AnthropicVendor, no_browser).await
 }
 
 // Device code flow
 pub async fn login_codex_device_flow() -> Result<()> {
     println!("Starting OpenAI Codex device-code login...\n");
     let client = reqwest::Client::new();
-    let client_id = codex_client_id();
+    let client_id = CodexVendor.client_id();
 
     let resp = client
         .post(CODEX_DEVICE_AUTH_URL)
@@ -1175,21 +1188,8 @@ pub async fn login_codex_device_flow() -> Result<()> {
                 return Err(anyhow!("Token exchange failed: {body}"));
             }
             let token_payload: serde_json::Value = token_resp.json().await?;
-            let access_token = token_payload["access_token"]
-                .as_str()
-                .ok_or_else(|| anyhow!("No access_token: {token_payload}"))?;
-            let refresh_token_val = token_payload["refresh_token"]
-                .as_str()
-                .ok_or_else(|| anyhow!("No refresh_token"))?;
-            let expires_in = token_payload["expires_in"].as_u64().unwrap_or(3600);
-            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            let store = TokenStore {
-                access_token: access_token.to_string(),
-                refresh_token: refresh_token_val.to_string(),
-                expires_at: now + expires_in,
-                token_endpoint: CODEX_TOKEN_URL.to_string(),
-                provider: "codex".to_string(),
-            };
+            let store =
+                token_store_from_payload(&token_payload, CODEX_TOKEN_URL, CODEX_NAMESPACE)?;
             save_tokens_for(&store)?;
             println!(
                 "\n\u{2705} Login successful! Token saved to {:?}",
@@ -1281,6 +1281,74 @@ mod tests {
         }
     }
 
+    // ── OAuthVendor wire-format locks (ADR §5.1) ──────────────────────────
+    // The login authorize URL + token-body encoding hit live OAuth servers, so
+    // no integration test covers them. These pure-function assertions pin the
+    // exact wire contract so the descriptor refactor can't silently drift it.
+
+    #[test]
+    fn codex_authorize_url_pins_wire_contract() {
+        let url = build_authorize_url(&CodexVendor, "CH", "ST").unwrap();
+        assert!(url.starts_with(CODEX_AUTHORIZE_URL), "{url}");
+        for needle in [
+            "response_type=code",
+            "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback",
+            "scope=openid%20profile%20email%20offline_access",
+            "code_challenge=CH",
+            "code_challenge_method=S256",
+            "state=ST",
+            // codex simplified-flow hints carried as extra authorize params
+            "id_token_add_organizations=true",
+            "codex_cli_simplified_flow=true",
+            "originator=openab-agent",
+        ] {
+            assert!(url.contains(needle), "missing `{needle}` in {url}");
+        }
+    }
+
+    #[test]
+    fn anthropic_authorize_url_pins_wire_contract() {
+        let url = build_authorize_url(&AnthropicVendor, "CH", "ST").unwrap();
+        assert!(url.starts_with(ANTHROPIC_AUTHORIZE_URL), "{url}");
+        for needle in [
+            "response_type=code",
+            "redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback",
+            "code_challenge=CH",
+            "code_challenge_method=S256",
+            "state=ST",
+            "code=true",                  // Anthropic-only extra authorize param
+            "scope=org%3Acreate_api_key", // scope prefix, colons percent-encoded
+        ] {
+            assert!(url.contains(needle), "missing `{needle}` in {url}");
+        }
+    }
+
+    #[test]
+    fn vendor_for_resolves_oauth_tenants_only() {
+        assert_eq!(vendor_for(CODEX_NAMESPACE).unwrap().namespace(), CODEX_NAMESPACE);
+        assert_eq!(
+            vendor_for(ANTHROPIC_NAMESPACE).unwrap().namespace(),
+            ANTHROPIC_NAMESPACE
+        );
+        // MCP and unknown tenants have no OAuthVendor (rmcp owns MCP refresh).
+        assert!(vendor_for("mcp:linear").is_none());
+        assert!(vendor_for("nope").is_none());
+    }
+
+    #[test]
+    fn token_body_and_redirect_per_vendor() {
+        assert_eq!(CodexVendor.token_body(), TokenBodyFormat::Form);
+        assert_eq!(AnthropicVendor.token_body(), TokenBodyFormat::Json);
+        assert_eq!(
+            CodexVendor.redirect_uri().as_deref(),
+            Some("http://localhost:1455/auth/callback")
+        );
+        assert_eq!(
+            AnthropicVendor.redirect_uri().as_deref(),
+            Some("http://localhost:53692/callback")
+        );
+    }
+
     #[test]
     fn test_is_expired_future_token() {
         let now = SystemTime::now()
@@ -1319,14 +1387,14 @@ mod tests {
     #[test]
     fn test_codex_client_id_default() {
         temp_env::with_var("OPENAB_AGENT_OAUTH_CLIENT_ID", None::<&str>, || {
-            assert_eq!(codex_client_id(), "app_EMoamEEZ73f0CkXaXp7hrann");
+            assert_eq!(CodexVendor.client_id(), "app_EMoamEEZ73f0CkXaXp7hrann");
         });
     }
 
     #[test]
     fn test_codex_client_id_override() {
         temp_env::with_var("OPENAB_AGENT_OAUTH_CLIENT_ID", Some("custom_id"), || {
-            assert_eq!(codex_client_id(), "custom_id");
+            assert_eq!(CodexVendor.client_id(), "custom_id");
         });
     }
 
@@ -1341,7 +1409,7 @@ mod tests {
     #[test]
     fn test_anthropic_authorize_url_carries_required_params() {
         temp_env::with_var("OPENAB_AGENT_ANTHROPIC_CLIENT_ID", None::<&str>, || {
-            let url = anthropic_authorize_url("CHAL", "STATE");
+            let url = build_authorize_url(&AnthropicVendor, "CHAL", "STATE").unwrap();
             assert!(url.starts_with("https://claude.ai/oauth/authorize?"));
             assert!(url.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"));
             assert!(url.contains("response_type=code"));
