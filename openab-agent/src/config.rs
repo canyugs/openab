@@ -91,8 +91,8 @@ mod tests {
     #[test]
     fn unknown_keys_tolerated_for_forward_compat() {
         // `providers` / future keys must not break an older binary.
-        let c = AgentConfig::parse(r#"{"model":"anthropic/x","providers":{"anthropic":{}}}"#)
-            .unwrap();
+        let c =
+            AgentConfig::parse(r#"{"model":"anthropic/x","providers":{"anthropic":{}}}"#).unwrap();
         assert_eq!(c.model.as_deref(), Some("anthropic/x"));
     }
 

@@ -327,13 +327,21 @@ impl AnthropicProvider {
 
     /// Build from the `CLAUDE_CODE_OAUTH_TOKEN` env route.
     pub fn from_oauth_env() -> Result<Self, String> {
-        let token = Self::oauth_env_token().ok_or_else(|| "CLAUDE_CODE_OAUTH_TOKEN not set".to_string())?;
-        Ok(Self::build(AnthropicAuth::OAuthEnv(token), anthropic_model()?))
+        let token =
+            Self::oauth_env_token().ok_or_else(|| "CLAUDE_CODE_OAUTH_TOKEN not set".to_string())?;
+        Ok(Self::build(
+            AnthropicAuth::OAuthEnv(token),
+            anthropic_model()?,
+        ))
     }
 
     fn from_oauth_env_with_model(model: &str) -> Result<Self, String> {
-        let token = Self::oauth_env_token().ok_or_else(|| "CLAUDE_CODE_OAUTH_TOKEN not set".to_string())?;
-        Ok(Self::build(AnthropicAuth::OAuthEnv(token), model.to_string()))
+        let token =
+            Self::oauth_env_token().ok_or_else(|| "CLAUDE_CODE_OAUTH_TOKEN not set".to_string())?;
+        Ok(Self::build(
+            AnthropicAuth::OAuthEnv(token),
+            model.to_string(),
+        ))
     }
 
     /// True when *some* Anthropic credential source exists (API key, env OAuth
@@ -472,10 +480,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn is_oauth(&self) -> bool {
-        matches!(
-            self.auth,
-            AnthropicAuth::OAuth | AnthropicAuth::OAuthEnv(_)
-        )
+        matches!(self.auth, AnthropicAuth::OAuth | AnthropicAuth::OAuthEnv(_))
     }
 
     fn chat<'a>(
@@ -1090,7 +1095,10 @@ mod tests {
         // neither env nor config → fail loud
         temp_env::with_vars(
             [
-                ("OPENAB_CONFIG_PATH", Some(dir.path().join("missing.json").to_str().unwrap())),
+                (
+                    "OPENAB_CONFIG_PATH",
+                    Some(dir.path().join("missing.json").to_str().unwrap()),
+                ),
                 ("OPENAB_AGENT_MODEL", None),
             ],
             || assert!(anthropic_model().is_err()),

@@ -1188,8 +1188,7 @@ pub async fn login_codex_device_flow() -> Result<()> {
                 return Err(anyhow!("Token exchange failed: {body}"));
             }
             let token_payload: serde_json::Value = token_resp.json().await?;
-            let store =
-                token_store_from_payload(&token_payload, CODEX_TOKEN_URL, CODEX_NAMESPACE)?;
+            let store = token_store_from_payload(&token_payload, CODEX_TOKEN_URL, CODEX_NAMESPACE)?;
             save_tokens_for(&store)?;
             println!(
                 "\n\u{2705} Login successful! Token saved to {:?}",
@@ -1325,7 +1324,10 @@ mod tests {
 
     #[test]
     fn vendor_for_resolves_oauth_tenants_only() {
-        assert_eq!(vendor_for(CODEX_NAMESPACE).unwrap().namespace(), CODEX_NAMESPACE);
+        assert_eq!(
+            vendor_for(CODEX_NAMESPACE).unwrap().namespace(),
+            CODEX_NAMESPACE
+        );
         assert_eq!(
             vendor_for(ANTHROPIC_NAMESPACE).unwrap().namespace(),
             ANTHROPIC_NAMESPACE
