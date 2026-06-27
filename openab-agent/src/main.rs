@@ -1,6 +1,7 @@
 mod acp;
 mod agent;
 mod auth;
+mod config;
 mod llm;
 mod mcp;
 mod skills;

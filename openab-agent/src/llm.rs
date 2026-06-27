@@ -130,17 +130,26 @@ impl ModelRef {
     }
 }
 
-/// The provider the user asked for: explicit `OPENAB_AGENT_PROVIDER`, else the
-/// `provider/` prefix of `OPENAB_AGENT_MODEL` (e.g. `openai/gpt-5.4` selects
-/// OpenAI even when an Anthropic key is also present), else empty (auto-detect).
+/// The provider the user asked for. Precedence: explicit `OPENAB_AGENT_PROVIDER`
+/// → `provider/` prefix of `OPENAB_AGENT_MODEL` (e.g. `openai/gpt-5.4` selects
+/// OpenAI even when an Anthropic key is also present) → `provider/` prefix of
+/// `config.json`'s `model` → empty (auto-detect). Env-over-config (ADR §5.5).
 pub fn resolve_provider_choice() -> String {
-    match std::env::var("OPENAB_AGENT_PROVIDER") {
-        Ok(p) if !p.is_empty() => p,
-        _ => std::env::var("OPENAB_AGENT_MODEL")
-            .ok()
-            .and_then(|m| ModelRef::parse(&m).provider)
-            .unwrap_or_default(),
+    if let Ok(p) = std::env::var("OPENAB_AGENT_PROVIDER") {
+        if !p.is_empty() {
+            return p;
+        }
     }
+    if let Some(p) = std::env::var("OPENAB_AGENT_MODEL")
+        .ok()
+        .and_then(|m| ModelRef::parse(&m).provider)
+    {
+        return p;
+    }
+    crate::config::AgentConfig::load_or_default()
+        .model
+        .and_then(|m| ModelRef::parse(&m).provider)
+        .unwrap_or_default()
 }
 
 /// Select an `LlmProvider` from an explicit `choice` (`anthropic` /
@@ -213,20 +222,37 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
 }
 
-/// Resolve the Anthropic model from `OPENAB_AGENT_MODEL`. No hardcoded default:
-/// dateless 4.6+ IDs are fixed canonical IDs (not evergreen pointers), so a
-/// pinned default is a per-generation 404 timebomb. Require an explicit choice
-/// and fail loud instead.
+/// Resolve the Anthropic model. Precedence (ADR §5.3/§5.5): `OPENAB_AGENT_MODEL`
+/// env → `model` in `config.json` → error. No hardcoded default: dateless 4.6+
+/// IDs are fixed canonical IDs (not evergreen pointers), so a pinned default is a
+/// per-generation 404 timebomb. Require an explicit choice and fail loud instead.
 fn anthropic_model() -> Result<String, String> {
-    std::env::var("OPENAB_AGENT_MODEL")
-        .map_err(|_| "no model configured; set OPENAB_AGENT_MODEL or select a model".to_string())
+    if let Ok(m) = std::env::var("OPENAB_AGENT_MODEL") {
+        if !m.is_empty() {
+            return Ok(m);
+        }
+    }
+    if let Some(m) = crate::config::AgentConfig::load_or_default().model {
+        if !m.is_empty() {
+            return Ok(m);
+        }
+    }
+    Err("no model configured; set OPENAB_AGENT_MODEL, add `model` to config.json, or select a model".to_string())
 }
 
+/// Max output tokens: `OPENAB_AGENT_MAX_TOKENS` env → `max_tokens` in
+/// `config.json` → built-in 8192 (env-over-config, ADR §5.5).
 fn anthropic_max_tokens() -> u32 {
-    std::env::var("OPENAB_AGENT_MAX_TOKENS")
+    if let Some(v) = std::env::var("OPENAB_AGENT_MAX_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8192)
+    {
+        return v;
+    }
+    if let Some(v) = crate::config::AgentConfig::load_or_default().max_tokens {
+        return v;
+    }
+    8192
 }
 
 /// openab-agent's built-in tools mapped to Claude Code's canonical casing. The
@@ -1026,6 +1052,48 @@ mod tests {
                 assert!(matches!(p.auth, AnthropicAuth::OAuthEnv(_)));
                 assert!(p.is_oauth());
             },
+        );
+    }
+
+    #[test]
+    fn model_resolves_env_over_config_over_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.json");
+        std::fs::write(&cfg, r#"{"model":"anthropic/from-config"}"#).unwrap();
+        let cfg_path = cfg.to_str().unwrap();
+
+        // env wins over config.json
+        temp_env::with_vars(
+            [
+                ("OPENAB_CONFIG_PATH", Some(cfg_path)),
+                ("OPENAB_AGENT_MODEL", Some("anthropic/from-env")),
+            ],
+            || {
+                assert_eq!(anthropic_model().unwrap(), "anthropic/from-env");
+                assert_eq!(resolve_provider_choice(), "anthropic");
+            },
+        );
+
+        // no env → config.json supplies the model (and its provider prefix)
+        temp_env::with_vars(
+            [
+                ("OPENAB_CONFIG_PATH", Some(cfg_path)),
+                ("OPENAB_AGENT_MODEL", None),
+                ("OPENAB_AGENT_PROVIDER", None),
+            ],
+            || {
+                assert_eq!(anthropic_model().unwrap(), "anthropic/from-config");
+                assert_eq!(resolve_provider_choice(), "anthropic");
+            },
+        );
+
+        // neither env nor config → fail loud
+        temp_env::with_vars(
+            [
+                ("OPENAB_CONFIG_PATH", Some(dir.path().join("missing.json").to_str().unwrap())),
+                ("OPENAB_AGENT_MODEL", None),
+            ],
+            || assert!(anthropic_model().is_err()),
         );
     }
 
