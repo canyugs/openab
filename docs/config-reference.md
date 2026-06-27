@@ -463,6 +463,32 @@ web    = "~/projects/frontend"
 
 ---
 
+## `[ambient]`
+
+Passive channel listening with batch flush. See [ambient.md](ambient.md) for full guide.
+
+```toml
+[ambient]
+enabled = false                   # Master switch
+flush_interval_seconds = 60       # Time trigger (±20% jitter)
+flush_max_messages = 10           # Count trigger
+flush_hard_cap = 50               # Max buffer size
+max_concurrent_flushes = 3        # Global LLM concurrency limit
+flush_timeout_seconds = 120       # Safety timeout per flush
+context_window = 20               # (v2, not yet implemented)
+
+[ambient.pool]                    # (v2, not yet enforced)
+max_sessions = 5
+session_ttl_minutes = 60
+context_flushes = 3
+
+[ambient.discord]
+channels = []                     # Channel ID allowlist — and their threads (required)
+allow_bot_messages = false
+```
+
+---
+
 ## `[cron]`
 
 Everything cron-related lives under `[cron]`.

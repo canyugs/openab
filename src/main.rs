@@ -762,6 +762,19 @@ async fn main() -> anyhow::Result<()> {
             .join("reminders.json");
         let reminder_store = remind::ReminderStore::load(reminder_path);
 
+        // Construct ambient dispatcher if enabled and channels configured.
+        let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty() {
+            info!(
+                channels = ?cfg.ambient.discord.channels,
+                flush_interval = cfg.ambient.flush_interval_seconds,
+                flush_max_messages = cfg.ambient.flush_max_messages,
+                "ambient mode enabled"
+            );
+            Some(Arc::new(openab_core::ambient::AmbientDispatcher::new(cfg.ambient.clone())))
+        } else {
+            None
+        };
+
         let handler = discord::Handler {
             router,
             allow_all_channels,
@@ -784,6 +797,7 @@ async fn main() -> anyhow::Result<()> {
             )),
             allow_dm: discord_cfg.allow_dm,
             dispatcher: discord_dispatcher,
+            ambient: ambient_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         };

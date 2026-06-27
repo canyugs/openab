@@ -148,6 +148,8 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     #[serde(default)]
     pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub ambient: AmbientConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1221,6 +1223,130 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     );
 
     Ok(config)
+}
+
+// ---------------------------------------------------------------------------
+// Ambient Mode configuration
+// ---------------------------------------------------------------------------
+
+/// Top-level `[ambient]` configuration for passive channel listening.
+///
+/// NOTE: ADR #1211 originally specified `[discord.ambient]`. The implementation
+/// uses top-level `[ambient]` with nested `[ambient.discord]` to allow future
+/// multi-platform ambient support without restructuring config.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AmbientConfig {
+    /// Master switch (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Time-based flush trigger in seconds (±20% jitter applied). Default: 60.
+    #[serde(default = "default_flush_interval_seconds")]
+    pub flush_interval_seconds: u64,
+    /// Count-based flush trigger. Default: 10.
+    #[serde(default = "default_flush_max_messages")]
+    pub flush_max_messages: usize,
+    /// Safety cap — force flush at this count even if timer hasn't expired.
+    /// Only relevant when `flush_max_messages` is set very high or disabled. Default: 50.
+    #[serde(default = "default_flush_hard_cap")]
+    pub flush_hard_cap: usize,
+    /// Historical messages fetched via Discord API before the batch. Default: 20.
+    /// NOTE: Not yet implemented (v2 follow-up). Parsed but not used at runtime.
+    #[serde(default = "default_context_window")]
+    pub context_window: usize,
+    /// Max simultaneous LLM calls across all ambient channels. Default: 3.
+    #[serde(default = "default_max_concurrent_flushes")]
+    pub max_concurrent_flushes: usize,
+    /// Safety timeout (seconds) — auto-reset flushing flag if exceeded. Default: 120.
+    #[serde(default = "default_flush_timeout_seconds")]
+    pub flush_timeout_seconds: u64,
+    /// Ambient session pool configuration.
+    #[serde(default)]
+    pub pool: AmbientPoolConfig,
+    /// Platform-specific ambient settings.
+    #[serde(default)]
+    pub discord: AmbientDiscordConfig,
+}
+
+impl Default for AmbientConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            flush_interval_seconds: default_flush_interval_seconds(),
+            flush_max_messages: default_flush_max_messages(),
+            flush_hard_cap: default_flush_hard_cap(),
+            context_window: default_context_window(),
+            max_concurrent_flushes: default_max_concurrent_flushes(),
+            flush_timeout_seconds: default_flush_timeout_seconds(),
+            pool: AmbientPoolConfig::default(),
+            discord: AmbientDiscordConfig::default(),
+        }
+    }
+}
+
+/// `[ambient.pool]` — dedicated session pool for ambient dispatches.
+///
+/// NOTE: Pool management is not yet implemented (v2 follow-up). These settings
+/// are parsed and validated on startup but not enforced at runtime.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AmbientPoolConfig {
+    /// Max concurrent ambient sessions. Default: 5.
+    #[serde(default = "default_ambient_max_sessions")]
+    pub max_sessions: usize,
+    /// Ambient session inactivity timeout in minutes. Default: 60.
+    #[serde(default = "default_ambient_session_ttl_minutes")]
+    pub session_ttl_minutes: u64,
+    /// Rolling window of retained flush history (cross-flush memory). Default: 3.
+    #[serde(default = "default_ambient_context_flushes")]
+    pub context_flushes: usize,
+}
+
+impl Default for AmbientPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: default_ambient_max_sessions(),
+            session_ttl_minutes: default_ambient_session_ttl_minutes(),
+            context_flushes: default_ambient_context_flushes(),
+        }
+    }
+}
+
+/// `[ambient.discord]` — Discord-specific ambient settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AmbientDiscordConfig {
+    /// Explicit channel allowlist. Required — empty means ambient is disabled.
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// Whether other bots' messages enter the ambient buffer. Default: false.
+    #[serde(default)]
+    pub allow_bot_messages: bool,
+}
+
+fn default_flush_interval_seconds() -> u64 {
+    60
+}
+fn default_flush_max_messages() -> usize {
+    10
+}
+fn default_flush_hard_cap() -> usize {
+    50
+}
+fn default_context_window() -> usize {
+    20
+}
+fn default_max_concurrent_flushes() -> usize {
+    3
+}
+fn default_flush_timeout_seconds() -> u64 {
+    120
+}
+fn default_ambient_max_sessions() -> usize {
+    5
+}
+fn default_ambient_session_ttl_minutes() -> u64 {
+    60
+}
+fn default_ambient_context_flushes() -> usize {
+    3
 }
 
 #[cfg(test)]

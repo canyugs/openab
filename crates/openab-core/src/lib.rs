@@ -24,5 +24,7 @@ pub mod timestamp;
 
 #[cfg(feature = "discord")]
 pub mod discord;
+#[cfg(feature = "discord")]
+pub mod ambient;
 #[cfg(feature = "slack")]
 pub mod slack;
