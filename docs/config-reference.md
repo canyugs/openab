@@ -484,7 +484,7 @@ context_flushes = 3
 
 [ambient.discord]
 channels = []                     # Channel ID allowlist — and their threads (required)
-allow_bot_messages = false
+allow_bot_messages = true
 ```
 
 ---

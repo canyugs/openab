@@ -1259,12 +1259,23 @@ pub struct AmbientConfig {
     /// Safety timeout (seconds) — auto-reset flushing flag if exceeded. Default: 120.
     #[serde(default = "default_flush_timeout_seconds")]
     pub flush_timeout_seconds: u64,
+    /// Path to a custom instructions file for the ambient system prompt.
+    /// Default: `~/.openab/config/ambient.md`. If the file exists, its content
+    /// (up to 2000 characters) replaces the built-in system instruction.
+    #[serde(default = "default_instructions_file")]
+    pub instructions_file: String,
     /// Ambient session pool configuration.
     #[serde(default)]
     pub pool: AmbientPoolConfig,
     /// Platform-specific ambient settings.
     #[serde(default)]
     pub discord: AmbientDiscordConfig,
+    /// Debug mode: when true, [NO_REPLY] responses are sent to the channel
+    /// instead of being suppressed, allowing observation of ambient behavior.
+    /// ⚠️ WARNING: This exposes the system prompt and buffered messages to the
+    /// channel. Only use in private/test channels, never in production.
+    #[serde(default)]
+    pub debug: bool,
 }
 
 impl Default for AmbientConfig {
@@ -1277,8 +1288,10 @@ impl Default for AmbientConfig {
             context_window: default_context_window(),
             max_concurrent_flushes: default_max_concurrent_flushes(),
             flush_timeout_seconds: default_flush_timeout_seconds(),
+            instructions_file: default_instructions_file(),
             pool: AmbientPoolConfig::default(),
             discord: AmbientDiscordConfig::default(),
+            debug: false,
         }
     }
 }
@@ -1311,14 +1324,23 @@ impl Default for AmbientPoolConfig {
 }
 
 /// `[ambient.discord]` — Discord-specific ambient settings.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AmbientDiscordConfig {
     /// Explicit channel allowlist. Required — empty means ambient is disabled.
     #[serde(default)]
     pub channels: Vec<String>,
-    /// Whether other bots' messages enter the ambient buffer. Default: false.
-    #[serde(default)]
+    /// Whether other bots' messages enter the ambient buffer. Default: true.
+    #[serde(default = "default_true")]
     pub allow_bot_messages: bool,
+}
+
+impl Default for AmbientDiscordConfig {
+    fn default() -> Self {
+        Self {
+            channels: Vec::new(),
+            allow_bot_messages: true,
+        }
+    }
 }
 
 fn default_flush_interval_seconds() -> u64 {
@@ -1338,6 +1360,9 @@ fn default_max_concurrent_flushes() -> usize {
 }
 fn default_flush_timeout_seconds() -> u64 {
     120
+}
+fn default_instructions_file() -> String {
+    "~/.openab/config/ambient.md".to_string()
 }
 fn default_ambient_max_sessions() -> usize {
     5

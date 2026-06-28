@@ -21,10 +21,31 @@ flush_max_messages = 10           # Count trigger
 flush_hard_cap = 50               # Safety cap on buffer size
 max_concurrent_flushes = 3        # Global LLM concurrency limit
 flush_timeout_seconds = 120       # Safety timeout per flush
+instructions_file = "~/.openab/config/ambient.md"  # Custom system prompt (optional)
+debug = false                     # ⚠️ Only enable in test channels (exposes prompt + messages)
 
 [ambient.discord]
 channels = ["1234567890"]         # Channel IDs to monitor (and their threads)
-allow_bot_messages = false        # Include other bots' messages in buffer
+allow_bot_messages = true         # Include other bots' messages in buffer (default)
+```
+
+### Custom Instructions
+
+The `instructions_file` field points to a Markdown file whose content is used as the ambient system prompt. This works like a user-defined `.cursorrules` or `CLAUDE.md` — you control how the bot behaves in ambient mode by editing one file.
+
+- **Default path:** `~/.openab/config/ambient.md`
+- **Max length:** First 2000 characters are used; content beyond that is truncated.
+- **Fallback:** If the file does not exist, the built-in default instructions are used.
+- **Restart required:** The file is read once at startup. To apply changes, restart the bot.
+
+Example `~/.openab/config/ambient.md`:
+
+```markdown
+You are passively observing a Discord channel.
+
+- Reply EXACTLY `[NO_REPLY]` if you have nothing to add
+- Only speak up for technical corrections or when directly asked
+- Keep replies concise
 ```
 
 ### Configuration fields
@@ -32,13 +53,15 @@ allow_bot_messages = false        # Include other bots' messages in buffer
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Master switch. Must be explicitly enabled. |
+| `debug` | `false` | When true, posts system prompt + transcript to channel on each flush and lets `[NO_REPLY]` responses through (not suppressed). ⚠️ **Only use in private/test channels** — exposes system prompt and buffered messages. |
 | `flush_interval_seconds` | `60` | Seconds between time-based flushes. ±20% jitter prevents thundering herd. Min: 1. |
 | `flush_max_messages` | `10` | Flush when this many messages accumulate. Min: 1. |
 | `flush_hard_cap` | `50` | Maximum buffer size. Messages beyond this are dropped. Min: 1. |
 | `max_concurrent_flushes` | `3` | Max simultaneous LLM calls across all ambient channels. Min: 1. |
 | `flush_timeout_seconds` | `120` | Safety timeout — resets flushing state if exceeded. Clamped to [5, 600]. |
+| `instructions_file` | `~/.openab/config/ambient.md` | Path to custom instructions file. First 2000 chars used as system prompt. Falls back to built-in default if missing. |
 | `channels` | `[]` | Explicit channel allowlist (required). Empty = ambient disabled. |
-| `allow_bot_messages` | `false` | Whether other bots' messages enter the ambient buffer. |
+| `allow_bot_messages` | `true` | Whether other bots' messages enter the ambient buffer. |
 
 > **Threads are observed by default.** Messages in **threads** whose parent is a configured channel are buffered too (most OpenAB conversation happens in auto-created threads, not the parent channel). **Both** bot-owned and non-owned threads are observed — the bot passively follows all thread conversation under an ambient channel. An @mention in any thread discards its buffer and triggers immediate dispatch, so there is no double-reply. Each thread batches independently (keyed by the thread ID).
 
