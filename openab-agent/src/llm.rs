@@ -161,7 +161,7 @@ pub fn resolve_provider_choice() -> String {
 pub fn select_provider(choice: &str) -> Result<Box<dyn LlmProvider>, String> {
     match choice {
         "anthropic" => Ok(Box::new(AnthropicProvider::auto()?)),
-        "anthropic-oauth" | "claude" => Ok(Box::new(AnthropicProvider::from_oauth_store()?)),
+        "anthropic-oauth" | "claude" => Ok(Box::new(AnthropicProvider::from_oauth_auto()?)),
         "openai" | "codex" => Ok(Box::new(OpenAiProvider::from_auth_store()?)),
         _ => match AnthropicProvider::auto() {
             Ok(p) => Ok(Box::new(p)),
@@ -395,6 +395,24 @@ impl AnthropicProvider {
     pub fn from_oauth_store_with_model(model: &str) -> Result<Self, String> {
         Self::ensure_oauth_token()?;
         Ok(Self::build(AnthropicAuth::OAuth, model.to_string()))
+    }
+
+    /// OAuth with env-over-store precedence: `CLAUDE_CODE_OAUTH_TOKEN` → stored
+    /// `anthropic-oauth` tenant. Lets fleet pods that only set the env token work
+    /// without an `auth.json`.
+    pub fn from_oauth_auto() -> Result<Self, String> {
+        if Self::oauth_env_token().is_some() {
+            return Self::from_oauth_env();
+        }
+        Self::from_oauth_store()
+    }
+
+    /// `from_oauth_auto()` with an explicit model override.
+    pub fn from_oauth_auto_with_model(model: &str) -> Result<Self, String> {
+        if Self::oauth_env_token().is_some() {
+            return Self::from_oauth_env_with_model(model);
+        }
+        Self::from_oauth_store_with_model(model)
     }
 
     fn build_request_body(&self, system: &str, messages: &[Message], tools: &[ToolDef]) -> Value {

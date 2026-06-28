@@ -62,7 +62,7 @@ impl AgentConfig {
         match Self::load() {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("ignoring config: {e}");
+                tracing::error!("ignoring config: {e}");
                 Self::default()
             }
         }

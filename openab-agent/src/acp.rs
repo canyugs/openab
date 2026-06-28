@@ -317,8 +317,8 @@ impl AcpServer {
                     let res = match (provider_choice.as_str(), model_override) {
                         ("anthropic", Some(m)) => AnthropicProvider::auto_with_model(m),
                         ("anthropic", None) => AnthropicProvider::auto(),
-                        (_, Some(m)) => AnthropicProvider::from_oauth_store_with_model(m),
-                        (_, None) => AnthropicProvider::from_oauth_store(),
+                        (_, Some(m)) => AnthropicProvider::from_oauth_auto_with_model(m),
+                        (_, None) => AnthropicProvider::from_oauth_auto(),
                     };
                     match res {
                         Ok(p) => (Box::new(p), "anthropic"),
@@ -600,7 +600,7 @@ impl AcpServer {
             let new_provider: Result<Box<dyn crate::llm::LlmProvider>, String> = match provider_name
             {
                 "anthropic" if session_is_oauth => {
-                    AnthropicProvider::from_oauth_store_with_model(value).map(|p| Box::new(p) as _)
+                    AnthropicProvider::from_oauth_auto_with_model(value).map(|p| Box::new(p) as _)
                 }
                 "anthropic" => AnthropicProvider::auto_with_model(value).map(|p| Box::new(p) as _),
                 _ => crate::llm::OpenAiProvider::from_auth_store_with_model(value)
