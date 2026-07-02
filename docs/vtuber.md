@@ -64,6 +64,10 @@ args = ["acp", "--trust-all-tools"]
 Streaming is handled by the VTuber adapter's SSE endpoint; it does not require
 separate streaming settings.
 
+The adapter reuses one warm ACP session for VTuber traffic. Requests are
+serialized; if a turn is already streaming, another request receives `429` with
+`Retry-After: 3`.
+
 ## 3. Point the Skin at OpenAB
 
 In the skin's OpenAI-compatible backend settings:
@@ -107,9 +111,13 @@ before TTS. The adapter passes them through verbatim.
 
 ## Notes & Limitations
 
-- **One session per request.** Each call mints a fresh agent session; the full
-  conversation history must be carried in `messages[]`, which OpenAI clients
-  already do.
+- **One shared warm session.** The adapter reuses a stable VTuber session to
+  avoid per-turn agent cold starts. OpenAI-compatible skins may still send full
+  `messages[]`; the adapter forwards system/developer instructions plus the
+  latest user turn so assistant history is not duplicated inside the persistent
+  ACP session.
+- **One turn at a time.** Concurrent requests return `429` with `Retry-After: 3`
+  instead of queueing behind the active VTuber turn.
 - **No agent output => no chat output.** If the configured ACP agent cannot
   answer, the SSE request eventually closes after the reply timeout.
 - **Tags are not motion.** Mapping `[emotion]` tags to VRM expressions, Live2D

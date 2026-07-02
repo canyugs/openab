@@ -16,7 +16,8 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use subtle::ConstantTimeEq;
+use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -79,6 +80,7 @@ pub type ReplyRegistry = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ReplyCh
 
 const REPLY_FIRST_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_REPLY_TAIL_IDLE: Duration = Duration::from_millis(1500);
+const MAX_IN_FLIGHT_REQUESTS: usize = 32;
 
 fn reply_tail_idle_timeout() -> Duration {
     std::env::var("VTUBER_REPLY_TAIL_IDLE_MS")
@@ -133,6 +135,7 @@ pub struct ChatRequest {
     pub stream: Option<bool>,
 }
 
+#[cfg(test)]
 fn flatten_messages(messages: &[ChatMessage]) -> String {
     let mut out = String::new();
     for m in messages {
@@ -155,11 +158,50 @@ fn flatten_messages(messages: &[ChatMessage]) -> String {
     out
 }
 
+fn persistent_session_prompt(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        if !matches!(m.role.as_str(), "system" | "developer") || m.content.trim().is_empty() {
+            continue;
+        }
+        append_labeled_message(&mut out, m);
+    }
+
+    if let Some(m) = messages.iter().rev().find(|m| {
+        !matches!(m.role.as_str(), "assistant" | "system" | "developer")
+            && !m.content.trim().is_empty()
+    }) {
+        append_labeled_message(&mut out, m);
+    }
+
+    out
+}
+
+fn append_labeled_message(out: &mut String, message: &ChatMessage) {
+    let label = match message.role.as_str() {
+        "system" => "System",
+        "developer" => "Developer",
+        "assistant" => "Assistant",
+        "user" | "" => "User",
+        other => other,
+    };
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(label);
+    out.push_str(": ");
+    out.push_str(&message.content);
+}
+
 fn delta_suffix(full: &str, sent_len: usize) -> (String, usize) {
     match full.get(sent_len..) {
         Some(suffix) => (suffix.to_string(), full.len()),
         None => (full.to_string(), full.len()),
     }
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 pub async fn chat_completions(
@@ -180,7 +222,10 @@ pub async fn chat_completions(
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "));
-        if provided != Some(expected.as_str()) {
+        let ok = provided
+            .map(|provided| constant_time_eq(provided, expected))
+            .unwrap_or(false);
+        if !ok {
             return (StatusCode::UNAUTHORIZED, "invalid api key").into_response();
         }
     }
@@ -193,20 +238,16 @@ pub async fn chat_completions(
             .into_response();
     }
 
-    // Serialise requests — one agent turn at a time
-    let Ok(_guard) = state.vtuber_request_lock.try_lock() else {
-        let mut resp = axum::response::Response::new(
-            "agent is busy, retry in a moment".into(),
-        );
+    // Serialise requests — one agent turn at a time on the shared VTuber session.
+    let Ok(request_guard) = state.vtuber_request_lock.clone().try_lock_owned() else {
+        let mut resp = axum::response::Response::new("agent is busy, retry in a moment".into());
         *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-        resp.headers_mut().insert(
-            axum::http::header::RETRY_AFTER,
-            "3".parse().unwrap(),
-        );
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, "3".parse().unwrap());
         return resp;
     };
 
-    let prompt = flatten_messages(&req.messages);
+    let prompt = persistent_session_prompt(&req.messages);
     if prompt.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -219,14 +260,20 @@ pub async fn chat_completions(
         .clone()
         .unwrap_or_else(|| cfg.default_model.clone());
 
-    // Persistent channel: reuse same session across all vtuber requests
+    // Persistent channel: reuse the same ACP session across VTuber turns.
     let channel_id = VTUBER_PERSISTENT_CHANNEL.to_string();
     let (tx, rx) = mpsc::unbounded_channel::<ReplyChunk>();
-    state
-        .vtuber_pending
-        .lock()
-        .await
-        .insert(channel_id.clone(), tx);
+    {
+        let mut pending = state.vtuber_pending.lock().await;
+        if pending.len() >= MAX_IN_FLIGHT_REQUESTS {
+            let mut resp = axum::response::Response::new("too many in-flight requests".into());
+            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, "3".parse().unwrap());
+            return resp;
+        }
+        pending.insert(channel_id.clone(), tx);
+    }
 
     let event = GatewayEvent::new(
         "vtuber",
@@ -263,6 +310,7 @@ pub async fn chat_completions(
         channel_id,
         state.vtuber_pending.clone(),
         reply_tail_idle_timeout(),
+        Some(request_guard),
     );
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -294,6 +342,7 @@ struct StreamState {
     registry: ReplyRegistry,
     seen_snapshot: bool,
     tail_idle: Duration,
+    _request_guard: Option<OwnedMutexGuard<()>>,
 }
 
 fn reply_stream(
@@ -302,6 +351,7 @@ fn reply_stream(
     channel_id: String,
     registry: ReplyRegistry,
     tail_idle: Duration,
+    request_guard: Option<OwnedMutexGuard<()>>,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     let init = StreamState {
         rx,
@@ -314,6 +364,7 @@ fn reply_stream(
         registry,
         seen_snapshot: false,
         tail_idle,
+        _request_guard: request_guard,
     };
     futures_util::stream::unfold(init, |mut s| async move {
         loop {
@@ -412,9 +463,7 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &ReplyRegistry) {
                 let _ = tx.send(ReplyChunk::Snapshot(full));
             }
             let _ = tx.send(ReplyChunk::Done);
-            if key != VTUBER_PERSISTENT_CHANNEL {
-                map.remove(key);
-            }
+            map.remove(key);
         }
         _ => {}
     }
@@ -432,7 +481,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Helper: spin up a minimal gateway with the VTuber chat route.
     // -----------------------------------------------------------------------
-    async fn start_gateway() -> String {
+    async fn start_gateway_with_state() -> (String, Arc<crate::AppState>) {
         let (event_tx, _) = tokio::sync::broadcast::channel::<String>(256);
         let state = Arc::new(crate::AppState {
             telegram_bot_token: None,
@@ -465,12 +514,17 @@ mod tests {
                 "/v1/chat/completions",
                 axum::routing::post(chat_completions),
             )
-            .with_state(state);
+            .with_state(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
+        (addr, state)
+    }
+
+    async fn start_gateway() -> String {
+        let (addr, _) = start_gateway_with_state().await;
         addr
     }
 
@@ -508,9 +562,141 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn chat_completions_rejects_when_in_flight_cap_is_reached() {
+        let (addr, state) = start_gateway_with_state().await;
+        for i in 0..MAX_IN_FLIGHT_REQUESTS {
+            let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
+            state
+                .vtuber_pending
+                .lock()
+                .await
+                .insert(format!("existing_{i}"), tx);
+        }
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("test-key")
+            .json(&serde_json::json!({
+                "model": "openab",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("3")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_serializes_for_stream_lifetime() {
+        let addr = start_gateway().await;
+        let url = format!("http://{}/v1/chat/completions", addr);
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "model": "openab",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        let first = client
+            .post(&url)
+            .bearer_auth("test-key")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = client
+            .post(&url)
+            .bearer_auth("test-key")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            second
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("3")
+        );
+
+        drop(first);
+    }
+
     // -----------------------------------------------------------------------
     // Unit tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn auth_key_comparison_matches_only_exact_value() {
+        assert!(constant_time_eq("test-key", "test-key"));
+        assert!(!constant_time_eq("test-key", "test-kez"));
+        assert!(!constant_time_eq("test", "test-key"));
+    }
+
+    #[test]
+    fn flatten_labels_roles_and_skips_empty() {
+        let msgs = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "be concise".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "   ".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "hello".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+        ];
+        assert_eq!(
+            flatten_messages(&msgs),
+            "System: be concise\n\nAssistant: hello\n\nUser: hi"
+        );
+    }
+
+    #[test]
+    fn persistent_session_prompt_uses_system_and_latest_user_only() {
+        let msgs = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "be 小光".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "hello".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "what now?".into(),
+            },
+        ];
+
+        assert_eq!(
+            persistent_session_prompt(&msgs),
+            "System: be 小光\n\nUser: what now?"
+        );
+    }
 
     #[tokio::test]
     async fn reply_stream_finishes_after_snapshot_idle() {
@@ -524,6 +710,7 @@ mod tests {
             "ch_idle".into(),
             registry.clone(),
             Duration::from_millis(10),
+            None,
         ));
 
         assert!(

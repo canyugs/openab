@@ -48,7 +48,7 @@ pub struct AppState {
     /// keyed by the per-request `channel.id`. See `adapters::vtuber`.
     #[cfg(feature = "vtuber")]
     pub vtuber_pending: adapters::vtuber::ReplyRegistry,
-    /// Serialises /v1/chat/completions requests.
+    /// Serialises /v1/chat/completions requests on the shared VTuber session.
     #[cfg(feature = "vtuber")]
     pub vtuber_request_lock: Arc<tokio::sync::Mutex<()>>,
     pub ws_token: Option<String>,
