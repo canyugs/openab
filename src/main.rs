@@ -289,7 +289,10 @@ async fn main() -> anyhow::Result<()> {
         };
         let allow_all_channels = env_bool("GATEWAY_ALLOW_ALL_CHANNELS", true);
         let allowed_channels = env_set("GATEWAY_ALLOWED_CHANNELS");
-        let allow_all_users = env_bool("GATEWAY_ALLOW_ALL_USERS", true);
+        // L3 identity: trust-none by default (Phase 3). Was `true` in #1267
+        // (behavior-preserving); now defaults deny-all — set GATEWAY_ALLOW_ALL_USERS=true
+        // or list GATEWAY_ALLOWED_USERS to admit senders. L2 (channels) stays open.
+        let allow_all_users = env_bool("GATEWAY_ALLOW_ALL_USERS", false);
         let allowed_users = env_set("GATEWAY_ALLOWED_USERS");
         let mut reg = PlatformTrustConfigs::new();
         for platform in ["telegram", "line", "feishu", "wecom", "googlechat", "teams"] {
