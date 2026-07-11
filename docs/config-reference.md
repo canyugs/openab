@@ -472,6 +472,7 @@ experimental Discord Voice Channel subsystem. Uses an OpenAI-compatible
 | `api_key` | string | `""` | API key for the STT service. When empty and `base_url` contains `groq.com`, the `GROQ_API_KEY` environment variable is used automatically. For local servers, use `api_key = "not-needed"`. |
 | `model` | string | `"whisper-large-v3-turbo"` | Model name to use for transcription. |
 | `base_url` | string | `"https://api.groq.com/openai/v1"` | Base URL of the STT API. Any OpenAI-compatible `/audio/transcriptions` endpoint works. |
+| `language` | string \| omit | omitted | Optional ISO-639-1 input-language hint such as `"zh"` or `"en"`. Omitted preserves provider auto-detection. A correct hint can improve accuracy and latency for short segments. |
 | `echo_transcript` | bool | `false` | For voice-message attachments, post a `> 🎤 <transcript>` message to the thread before the agent reply so users can verify what was heard. Failures show `(transcription failed)` and add a ⚠️ reaction to the original message. Voice Channel transcript visibility is controlled by `/voice status`, ephemeral `/voice transcript`, and explicit `/voice summary`, not this field. |
 
 ---

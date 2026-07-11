@@ -1,6 +1,6 @@
 # ADR: Discord Voice Channel Receive and Transcription
 
-- **Status:** Proposed — receive pipeline implemented, live validation pending
+- **Status:** Proposed — one-speaker live receive passed; accuracy and soak validation pending
 - **Date:** 2026-07-12
 - **Implementation branch:** `feat/discord-voice-receive`
 - **Related:** [Discord guide](../discord.md), [STT guide](../stt.md), [Discord Voice Channel guide](../discord-voice.md)
@@ -20,9 +20,11 @@ This table records implementation state separately from runtime validation. Upda
 | `VoiceTick`/`SpeakingStateUpdate` capture | **Implemented on branch** | SSRCs map to Discord users; per-user 48 kHz stereo buffers segment decoded PCM in the callback using audio-sample silence and duration bounds. |
 | Bounded STT and transcript pipeline | **Implemented on branch** | Only completed segments enter a bounded queue. Workers encode WAV in memory, call `stt::transcribe`, and append to a bounded transcript; no audio files are written. |
 | ACP summary dispatch | **Implemented with an unresolved security limitation** | Only explicit `/voice summary` uses the pinned control channel's normal, tool-capable ACP path. Transcript-as-data behavior is prompt-enforced, not sandbox-enforced. |
-| Automated verification | **Partial pass** | The default Clippy check and targeted Discord check pass; 39 voice/config/runtime tests pass. Workspace tests reach 687 passes but one pre-existing macOS `/bin/false` assertion fails. The unified Linux/arm64 image builds with bundled Opus and has no missing dynamic library. Repository-wide fmt and Windows verification remain pending. |
+| Automated verification | **Partial pass** | Default and unified Clippy pass; 39 voice/config/runtime tests pass. Discord-only ring and unified AWS-LC tests both call the original Rustls builder panic point successfully. Workspace tests reach 687 passes but one pre-existing macOS `/bin/false` assertion fails. Repository-wide fmt and Windows verification remain pending. |
 | Local Kubernetes artifact/runtime smoke | **Passed** | Image `sha256:661d58c5934332ccb4222b7b18e4063cb0d8f9949aec110938bf1928bb1250b9` reached `1/1 Running` with zero restarts in `docker-desktop/openab-local` as Helm release `openab-voice-smoke`. The smoke ran without Discord/STT credentials and is not Voice receive evidence. |
-| Real Discord receive with DAVE enabled | **Pending real-world validation** | No successful live Discord validation is claimed by this document. |
+| Local Discord/Groq/Claude readiness | **Passed** | The live `openab-voice` release connects the bot, registers global commands, verifies the configured Groq model, persists Claude OAuth, and completes a Discord-to-Claude ACP turn. |
+| Real Discord receive | **Passed for one speaker** | The first Songbird join exposed a Rustls 0.23 provider ambiguity in unified builds. Commit `7b8f90f` explicitly selects AWS-LC when AgentCore features are present and ring for Discord-only builds. After that fix, join, decoded receive, attribution, timestamps, and raw transcript download passed. The rollout ended the session; explicit stop and DAVE remain separate checks. |
+| STT accuracy sample | **Failed; controlled retry pending** | The first four-segment raw transcript preserved one-speaker attribution and timing, but contained an ellipsis-only segment, an incorrect-language hallucination, and unreliable Chinese text. Image `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88` is deployed with `whisper-large-v3` plus `language = "zh"` for the next A/B sample. |
 | Two-speaker and reconnect soak test | **Pending real-world validation** | Attribution, reconnect health beyond a unit state transition, and a 30-minute minimum soak remain unverified. |
 | Production readiness | **Not established** | Requires the acceptance checks in section 12. |
 

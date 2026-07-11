@@ -88,10 +88,18 @@ pub async fn transcribe(
         .mime_str(mime_type)
         .ok()?;
 
-    let form = multipart::Form::new()
+    let mut form = multipart::Form::new()
         .part("file", file_part)
         .text("model", cfg.model.clone())
         .text("response_format", "json");
+    if let Some(language) = cfg
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
+    {
+        form = form.text("language", language.to_string());
+    }
 
     let resp = match client
         .post(&url)

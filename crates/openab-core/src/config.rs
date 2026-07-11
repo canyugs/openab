@@ -393,6 +393,10 @@ pub struct SttConfig {
     pub model: String,
     #[serde(default = "default_stt_base_url")]
     pub base_url: String,
+    /// Optional ISO-639-1 language hint (for example, `"zh"`). When omitted,
+    /// the provider auto-detects the input language for backward compatibility.
+    #[serde(default)]
+    pub language: Option<String>,
     /// Echo the transcribed text back to the thread (no mentions) before
     /// dispatching the prompt to the agent. Lets users verify STT accuracy.
     #[serde(default = "default_echo_transcript")]
@@ -406,6 +410,7 @@ impl Default for SttConfig {
             api_key: String::new(),
             model: default_stt_model(),
             base_url: default_stt_base_url(),
+            language: None,
             echo_transcript: default_echo_transcript(),
         }
     }
@@ -2308,6 +2313,22 @@ command = "echo"
             !cfg.echo_transcript,
             "echo_transcript should default to false"
         );
+        assert!(cfg.language.is_none());
+    }
+
+    #[test]
+    fn stt_language_hint_is_optional_and_parsed() {
+        let toml = r#"
+[agent]
+command = "echo"
+
+[stt]
+enabled = true
+api_key = "test"
+language = "zh"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.stt.language.as_deref(), Some("zh"));
     }
 
     #[test]

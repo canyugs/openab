@@ -4,9 +4,14 @@
 > `feat/discord-voice-receive` can register and run the `/voice` lifecycle, join
 > through Songbird 0.6, segment per-user decoded PCM, transcribe it, and explicitly
 > send a retained transcript to ACP for summary. Real Discord/DAVE, two-speaker,
-> reconnect, and long-running validation have not passed yet. The unified Linux
-> image and a Docker Desktop Kubernetes runtime smoke have passed for artifact
-> `sha256:661d58c5934332ccb4222b7b18e4063cb0d8f9949aec110938bf1928bb1250b9`.
+> DAVE-specific behavior, two-speaker attribution, reconnect, and long-running
+> validation have not passed yet. A live local deployment
+> now connects Discord, receives and attributes decoded audio, transcribes with Groq,
+> and runs an authenticated Claude ACP backend. The first raw transcript proved the
+> receive pipeline but failed the accuracy bar: four attributed segments included an
+> ellipsis-only result and an incorrect language detection. Artifact
+> `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88`
+> is deployed for a controlled retry with `whisper-large-v3` and `language = "zh"`.
 > The summary uses the normal tool-capable ACP path with only a prompt-level
 > injection guard. This is an experimental test build, not production
 > meeting-recording support.
@@ -45,15 +50,17 @@ path is not proof that Discord is delivering complete, correctly attributed audi
 | STT pipeline | **Implemented on branch.** A bounded queue feeds workers that encode WAV in memory and call the existing STT client. No temporary audio files are written. Queue loss and STT failures are counted. |
 | Transcript | **Implemented on branch.** Text is retained in bounded process memory with user ID and timing metadata; evictions and rejected entries are counted. |
 | ACP summary | **Implemented with a security limitation.** Only explicit `/voice summary` submits the transcript. It uses the normal tool-capable ACP path; instructions in the prompt say the transcript is untrusted, but tools are not technically disabled. |
-| Automated branch verification | **Partial pass.** Default Clippy and the targeted Discord check pass; 39 voice/config/runtime tests pass. Workspace tests reach 687 passes with one pre-existing macOS `/bin/false` failure. The unified `agentcore` Linux/arm64 image builds with bundled Opus and has no missing dynamic library. Repository-wide fmt, Windows, and live Discord validation remain pending. |
-| Local Kubernetes runtime smoke | **Passed for image/runtime only.** The exact image above is `1/1 Running` with zero restarts in Docker Desktop Kubernetes. This smoke intentionally runs without Discord or STT credentials, so it does not validate Voice Channel receive. |
-| Live Discord/DAVE evidence | **Not verified.** No successful real call is claimed yet. |
+| Automated branch verification | **Partial pass.** Default and unified Clippy pass; 39 voice/config/runtime tests pass. Both Discord-only ring and unified AWS-LC regression tests call the original Rustls panic point successfully. Workspace tests reach 687 passes with one pre-existing macOS `/bin/false` failure. Repository-wide fmt, Windows, and complete live Discord validation remain pending. |
+| Local Kubernetes runtime smoke | **Passed and retired.** The original credential-free image reached `1/1 Running` with zero restarts. Its temporary Helm release was removed after the live deployment replaced it. |
+| Discord, Groq, and Claude readiness | **Passed locally.** The bot connects, global commands register, Groq accepts the configured STT model, Claude OAuth persists on PVC, and a Discord-to-Claude ACP turn completes without an authentication error. |
+| Live Discord receive evidence | **Passed for one speaker.** After commit `7b8f90f` fixed the unified Rustls provider ambiguity, `/voice join`, decoded receive, speaker attribution, timestamping, and transcript download worked in a real Voice Channel. The subsequent rollout ended the session; explicit `/voice stop` and DAVE behavior remain separate checks. |
+| First STT accuracy sample | **Failed the reliability bar.** Four segments retained the correct single-speaker identity and plausible timestamps, but one result was only `...` and another hallucinated a different language. The two Chinese results were also not reliable enough to treat as a meeting record. A controlled model/language A/B retry is pending. |
 | Attribution, reconnect, and soak evidence | **Not verified.** Two-speaker attribution, reconnect health beyond a unit state transition, and a 30-minute soak remain required. |
 
 The implementation is intentionally receive-only. It does not play ACP responses or
 other audio into the Voice Channel.
 
-## Local Kubernetes Smoke Record
+## Local Kubernetes Smoke and Live Test Record
 
 The purpose of this smoke is to prove that the branch's unified Linux image can be
 pulled from the local registry, mounted with Helm configuration, and kept running
@@ -78,11 +85,34 @@ unreachable loopback Custom Gateway. Repeated `connection refused` gateway logs 
 expected and keep the process alive for runtime inspection. Discord and Voice
 Channel capture are disabled in this smoke configuration.
 
-The local cluster did not contain a Discord bot token or STT API key when this state
-was recorded. A real Voice Channel test therefore remains blocked until those two
-credentials are injected as Kubernetes Secrets and a private Discord server's text,
-voice, and operator user IDs are added to the opt-in configuration. Secrets must not
-be committed to this repository or placed in `[agent].env`.
+That temporary smoke release was uninstalled after the following live test release
+became healthy:
+
+| Item | Current local test state on 2026-07-12 |
+|---|---|
+| Kubernetes context / namespace | `docker-desktop` / `openab-local` |
+| Helm release / deployment | `openab-voice` revision 6 / `openab-voice-voice` |
+| Runtime | `1/1 Running`, zero restarts at verification time |
+| Image ID | `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88` |
+| Rustls provider | Explicit `aws-lc-rs`; startup log confirms installation before Discord/Songbird TLS |
+| ACP backend | `claude-agent-acp`; Claude OAuth authenticated and retained on a 1 GiB PVC |
+| STT provider | Groq with `whisper-large-v3` and the optional ISO-639-1 hint `zh` |
+| Authorization | Explicit control-channel allowlist and one human operator; identifiers are intentionally omitted here |
+| Voice evidence | One-speaker join, decoded receive, attribution, timestamps, and raw transcript download passed; first-pass transcription accuracy failed; explicit stop remains to be observed |
+
+The original runtime smoke did not contain a Discord bot token or STT API key. The
+live release now receives those values from a Kubernetes Secret through the broker
+process. They are not committed to the repository, placed in Helm values, or exposed
+through `[agent].env`; the ACP child receives only the normal baseline environment
+plus the non-secret Claude executable path.
+
+Claude Code 2.1.179 currently uses an OAuth flow that asks the caller to paste an
+authorization code back into stdin. OpenAB's Discord `/auth` relay can show the URL
+but cannot feed a later Discord message into that stdin, so this specific flow gets
+stuck behind the single-flight guard. The local test authenticated with a one-time
+`kubectl exec ... env -i ... claude auth login` process instead, ensuring the Claude
+login subprocess did not inherit Discord or STT credentials. Do not use Discord
+`/auth` for this Claude version until the handler supports its paste-code flow.
 
 ## Voice Messages vs. Voice Channels
 
@@ -140,6 +170,7 @@ enabled = true
 api_key = "${GROQ_API_KEY}"
 model = "whisper-large-v3-turbo"
 base_url = "https://api.groq.com/openai/v1"
+language = "zh" # optional; use only when the meeting language is known
 ```
 
 Use the full experimental settings in a private test environment:
