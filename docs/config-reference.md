@@ -86,6 +86,30 @@ Discord adapter. Requires a Discord bot token.
 | `max_buffered_messages` | u32 | `10` | Per-thread/lane mpsc channel capacity. Only applies to `per-thread` / `per-lane` modes. |
 | `max_batch_tokens` | u32 | `24000` | Soft token cap per ACP turn. Only applies to `per-thread` / `per-lane` modes. |
 
+### `[discord.voice]` (experimental)
+
+Opt-in live Discord Voice Channel receive and transcription. This is separate from
+Discord voice-message attachments. It requires `[stt].enabled = true`; when
+`enabled` is omitted or `false`, OpenAB does not request the Voice States intent,
+register `/voice`, join a Voice Channel, or start receive tasks.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable the experimental Discord Voice Channel subsystem. |
+| `allowed_channels` | string[] | `[]` | Voice Channel ID allowlist. Empty permits any Voice Channel that the bot can access. This is separate from `[discord].allowed_channels`, which gates the text channel/thread used to control the session. |
+| `silence_ms` | u64 | `2000` | Per-speaker silence required to close an audio segment. |
+| `max_segment_seconds` | u64 | `30` | Maximum per-speaker audio segment duration before a forced boundary. At 48 kHz stereo PCM this caps one queued segment at about 5.8 MB. |
+| `max_session_minutes` | u64 | `120` | Maximum session duration. At timeout OpenAB leaves and logs expiration; it does not post a timeout notice or automatically request a summary. |
+| `max_pending_segments` | usize | `8` | Capacity of the completed-segment STT queue. New segments are dropped and counted when the queue is full. Capture is also capped at 25 mapped speakers, and each STT request times out after 120 seconds. |
+| `max_transcript_bytes` | usize | `80000` | Maximum retained UTF-8 transcript text. Old entries may be evicted; oversized/rejected entries are counted in `/voice status`. |
+
+`[discord].allowed_users` authorizes **operators**, not speakers. Once the bot joins,
+all audible participants that Discord maps to a user may be captured. Obtain the
+required consent before `/voice join`. Raw WAV payloads are created in memory and
+sent to the configured STT endpoint; OpenAB does not write temporary audio files.
+See the [Discord Voice Channel guide](discord-voice.md) for lifecycle, limitations,
+and the current validation status.
+
 ---
 
 ## `[slack]`
@@ -438,15 +462,17 @@ Keys can be unicode emoji or Discord/GitHub shortcodes (e.g. `:thumbsup:`). Shor
 
 ## `[stt]`
 
-Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/audio/transcriptions` endpoint.
+Speech-to-text transcription for Discord/Slack voice-message attachments and the
+experimental Discord Voice Channel subsystem. Uses an OpenAI-compatible
+`/audio/transcriptions` endpoint.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable voice message transcription. |
+| `enabled` | bool | `false` | Enable STT for supported audio inputs. Required when `[discord.voice].enabled = true`. |
 | `api_key` | string | `""` | API key for the STT service. When empty and `base_url` contains `groq.com`, the `GROQ_API_KEY` environment variable is used automatically. For local servers, use `api_key = "not-needed"`. |
 | `model` | string | `"whisper-large-v3-turbo"` | Model name to use for transcription. |
 | `base_url` | string | `"https://api.groq.com/openai/v1"` | Base URL of the STT API. Any OpenAI-compatible `/audio/transcriptions` endpoint works. |
-| `echo_transcript` | bool | `false` | When set to `true` and STT runs, post a `> 🎤 <transcript>` message to the thread before the agent reply so users can verify what was heard. Failures show `(transcription failed)` and add a ⚠️ reaction to the original message. |
+| `echo_transcript` | bool | `false` | For voice-message attachments, post a `> 🎤 <transcript>` message to the thread before the agent reply so users can verify what was heard. Failures show `(transcription failed)` and add a ⚠️ reaction to the original message. Voice Channel transcript visibility is controlled by `/voice status`, ephemeral `/voice transcript`, and explicit `/voice summary`, not this field. |
 
 ---
 
@@ -678,62 +704,44 @@ disable_on_success_working_dir = "/workspace/my-project"
 
 ## Customizing via Helm
 
-When deploying with the Helm chart (`charts/openab`), the `config.toml` is generated from `values.yaml`. Each agent is defined under the `agents` map:
+Chart v0.10 and later do not map legacy `agents.<name>.discord.*`, `stt.*`, or
+other adapter-shaped values into TOML. Supply the complete OpenAB configuration
+through `agents.<name>.configToml`, or point `agents.<name>.configUrl` at a remote
+configuration file.
+
+For a standalone file, `--set-file` preserves the TOML verbatim:
+
+```bash
+helm upgrade --install mybot charts/openab \
+  --set-file agents.kiro.configToml=./config.toml
+```
+
+The equivalent inline values shape is:
 
 ```yaml
 agents:
   kiro:
-    command: kiro-cli
-    args: ["acp", "--trust-all-tools"]
-    discord:
-      enabled: true
-      allowedChannels: ["1234567890"]
-      allowBotMessages: "mentions"
-      trustedBotIds: ["9876543210"]
-    pool:
-      maxSessions: 10
-      sessionTtlHours: 24
-    reactions:
-      enabled: true
-    stt:
-      enabled: true
-      apiKey: "your-groq-key"
+    configToml: |
+      [discord]
+      bot_token = "${DISCORD_BOT_TOKEN}"
+      allowed_channels = ["1234567890"]
+      allowed_users = ["9876543210"]
+
+      [discord.voice]
+      enabled = false
+
+      [stt]
+      enabled = true
+      api_key = "${STT_API_KEY}"
+      model = "whisper-large-v3-turbo"
 ```
 
-Key mapping (`values.yaml` → `config.toml`):
-
-| Helm value | Config key |
-|---|---|
-| `agents.<name>.discord.allowedChannels` | `[discord] allowed_channels` |
-| `agents.<name>.discord.allowBotMessages` | `[discord] allow_bot_messages` |
-| `agents.<name>.discord.trustedBotIds` | `[discord] trusted_bot_ids` |
-| `agents.<name>.discord.allowUserMessages` | `[discord] allow_user_messages` |
-| `agents.<name>.discord.messageProcessingMode` | `[discord] message_processing_mode` |
-| `agents.<name>.discord.maxBufferedMessages` | `[discord] max_buffered_messages` |
-| `agents.<name>.discord.maxBatchTokens` | `[discord] max_batch_tokens` |
-| `agents.<name>.slack.*` | `[slack] *` (same pattern) |
-| `agents.<name>.pool.maxSessions` | `[pool] max_sessions` |
-| `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
-| `agents.<name>.workspace.aliases.<alias>` | `[workspace.aliases] <alias>` |
-| `agents.<name>.reactions.enabled` | `[reactions] enabled` |
-| `agents.<name>.reactions.toolDisplay` | `[reactions] tool_display` |
-| `agents.<name>.stt.apiKey` | `[stt] api_key` |
-| `agents.<name>.cronjobs[].enabled` | `[[cron.jobs]] enabled` |
-| `agents.<name>.cronjobs[].schedule` | `[[cron.jobs]] schedule` |
-| `agents.<name>.cronjobs[].channel` | `[[cron.jobs]] channel` |
-| `agents.<name>.cronjobs[].message` | `[[cron.jobs]] message` |
-| `agents.<name>.cronjobs[].platform` | `[[cron.jobs]] platform` |
-| `agents.<name>.cronjobs[].senderName` | `[[cron.jobs]] sender_name` |
-| `agents.<name>.cronjobs[].timezone` | `[[cron.jobs]] timezone` |
-| `agents.<name>.cronjobs[].threadId` | `[[cron.jobs]] thread_id` |
-
-> ⚠️ Use `--set-string` (not `--set`) for Discord/Slack IDs to avoid float64 precision loss:
-> ```bash
-> helm upgrade --install mybot charts/openab \
->   --set-string agents.kiro.discord.allowedChannels[0]="1234567890"
-> ```
-
-See `charts/openab/values.yaml` for the full list of Helm values including `persistence`, `image`, `resources`, and multi-agent examples.
+Inject secrets as environment variables (for example with `secretEnv`) and keep
+`${...}` references in TOML. `configToml` is mounted verbatim and is not validated
+or field-mapped by Helm. With `configUrl`, OpenAB starts with `-c <URL>` and does
+not mount the configuration ConfigMap. See [Migrating to configToml](migrate-to-configtoml.md)
+and `charts/openab/values.yaml` for deployment-level settings such as persistence,
+images, resources, and secret injection.
 
 ---
 

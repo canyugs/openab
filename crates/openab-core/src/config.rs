@@ -471,6 +471,74 @@ pub struct DiscordConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+    /// Discord voice-channel capture and transcription. Disabled by default.
+    #[serde(default)]
+    pub voice: DiscordVoiceConfig,
+}
+
+/// Opt-in Discord voice-channel capture configuration.
+///
+/// Defaults preserve the previous text-only Discord behavior. Audio is accepted
+/// only after an authorized user explicitly runs `/voice join`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscordVoiceConfig {
+    /// Enable `/voice` commands and the `GUILD_VOICE_STATES` intent.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional voice-channel allowlist. Empty means any voice channel the
+    /// authorized command caller is currently connected to.
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
+    /// Silence required to finalize an utterance for STT.
+    #[serde(default = "default_voice_silence_ms")]
+    pub silence_ms: u64,
+    /// Hard cap for one STT segment, even if the speaker never pauses.
+    #[serde(default = "default_voice_max_segment_seconds")]
+    pub max_segment_seconds: u64,
+    /// Hard cap for one voice session, enforced by an independent timer.
+    #[serde(default = "default_voice_max_session_minutes")]
+    pub max_session_minutes: u64,
+    /// Bounded STT work queue capacity. Full queues drop the new segment and
+    /// increment session diagnostics rather than blocking Discord receive.
+    #[serde(default = "default_voice_max_pending_segments")]
+    pub max_pending_segments: usize,
+    /// Maximum retained transcript size per voice session.
+    #[serde(default = "default_voice_max_transcript_bytes")]
+    pub max_transcript_bytes: usize,
+}
+
+impl Default for DiscordVoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_channels: Vec::new(),
+            silence_ms: default_voice_silence_ms(),
+            max_segment_seconds: default_voice_max_segment_seconds(),
+            max_session_minutes: default_voice_max_session_minutes(),
+            max_pending_segments: default_voice_max_pending_segments(),
+            max_transcript_bytes: default_voice_max_transcript_bytes(),
+        }
+    }
+}
+
+fn default_voice_silence_ms() -> u64 {
+    2_000
+}
+
+fn default_voice_max_segment_seconds() -> u64 {
+    30
+}
+
+fn default_voice_max_session_minutes() -> u64 {
+    120
+}
+
+fn default_voice_max_pending_segments() -> usize {
+    8
+}
+
+fn default_voice_max_transcript_bytes() -> usize {
+    80_000
 }
 
 fn default_max_bot_turns() -> u32 {
@@ -2159,6 +2227,48 @@ command = "echo"
             cfg.discord.unwrap().message_processing_mode,
             MessageProcessingMode::Message
         );
+    }
+
+    #[test]
+    fn discord_voice_defaults_disabled() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        let voice = cfg.discord.unwrap().voice;
+        assert!(!voice.enabled);
+        assert!(voice.allowed_channels.is_empty());
+        assert_eq!(voice.silence_ms, 2_000);
+        assert_eq!(voice.max_segment_seconds, 30);
+        assert_eq!(voice.max_session_minutes, 120);
+        assert_eq!(voice.max_pending_segments, 8);
+        assert_eq!(voice.max_transcript_bytes, 80_000);
+    }
+
+    #[test]
+    fn discord_voice_config_parses_explicit_values() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[discord.voice]
+enabled = true
+allowed_channels = ["123", "456"]
+silence_ms = 1500
+max_segment_seconds = 45
+max_session_minutes = 90
+max_pending_segments = 8
+max_transcript_bytes = 50000
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let voice = cfg.discord.unwrap().voice;
+        assert!(voice.enabled);
+        assert_eq!(voice.allowed_channels, ["123", "456"]);
+        assert_eq!(voice.silence_ms, 1_500);
+        assert_eq!(voice.max_segment_seconds, 45);
+        assert_eq!(voice.max_session_minutes, 90);
+        assert_eq!(voice.max_pending_segments, 8);
+        assert_eq!(voice.max_transcript_bytes, 50_000);
     }
 
     #[test]

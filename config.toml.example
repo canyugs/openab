@@ -19,6 +19,19 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allow_dm = false                     # true = respond to Discord DMs; false (default) = ignore DMs
                                        # allowed_users still applies in DMs
 
+# --- Experimental Discord Voice Channel transcription ---
+# Requires [stt].enabled = true. The bot receives every audible participant in the
+# joined channel; [discord].allowed_users only controls who may run /voice commands.
+# Obtain participant consent before enabling this feature.
+# [discord.voice]
+# enabled = false                  # opt in; omitted/false keeps voice runtime inactive
+# allowed_channels = []            # Voice Channel IDs; empty = any Voice Channel
+# silence_ms = 2000                # close a speaker segment after this much silence
+# max_segment_seconds = 30         # force a segment boundary at this duration
+# max_session_minutes = 120        # automatically leave after this duration
+# max_pending_segments = 8         # bounded completed-segment STT queue
+# max_transcript_bytes = 80000     # bounded in-memory transcript text
+
 # [slack]
 # bot_token = "${SLACK_BOT_TOKEN}"     # Bot User OAuth Token (xoxb-...)
 # app_token = "${SLACK_APP_TOKEN}"     # App-Level Token (xapp-...) for Socket Mode

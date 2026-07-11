@@ -2,6 +2,11 @@
 
 Complete guide to setting up, configuring, and running OpenAB with Discord.
 
+For the opt-in live Voice Channel transcription spike, including its current
+validation status and consent requirements, see the
+[Discord Voice Channel guide](discord-voice.md). Voice Channel capture is separate
+from the voice-message attachment support described below.
+
 ## Bot Setup
 
 ### 1. Create a Discord Application
@@ -282,16 +287,19 @@ Multiple bots can share the same Discord channel. Each bot only responds to its 
 
 ### Helm example
 
+Chart v0.10 and later accepts each bot's complete TOML through `configToml` (or
+`configUrl`); it no longer maps `agents.<name>.discord.*` fields. Create one TOML
+file per bot, including that bot's `[discord]` and `[agent]` sections, then install
+them verbatim:
+
 ```bash
 helm install openab openab/openab \
-  --set agents.kiro.discord.botToken="$BOT_A_TOKEN" \
-  --set-string 'agents.kiro.discord.allowedChannels[0]=CHANNEL_ID' \
-  --set agents.dealer.discord.botToken="$BOT_B_TOKEN" \
-  --set-string 'agents.dealer.discord.allowedChannels[0]=CHANNEL_ID' \
-  --set agents.dealer.discord.enabled=true \
-  --set agents.dealer.command=kiro-cli \
-  --set 'agents.dealer.args={acp,--trust-all-tools}'
+  --set-file agents.kiro.configToml=./kiro.toml \
+  --set-file agents.dealer.configToml=./dealer.toml
 ```
+
+Reference distinct environment variables for each token in those files and inject
+them with per-agent `secretEnv` or another Kubernetes secret mechanism.
 
 ### Known limitations
 
@@ -384,16 +392,17 @@ See [multi-agent.md](multi-agent.md) for detailed examples.
 
 ## Helm Values
 
+Chart v0.10 and later mounts `configToml` verbatim. Keep Discord IDs as quoted
+strings in the TOML file and deploy it with:
+
 ```bash
 helm install openab openab/openab \
-  --set agents.kiro.discord.botToken="$DISCORD_BOT_TOKEN" \
-  --set-string 'agents.kiro.discord.allowedChannels[0]=YOUR_CHANNEL_ID' \
-  --set agents.kiro.discord.allowBotMessages=off \
-  --set agents.kiro.discord.allowUserMessages=involved \
-  --set-string 'agents.kiro.discord.allowedRoleIds[0]=YOUR_ROLE_ID'
+  --set-file agents.kiro.configToml=./config.toml
 ```
 
-⚠️ Use `--set-string` for channel/user/role IDs to avoid float64 precision loss.
+Alternatively, set `agents.kiro.configUrl` to a remote TOML source. Adapter-shaped
+Helm values such as `agents.kiro.discord.allowedChannels` are legacy and rejected.
+See [Migrating to configToml](migrate-to-configtoml.md).
 
 ---
 

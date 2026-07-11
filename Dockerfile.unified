@@ -27,6 +27,9 @@ ARG BUILDER_IMAGE=local_builder
 # To get new digest: docker pull rust:1-bookworm && docker inspect rust:1-bookworm --format '{{index .RepoDigests 0}}'
 FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS local_builder
 WORKDIR /build
+# Songbird's pinned Opus backend builds libopus from source.
+RUN apt-get update && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
 COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml

@@ -15,6 +15,8 @@ use openab_core::config;
 use openab_core::cron;
 #[cfg(feature = "discord")]
 use openab_core::discord;
+#[cfg(feature = "discord")]
+use openab_core::discord_voice_runtime::DiscordVoiceManager;
 use openab_core::dispatch;
 use openab_core::gateway;
 use openab_core::hooks;
@@ -31,6 +33,11 @@ use clap::Parser;
 use serenity::gateway::GatewayError;
 #[cfg(feature = "discord")]
 use serenity::prelude::*;
+#[cfg(feature = "discord")]
+use songbird::{
+    driver::{DecodeConfig, DecodeMode},
+    Config as SongbirdConfig, SerenityInit,
+};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -946,6 +953,19 @@ async fn main() -> anyhow::Result<()> {
             parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
         let allowed_role_ids =
             parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
+        if discord_cfg.voice.enabled && (!cfg.stt.enabled || cfg.stt.api_key.trim().is_empty()) {
+            anyhow::bail!(
+                "discord.voice.enabled = true requires [stt] enabled = true and a non-empty api_key"
+            );
+        }
+        let voice_manager = if discord_cfg.voice.enabled {
+            Some(DiscordVoiceManager::new(
+                discord_cfg.voice.clone(),
+                cfg.stt.clone(),
+            )?)
+        } else {
+            None
+        };
         info!(
             allow_all_channels,
             allow_all_users,
@@ -956,6 +976,7 @@ async fn main() -> anyhow::Result<()> {
             allow_bot_messages = ?discord_cfg.allow_bot_messages,
             allow_user_messages = ?discord_cfg.allow_user_messages,
             allow_dm = discord_cfg.allow_dm,
+            voice_enabled = voice_manager.is_some(),
             "starting discord adapter"
         );
 
@@ -1023,22 +1044,37 @@ async fn main() -> anyhow::Result<()> {
             ambient: ambient_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            voice_manager: voice_manager.clone(),
         };
 
-        let intents = GatewayIntents::GUILD_MESSAGES
+        let mut intents = GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::MESSAGE_CONTENT
             | GatewayIntents::GUILDS
             | GatewayIntents::DIRECT_MESSAGES
             | GatewayIntents::GUILD_MESSAGE_REACTIONS;
+        if voice_manager.is_some() {
+            intents |= GatewayIntents::GUILD_VOICE_STATES;
+        }
 
-        let mut client = Client::builder(&discord_cfg.bot_token, intents)
-            .event_handler(handler)
-            .await?;
+        let mut client_builder = Client::builder(&discord_cfg.bot_token, intents)
+            .event_handler(handler);
+        if let Some(manager) = &voice_manager {
+            let songbird_config = SongbirdConfig::default()
+                .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
+            let songbird = songbird::Songbird::serenity_from_config(songbird_config);
+            manager.attach_songbird(songbird.clone());
+            client_builder = client_builder.register_songbird_with(songbird);
+        }
+        let mut client = client_builder.await?;
 
         let shard_manager = client.shard_manager.clone();
+        let shutdown_voice_manager = voice_manager.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
             info!("shutdown signal received");
+            if let Some(manager) = shutdown_voice_manager {
+                manager.shutdown_all().await;
+            }
             shard_manager.shutdown_all().await;
         });
 

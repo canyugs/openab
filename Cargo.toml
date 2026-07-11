@@ -22,6 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend", "cache"], optional = true }
+songbird = { version = "0.6", features = ["receive"], optional = true }
 
 [features]
 # Default: core only (Discord + Slack). Gateway ships as separate binary.
@@ -31,7 +32,7 @@ default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3", "pre-see
 unified = ["telegram", "line", "feishu", "googlechat", "wecom", "teams"]
 
 # Core adapters
-discord = ["dep:serenity", "openab-core/discord"]
+discord = ["dep:serenity", "dep:songbird", "openab-core/discord"]
 slack = ["openab-core/slack"]
 
 # Core optional features
