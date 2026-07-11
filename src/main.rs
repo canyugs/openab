@@ -136,6 +136,30 @@ fn has_unified_platform_env() -> bool {
                 .unwrap_or(false))
 }
 
+/// Install an explicit rustls 0.23 process-wide crypto provider before any TLS
+/// client is constructed. Unified builds enable AWS-LC through the AWS SDK and
+/// ring through reqwest/Songbird, so rustls cannot infer a provider on its own.
+#[cfg(feature = "discord")]
+fn install_rustls_crypto_provider() -> anyhow::Result<&'static str> {
+    if rustls_023::crypto::CryptoProvider::get_default().is_some() {
+        return Ok("already-installed");
+    }
+
+    #[cfg(feature = "agentcore")]
+    let (provider, name) = (
+        rustls_023::crypto::aws_lc_rs::default_provider(),
+        "aws-lc-rs",
+    );
+
+    #[cfg(not(feature = "agentcore"))]
+    let (provider, name) = (rustls_023::crypto::ring::default_provider(), "ring");
+
+    provider.install_default().map_err(|_| {
+        anyhow::anyhow!("failed to install the process-wide rustls crypto provider")
+    })?;
+    Ok(name)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -144,6 +168,12 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "openab=info".into()),
         )
         .init();
+
+    #[cfg(feature = "discord")]
+    {
+        let provider = install_rustls_crypto_provider()?;
+        info!(provider, "rustls crypto provider ready");
+    }
 
     let cmd = Cli::parse()
         .command
@@ -1252,5 +1282,13 @@ mod tests {
 
         // Cleanup
         clear_all();
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn installs_rustls_crypto_provider() {
+        install_rustls_crypto_provider().unwrap();
+        let _ = rustls_023::ClientConfig::builder();
+        assert!(rustls_023::crypto::CryptoProvider::get_default().is_some());
     }
 }
