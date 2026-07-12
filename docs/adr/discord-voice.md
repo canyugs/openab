@@ -3,7 +3,7 @@
 - **Status:** Proposed — one-speaker live receive passed; accuracy and soak validation pending
 - **Date:** 2026-07-12
 - **Implementation branch:** `feat/discord-voice-receive`
-- **Related:** [Discord guide](../discord.md), [STT guide](../stt.md), [Discord Voice Channel guide](../discord-voice.md), [Hands-free device voice delegation ADR](duplex-voice-engines-and-action-broker.md)
+- **Related:** [Discord guide](../discord.md), [STT guide](../stt.md), [Discord Voice Channel guide](../discord-voice.md), [Discord Voice intent delegation ADR](duplex-voice-engines-and-action-broker.md)
 
 ---
 
@@ -20,11 +20,14 @@ This table records implementation state separately from runtime validation. Upda
 | `VoiceTick`/`SpeakingStateUpdate` capture | **Implemented on branch** | SSRCs map to Discord users; per-user 48 kHz stereo buffers segment decoded PCM in the callback using audio-sample silence and duration bounds. |
 | Bounded STT and transcript pipeline | **Implemented on branch** | Only completed segments enter a bounded queue. Workers encode WAV in memory, call `stt::transcribe`, and append to a bounded transcript; no audio files are written. |
 | ACP summary dispatch | **Implemented with an unresolved security limitation** | Only explicit `/voice summary` uses the pinned control channel's normal, tool-capable ACP path. Transcript-as-data behavior is prompt-enforced, not sandbox-enforced. |
-| Automated verification | **Partial pass** | Default and unified Clippy pass; 39 voice/config/runtime tests pass. Discord-only ring and unified AWS-LC tests both call the original Rustls builder panic point successfully. Workspace tests reach 687 passes but one pre-existing macOS `/bin/false` assertion fails. Repository-wide fmt and Windows verification remain pending. |
+| Automated verification | **Partial pass** | Default and unified Clippy pass; 39 voice/config/runtime tests pass. Discord-only ring and unified AWS-LC tests both call the original Rustls builder panic point successfully. The current core library suite lists 690 tests; the most recent full run had one pre-existing macOS `/bin/false` assertion failure while the new typed-turn suites passed. Repository-wide fmt and Windows verification remain pending. |
 | Local Kubernetes artifact/runtime smoke | **Passed** | Image `sha256:661d58c5934332ccb4222b7b18e4063cb0d8f9949aec110938bf1928bb1250b9` reached `1/1 Running` with zero restarts in `docker-desktop/openab-local` as Helm release `openab-voice-smoke`. The smoke ran without Discord/STT credentials and is not Voice receive evidence. |
 | Local Discord/Groq/Claude readiness | **Passed** | The live `openab-voice` release connects the bot, registers global commands, verifies the configured Groq model, persists Claude OAuth, and completes a Discord-to-Claude ACP turn. |
 | Real Discord receive | **Passed for one speaker** | The first Songbird join exposed a Rustls 0.23 provider ambiguity in unified builds. Commit `7b8f90f` explicitly selects AWS-LC when AgentCore features are present and ring for Discord-only builds. After that fix, join, decoded receive, attribution, timestamps, and raw transcript download passed. The rollout ended the session; explicit stop and DAVE remain separate checks. |
 | STT accuracy sample | **Failed; controlled retry pending** | The first four-segment raw transcript preserved one-speaker attribution and timing, but contained an ellipsis-only segment, an incorrect-language hallucination, and unreliable Chinese text. Image `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88` is deployed with `whisper-large-v3` plus `language = "zh"` for the next A/B sample. |
+| Voice intent broker | **Direction selected; implementation not started** | The follow-on path will turn attributed transcript into a pending semantic intent, confirm it, and dispatch a real Discord mention exactly once. |
+| Spoken confirmation and TTS | **Not started** | Text confirmation is the first engineering slice. Spoken yes/no plus Songbird TTS is the first hands-free daily milestone. |
+| Realtime/Live and result observation | **Not started; optional later slices** | Realtime/Live must emit the same proposal contract. Thread observation must not block the initial confirmed-dispatch loop. |
 | Two-speaker and reconnect soak test | **Pending real-world validation** | Attribution, reconnect health beyond a unit state transition, and a 30-minute minimum soak remain unverified. |
 | Production readiness | **Not established** | Requires the acceptance checks in section 12. |
 
@@ -45,10 +48,11 @@ The branch now implements those code paths, but the baseline distinction remains
 voice-message STT and Voice Channel capture are separate features. Enabling STT
 does not silently enable live capture.
 
-This ADR remains authoritative for Discord Voice Channel receive and meeting
-transcription. The [hands-free device voice delegation ADR](duplex-voice-engines-and-action-broker.md)
-describes a separate phone-to-Discord broker for daily agent operation. It does
-not depend on Discord Voice Channel capture and does not change this subsystem.
+This ADR remains authoritative for Discord Voice Channel receive and transcript
+retention. The [Discord Voice intent delegation ADR](duplex-voice-engines-and-action-broker.md)
+builds directly on this subsystem: attributed transcript becomes a pending
+semantic intent, receives one confirmation, and is dispatched through the
+existing Discord bot-to-bot path.
 
 ## 2. Context and Purpose
 
@@ -391,7 +395,7 @@ observability gap rather than inferring health from connection state.
 - [x] 39 targeted voice/config/runtime tests pass.
 - [ ] `cargo fmt`
 - [x] `cargo clippy -- -D warnings`
-- [ ] `cargo test --workspace` (687 pass; one unrelated macOS `/bin/false` test fails locally)
+- [ ] `cargo test --workspace` (one unrelated macOS `/bin/false` test fails locally; targeted new suites pass and the current core library lists 690 tests)
 - [ ] `cargo check --target x86_64-pc-windows-gnu`
 - [x] Default/omitted `[discord.voice]` leaves voice disabled in config/runtime tests.
 - [ ] Disabled voice does not register active receive work or join channels.
@@ -407,7 +411,8 @@ observability gap rather than inferring health from connection state.
 
 ### Real Discord / DAVE Validation
 
-- [ ] Test in a normal Discord Voice Channel with current DAVE requirements.
+- [x] One-speaker join, decoded receive, attribution, timestamps, and transcript were validated in a normal Discord Voice Channel.
+- [ ] Explicitly validate current DAVE behavior across stop, leave, reconnect, and rejoin.
 - [ ] Two human accounts produce separate, correctly attributed audio.
 - [ ] Simultaneous speech remains in separate speaker streams.
 - [ ] The first spoken syllable after silence is not consistently lost.

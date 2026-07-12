@@ -1,775 +1,608 @@
-# ADR: Hands-Free Device Voice Delegation through Discord
+# ADR: Discord Voice Intent Delegation
 
-- **Status:** Proposed — daily-operation UX and two integration tracks selected; implementation pending
+- **Status:** Proposed — Discord Voice intent-delegation direction selected
 - **Date:** 2026-07-12
-- **Implementation:** Not started — Track A is the first delivery target
-- **Related:** [Discord multi-agent guide](../multi-agent.md), [Discord guide](../discord.md), [Discord Voice receive ADR](discord-voice.md), [Issue #1364](https://github.com/openabdev/openab/issues/1364), [Issue #1368](https://github.com/openabdev/openab/issues/1368)
+- **Implementation:** Voice receive foundation implemented; intent broker not started
+- **Implementation branch:** `feat/discord-voice-receive`
+- **Direction update:** [canyugs/openab#20 comment 4951151976](https://github.com/canyugs/openab/issues/20#issuecomment-4951151976)
+- **Related:** [Discord Voice receive ADR](discord-voice.md), [Discord multi-agent guide](../multi-agent.md), [Issue #1364](https://github.com/openabdev/openab/issues/1364), [Issue #1368](https://github.com/openabdev/openab/issues/1368)
 
 ---
 
 ## 1. Decision
 
-OpenAB's first useful voice-to-agent workflow will be a **device-bound,
-hands-free voice delegation broker**, not a new action runtime inside OpenAB.
-
-The operator talks to a Siri-like assistant on their phone. The assistant turns
-the request into a semantic delegation, paraphrases the intended task aloud,
-and waits for one spoken confirmation. After the operator confirms, a dedicated
-Discord bot such as `b0-voice-broker` posts the delegation to an existing OAB
-agent. The existing Discord bot-to-bot and ACP paths perform the work unchanged.
-
-The broker then observes the Discord thread in the background and speaks short,
-useful progress and completion updates back to the operator.
-
-This UX has two supported integration tracks:
-
-1. **Discord-native, no OpenAB code changes.** The broker infers job state from
-   the existing Discord root message, thread, reactions, and replies.
-2. **OpenAB-assisted.** The same Discord delegation remains visible, while an
-   optional OpenAB event bridge emits structured lifecycle and completion data
-   to the broker.
-
-The operator-facing command flow is the same in both tracks. Status wording may
-be more precise in the OpenAB-assisted track, but the operator does not learn a
-different command vocabulary.
+The first daily voice-delegation path will build on OpenAB's existing Discord
+Voice receive implementation.
 
 ```text
-Phone voice client
-    │
-    │ "Ask B0 to run a group review on PR #12345"
-    ▼
-Voice Delegation Broker
-    │
-    │ "You want B0 to start a group review of PR #12345, right?"
-    │
-    ◄── "Yes"
-    │
-    │ confirmed semantic intent
-    ▼
-Discord as b0-voice-broker
-    │
-    │ "<@B0> Can asked via voice:
-    │  start a group review of PR #12345."
-    ▼
-Existing OpenAB multi-agent flow
-    │
-    │ B0 creates a thread, runs ACP, and coordinates other bots
-    ▼
-Voice Delegation Broker observes the thread
-    │
-    └── "B0 has started coordinating the review. I'll keep tracking it."
+Discord Voice Channel
+  → OpenAB Songbird receive
+  → STT or a future Realtime/Live engine
+  → semantic intent proposal
+  → one semantic confirmation
+  → deterministic Discord text mention
+  → existing OpenAB bot-to-bot and ACP flow
 ```
 
-For ordinary daily work, **there is no Discord text approval step**. Discord
-text is the dispatch and audit surface, not a UI the operator must watch.
+The voice-dispatching OpenAB instance will gain a small deterministic intent
+broker inside or immediately beside its Discord Voice subsystem. It receives an
+intent proposal, asks the operator to confirm what it understood, and dispatches
+the confirmed task exactly once as a Discord message to an existing OAB agent.
 
-The one required gate is a spoken **intent confirmation** before a new
-delegation is posted. It confirms what the assistant understood; it is not a
-permission prompt and it does not require reviewing the exact Discord wording.
+The receiving B0-B15 agents continue using their existing Discord and ACP code.
+They do not receive a new voice protocol or a new ACP executor.
+
+The following are explicit decisions:
+
+- use the current Discord Voice receive branch as the foundation;
+- modify the voice-dispatching OpenAB instance;
+- keep target OAB agents unchanged except for Discord configuration;
+- keep Discord text as the dispatch and audit surface;
+- confirm semantic intent once before dispatch;
+- let parser, LLM, Realtime, or GPT-Live implementations only propose intents;
+- let deterministic OpenAB state, not the model, perform final dispatch;
+- do not involve OCP in the first path; and
+- do not block initial dispatch on structured ACP lifecycle observation.
 
 ## 2. Product Goal
 
-The goal is a daily operating interface for times when looking at a screen is
-inconvenient, especially while driving or walking.
+The product goal is a daily voice interface for delegating real work to the
+existing OpenAB agent fleet.
 
-The operator should be able to:
-
-- delegate a new task to B0 or another named OAB agent;
-- correct a misunderstood task before it is sent;
-- continue talking while one or more jobs run in the background;
-- ask for status without triggering another confirmation;
-- add a new task while existing tasks are still running;
-- hear concise progress only when something meaningful changes;
-- receive a short completion summary and ask for more detail; and
-- return later and resume tracking jobs created by an earlier voice session.
-
-This is not intended as a demo-only path. The broker owns a persistent daily job
-ledger and treats Discord/OAB work as asynchronous background activity.
-
-## 3. Scope and Non-Goals
-
-### In scope
-
-- a native or device-appropriate voice client;
-- a low-latency conversational voice provider, initially OpenAI Realtime;
-- semantic intent drafting and spoken paraphrase-back;
-- exactly one spoken confirmation for each new or materially changed
-  delegation;
-- a dedicated Discord broker bot identity;
-- existing OpenAB bot-to-bot dispatch;
-- background Discord thread observation;
-- spoken progress, completion, and failure summaries;
-- multiple concurrent delegation jobs;
-- restart-safe job correlation for ordinary daily use;
-- a zero-core-change Discord-native integration track; and
-- an optional OpenAB-assisted track for structured progress, completion,
-  cancellation, and follow-up.
-
-### Explicitly not part of this ADR
-
-- a new OpenAB permission resolver;
-- a per-action Discord button or text confirmation;
-- speaker biometrics or Discord Voice Channel SSRC attribution;
-- a new `ActionBroker` or `AcpActionExecutor` inside OpenAB;
-- direct ACP execution by the voice model;
-- moving the Discord bot token into the phone client;
-- Discord Voice Channel capture, Songbird playback, or meeting transcription;
-- defining a new policy for high-risk or irreversible operations; and
-- requiring typed ACP completion before the voice workflow can ship.
-
-The optional OpenAB-assisted track adds an observation/control seam around the
-existing dispatch path. It does not move intent confirmation into OpenAB and it
-does not replace the dedicated broker identity in Discord.
-
-Existing agent capabilities, permissions, and operational policy remain as
-they are. This ADR changes the interaction path, not the authority model of the
-receiving OAB agents.
-
-## 4. Daily User Experience
-
-### 4.1 New delegation
+The target interaction is:
 
 ```text
-Operator: "Ask B0 to review PR 12345 with the group."
+Can, in Discord Voice:
+  "叫 Sam 看 canyugs/openab issue 20"
 
-Broker:   "You want B0 to start a group review of PR #12345, right?"
+OpenAB drafts:
+  target = Sam
+  task = inspect canyugs/openab#20
 
-Operator: "Yes."
+OpenAB asks:
+  "要請 Sam 看 canyugs/openab#20 嗎？"
 
-Broker:   "Sent. I'll let you know when B0 starts."
+Can:
+  "對"
 
-Broker:   "B0 has started coordinating the review. Please keep driving;
-           I'll follow up when there is a useful update."
+OpenAB posts in the pinned text channel:
+  <@SAM_DISCORD_ID> Can asked via voice:
+  請看 canyugs/openab#20
+
+OpenAB says:
+  "已送出。"
 ```
 
-The confirmation is semantic. The operator confirms the target and objective,
-not an exact transcript or generated Discord sentence.
+The confirmation checks the target and intended task. It is not a review of the
+exact generated Discord prose and it does not require another approval after a
+clear spoken yes.
 
-### 4.2 Correction before dispatch
+The final daily-use experience should not require looking at the phone. The
+implementation is deliberately sliced, however, so the first engineering slice
+uses text confirmation before spoken confirmation and TTS are added.
+
+## 3. Revised Boundary
+
+### 3.1 What changes in OpenAB
+
+The voice-dispatching instance adds:
+
+- an intent proposal contract;
+- target alias resolution;
+- one pending-intent state machine per guild/voice session;
+- yes/no/correction/timeout handling;
+- exactly-once Discord mention dispatch;
+- later, spoken confirmation input;
+- later, Songbird TTS playback; and
+- optionally, thread/result observation.
+
+### 3.2 What stays unchanged
+
+Receiving OAB agents retain the current flow:
 
 ```text
-Broker:   "You want B0 to review and merge PR #12345, right?"
-
-Operator: "No, review only. Don't merge it."
-
-Broker:   "Review PR #12345 with the group, but do not merge it. Right?"
-
-Operator: "Right."
-```
-
-Nothing is posted until the corrected intent is confirmed.
-
-### 4.3 Status and follow-up
-
-```text
-Operator: "How is the PR review going?"
-
-Broker:   "B0 has started three reviewers. Two have replied; one is still
-           running. No blocker has been reported yet."
-```
-
-Status questions do not require confirmation because they do not create a new
-delegation. If the operator materially changes a job, the broker paraphrases
-the new intent once before posting the follow-up.
-
-### 4.4 Answering an agent question
-
-When B0 or another agent asks a blocking question, the broker speaks a concise
-version and binds the operator's answer to that job:
-
-```text
-Broker:   "B0 needs to know whether the review should include the draft PR."
-
-Operator: "Yes, include drafts but don't merge anything."
-
-Broker:   "Tell B0 to include draft PRs and not merge anything. Right?"
-
-Operator: "Right."
-```
-
-The confirmed answer is posted into the existing job thread. This uses the same
-single intent-confirmation turn as a new delegation; it is not a second approval
-system.
-
-### 4.5 Multiple jobs
-
-The foreground voice conversation is not bound to one OAB turn. Every confirmed
-delegation becomes an independent background job. The operator can say:
-
-```text
-"While that runs, ask B3 to check the staging error from this morning."
-```
-
-The broker confirms that second intent, dispatches it, and tracks both jobs.
-Short references such as "the PR review" or "the staging check" resolve against
-the broker's job ledger rather than raw Discord history.
-
-### 4.6 Interruption and notification style
-
-The voice client should support natural barge-in. The operator can interrupt a
-long spoken update, ask for the conclusion first, or say "later".
-
-Background updates are coalesced and spoken only when one of these happens:
-
-- the target agent accepts or starts the delegation;
-- the target agent asks a question that blocks progress;
-- a material blocker or failure appears;
-- the job completes; or
-- the operator explicitly asks for status.
-
-Routine reactions, repeated thinking messages, and every individual agent post
-are not read aloud.
-
-If there is no active voice session, the broker records blockers and completions
-in the job ledger. On the next wake, it gives one compact summary. A conventional
-push notification may be added later, but the design does not assume a phone can
-start unsolicited background speech.
-
-## 5. Interaction State
-
-There are two independent state machines: one for the foreground conversation
-and one for each delegated job.
-
-### 5.1 Foreground intent state
-
-```text
-Listening
-    │
-    ▼
-DraftingIntent
-    │
-    ├─ ambiguous ─────────► Clarifying ───────┐
-    │                                         │
-    ▼                                         │
-ConfirmingIntent ◄────────────────────────────┘
-    │
-    ├─ correction ────────► DraftingIntent
-    ├─ no / timeout ──────► Abandoned
-    └─ yes ───────────────► Dispatching
-```
-
-Only an explicit affirmative response while one intent is pending advances to
-`Dispatching`. An acknowledgement such as "okay" after a progress report must
-not accidentally confirm a different future task.
-
-Any command that creates or changes Discord work follows this same rule: a new
-task, correction, answer to an agent question, follow-up, reassignment, or
-cancellation. Status queries and passive progress reports do not require
-confirmation.
-
-If two drafts could be pending, the broker names the task in its question. The
-preferred UX is still one active confirmation at a time.
-
-### 5.2 Background job state
-
-```text
-Dispatching
-    ├─ Discord post failed ─► DeliveryFailed
-    └─ root message posted ─► Sent
-                                 │
-                                 ├─ thread/reaction observed ─► Running
-                                 ├─ no response ──────────────► Waiting
-                                 └─ final thread result ──────► Completed | Failed
-```
-
-The voice session may disconnect while a job is `Sent`, `Waiting`, or `Running`.
-Tracking continues server-side. A later session can ask for the current state.
-
-## 6. Components
-
-### 6.1 Device Voice Client
-
-The phone client owns microphone input, audio playback, interruption, and the
-device-native activation experience. It should feel like a voice assistant, not
-like a mobile Discord client.
-
-For an OpenAI Realtime implementation, use WebRTC from the client. The backend
-creates the Realtime session or returns a short-lived client credential; the
-normal OpenAI API key remains server-side.
-
-The client does not hold the Discord bot token and does not talk to OAB agents
-directly.
-
-### 6.2 Realtime Conversation Engine
-
-The first engine provides low-latency speech-to-speech conversation and emits a
-structured proposal such as:
-
-```json
-{
-  "target": "B0",
-  "objective": "Start a group review of PR #12345",
-  "references": ["PR #12345"]
-}
-```
-
-The model-facing tool is named as a proposal, for example
-`propose_delegation`. It does not expose a raw `send_discord_message` tool.
-
-A proposal creates `ConfirmingIntent`; it does not dispatch. Application state,
-not prompt wording alone, decides when the confirmed intent is posted.
-
-The provider is replaceable. A later STT + dialogue model + TTS pipeline may
-emit the same proposal contract without changing Discord or OpenAB.
-
-### 6.3 Voice Delegation Broker
-
-The broker is a small server-side service that owns:
-
-- the foreground session state;
-- pending semantic intents;
-- confirmation matching;
-- Discord posting;
-- the persistent delegation job ledger;
-- Discord Gateway observation with REST polling as recovery;
-- progress coalescing and summarization; and
-- spoken event delivery back to the active device session.
-
-It does **not** execute ACP work. Its executable action is only "post this
-confirmed delegation to this configured Discord target and track the result."
-
-Suggested records:
-
-```rust
-struct PendingIntent {
-    intent_id: IntentId,
-    voice_session_id: VoiceSessionId,
-    target_bot_id: DiscordUserId,
-    objective: String,
-    references: Vec<String>,
-    paraphrase: String,
-    state: IntentState,
-}
-
-struct DelegationJob {
-    intent_id: IntentId,
-    target_bot_id: DiscordUserId,
-    channel_id: DiscordChannelId,
-    root_message_id: DiscordMessageId,
-    thread_id: Option<DiscordChannelId>,
-    state: DelegationState,
-    last_observed_message_id: Option<DiscordMessageId>,
-    last_spoken_summary: Option<String>,
-}
-```
-
-### 6.4 Discord Broker Bot
-
-The broker posts under its own visible identity, for example
-`b0-voice-broker`. It never impersonates the human operator.
-
-A delegation message should be concise and explicit:
-
-```text
-<@TARGET_BOT_ID> Voice delegation from Can:
-Start a group review of PR #12345. Report blockers and the final result here.
-```
-
-This gives the channel a natural audit marker: everyone can see that the task
-was delegated through the voice broker.
-
-### 6.5 Existing OAB Agents
-
-The receiving agent follows the existing Discord message flow:
-
-```text
-broker bot message
+Discord bot message
   → trusted bot mention admission
   → normal thread creation/detection
   → normal OpenAB dispatch
   → existing ACP coding agent
-  → Discord thread result
+  → Discord result
 ```
 
-No OpenAB core change is required for the Discord-native track. The deployment
-configuration of each directly targetable OAB bot must trust the broker bot ID.
-
-### 6.6 Optional OpenAB Delegation Event Bridge
-
-The OpenAB-assisted track adds a narrow event/control interface to the existing
-dispatch lifecycle. It does not become another agent runtime.
-
-The bridge correlates events by the originating Discord message ID, which is
-already retained as `ChannelRef.origin_event_id`, and may emit:
-
-```rust
-enum DelegationEvent {
-    Accepted,
-    Queued,
-    Running,
-    ToolProgress { title: String, status: String },
-    Completed { display_text: String },
-    Failed { display_text: String },
-    Cancelled,
-}
-```
-
-The transport may be a broker WebSocket connection, a configured webhook, or a
-small local event stream. The contract matters more than the initial transport:
-events are ordered per origin message, replayable after reconnect, and end in
-one terminal event.
-
-The existing Discord message and thread remain the human-visible record. The
-event bridge improves correlation and spoken status; it does not make the
-handoff invisible.
-
-## 7. Integration Tracks
-
-### 7.1 Shared UX contract
-
-Both tracks use the same sequence:
-
-```text
-spoken request
-  → spoken paraphrase
-  → one spoken confirmation
-  → broker-authored Discord delegation
-  → background tracking
-  → concise spoken updates
-```
-
-They also share the same `PendingIntent` and `DelegationJob` records. A job may
-start in Discord-native mode and later attach to structured OpenAB events
-without being re-dispatched.
-
-### 7.2 Track A — Discord-native, no OpenAB code changes
-
-This is the first delivery track and the compatibility fallback. It changes
-OpenAB configuration, not OpenAB Rust code.
-
-#### Receiver configuration
-
-The receiving OAB bot can keep bot messages disabled generally. An explicit
-mention from a bot listed in `trusted_bot_ids` already bypasses the normal bot
-message mode in the current Discord adapter.
+Each target bot only needs to trust the voice-dispatching bot identity and allow
+the pinned channel:
 
 ```toml
 [discord]
-allowed_channels = ["<VOICE_DELEGATION_CHANNEL_ID>"]
+allowed_channels = ["<VOICE_CONTROL_CHANNEL_ID>"]
 allow_bot_messages = "off"
-trusted_bot_ids = ["<VOICE_BROKER_BOT_USER_ID>"]
+trusted_bot_ids = ["<VOICE_DISPATCH_BOT_USER_ID>"]
 ```
 
-The broker must send a real Discord mention token, `<@TARGET_BOT_USER_ID>`, not
-plain display text such as `@B0`.
+The dispatch must contain a real Discord mention token such as
+`<@TARGET_BOT_USER_ID>`, not plain display text such as `@Sam`.
 
-The recommended first topology is to target one orchestrator, B0, per root
-message. B0 can use the existing multi-agent flow to coordinate B1-B15. This
-keeps one clear thread and one responsibility chain per voice delegation.
+### 3.3 What is no longer the first path
 
-#### Thread correlation
+The external phone application plus standalone Discord broker described by the
+previous revision is no longer the selected first implementation. It remains a
+possible alternative, but it would duplicate Discord Voice receive, STT, and
+platform ownership that OpenAB already has.
 
-After posting the root message, the broker stores `(channel_id, message_id)`.
-OpenAB normally creates a thread for the task. The broker observes or refetches
-the root message until its thread ID appears, then tracks messages and reactions
-inside that thread.
+OCP is also not part of this path. OpenAB already owns Discord adapters and the
+voice session. Adding a second coordination plane would duplicate responsibility
+without helping the initial intent-confirmation loop.
 
-Primary observation uses Discord Gateway events. REST polling fills gaps after
-disconnects and supports restart recovery.
+### 3.4 First-path non-goals
 
-#### Observable progress
+- no OCP integration;
+- no new ACP executor;
+- no direct Discord dispatch by a parser, LLM, Realtime, or Live model;
+- no requirement to turn every voice session into a meeting summary;
+- no automatic task dispatch without semantic confirmation;
+- no full-duplex, wake-word, barge-in, or echo-cancellation requirement in v1;
+- no requirement to finish thread/result observation before the first dispatch
+  slice; and
+- no redesign of existing OpenAB permission or security policy in this ADR.
 
-Without a new OpenAB API, the broker uses Discord-visible evidence:
+## 4. Current Status
 
-- successful root-message creation means "sent";
-- thread creation or the queued/working reaction means "accepted/started";
-- thread messages provide questions, progress, and final text; and
-- completion/error reactions plus final thread output provide a terminal UX
-  signal.
+### 4.1 Capability status on 2026-07-12
 
-The broker should describe only what it observed. For example, say "B0 reports
-the review is complete" rather than claiming an independent ACP-level proof.
-For a cancellation, Track A says "I asked B0 to stop" until Discord shows the
-result; it does not claim that the underlying turn has already stopped.
-
-### 7.3 Track B — OpenAB-assisted structured lifecycle
-
-This track keeps the exact same Discord message path, then supplements it with
-structured events from the receiving OpenAB instance.
-
-```text
-b0-voice-broker ── Discord message ──► B0 / normal ACP path
-        ▲                                  │
-        │                                  ├─ Discord thread remains visible
-        │                                  │
-        └──── DelegationEvent stream ◄─────┘
-```
-
-The broker subscribes using the root Discord message ID. OpenAB reports queue,
-turn, tool-progress, terminal, and delivery states without requiring the broker
-to infer all of them from reactions.
-
-This track may additionally expose exact controls keyed by the same origin:
-
-- cancel the currently active turn;
-- send a confirmed follow-up into the same OAB session/thread; and
-- request the latest structured status after reconnect.
-
-Intent confirmation still happens on the phone before Discord dispatch. A
-material job-changing command such as cancel or follow-up uses the same single
-spoken paraphrase/confirmation rule; it never adds a text approval step.
-
-Track B may say that an exact turn cancellation was requested or confirmed only
-when the structured lifecycle reports that state.
-
-### 7.4 Comparison and upgrade path
-
-| Concern | Track A: no OpenAB code change | Track B: OpenAB-assisted |
+| Capability | State | Evidence / next gap |
 |---|---|---|
-| Dispatch | Trusted Discord bot mention | Same trusted Discord bot mention |
-| Audit | Root message + OAB thread | Same root message + OAB thread |
-| Progress source | Reactions and thread messages | Structured events plus Discord |
-| Completion wording | "B0 reports complete" | Can report typed terminal state |
-| Cancellation | Natural-language Discord follow-up | Exact active-turn control |
-| OpenAB work | Configuration only | Event/control API and lifecycle wiring |
-| Rollout role | First daily-driver and fallback | Reliability/precision upgrade |
+| `/voice join`, `/voice status`, `/voice transcript`, `/voice summary`, `/voice stop` | **Implemented** | Existing branch commands are wired through the Discord adapter. |
+| Songbird Discord Voice receive | **Implemented** | Decode receive, DAVE registration, and the voice session lifecycle exist. |
+| Discord speaker attribution | **Implemented; partially live-validated** | SSRC maps to Discord user ID; one-speaker attribution and timestamps passed. Two-speaker soak remains pending. |
+| PCM segmentation and bounded STT queue | **Implemented** | Per-user 48 kHz stereo segmentation, in-memory WAV encoding, bounded workers, and drop accounting exist. |
+| STT and retained transcript | **Implemented; accuracy retry pending** | Groq `whisper-large-v3` with `language = "zh"` is deployed. The first sample was not reliable enough. |
+| Explicit ACP transcript summary | **Implemented** | `/voice summary` uses the current normal ACP path. This remains separate from intent delegation. |
+| Intent proposal/parser | **Not started** | No target/task parser or `propose_delegation` backend exists. |
+| Pending intent state machine | **Not started** | No `WaitingConfirmation`, correction, timeout, or exactly-once dispatch state exists. |
+| Text confirmation and voice-specific mention dispatch | **Not started** | Slice 1 has not been implemented. |
+| Spoken yes/no/correction | **Not started** | Captured transcript is not interpreted as confirmation state. |
+| TTS and Songbird playback | **Not started** | There is no TTS provider or playback consumer. |
+| Realtime / GPT-Live proposal backend | **Not started** | No Realtime session or tool/event integration exists. |
+| Thread/result observation | **Not started** | Existing Discord seams are available, but no voice job observer is wired. |
+| Typed ACP completion seam | **Implemented and unit-tested; orthogonal** | Useful later for structured observation, but not a v1 dispatch blocker. |
 
-Track A is not throwaway code. The broker always retains Discord observation so
-it can continue operating when the structured event bridge is unavailable.
+### 4.2 Local Kubernetes status
 
-## 8. Smooth-UX Rules
+The current `docker-desktop/openab-local` deployment is healthy:
 
-1. **One confirmation, once.** A new or materially changed delegation gets one
-   short paraphrase-back. Status queries and spoken reports do not.
-2. **Confirm meaning, not wording.** Read back target, objective, and key
-   constraints; never read a full generated Discord message unless asked.
-3. **Dispatch immediately after yes.** Do not introduce a second text or button
-   approval.
-4. **Keep listening.** Dispatching a job must not block the foreground voice
-   conversation.
-5. **Track multiple jobs by name.** Resolve "the PR review" and "the staging
-   check" against a persistent ledger.
-6. **Speak deltas, not logs.** Coalesce repeated Discord activity into one short
-   update.
-7. **Be truthful about handoff state.** Distinguish "sent", "B0 started", and
-   "B0 reported completion".
-8. **Support correction naturally.** "No, review only" edits the pending intent
-   and triggers one new paraphrase.
-9. **Allow barge-in.** The operator can interrupt speech, ask for the conclusion,
-   defer an update, or start another task.
-10. **Recover without re-dispatching.** Reconnect and restart resume observation
-    from the stored Discord IDs.
-11. **Use one confirmation rule everywhere.** New tasks, corrections, answers,
-    follow-ups, reassignments, and cancellations each receive one semantic
-    paraphrase; status queries and passive reports receive none.
+- deployment `openab-voice-voice`: `1/1` ready;
+- pod restarts: `0`;
+- image: `localhost:5555/openab:claude-voice-zh-stt`; and
+- image digest:
+  `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88`.
 
-## 9. Relationship to Other Voice Proposals
+This image validates only the existing Discord receive, STT, and Claude ACP
+configuration. It predates the intent-broker work and must not be cited as
+evidence that delegation, TTS, or Realtime works.
 
-### Issue #1364
+### 4.3 Daily-UX readiness
 
-#1364 proposes a voice bridge around OpenAB/GPT-Live-style interaction. This ADR
-keeps the useful foreground/background split but makes the handoff explicit:
-the voice assistant first creates and confirms a semantic intent, then delegates
-through a distinct Discord broker identity. It does not forward a raw transcript
-or pretend that the operator typed the message.
+| Slice | User experience | Daily hands-free ready? |
+|---|---|---|
+| Existing receive/STT | Meeting-style capture, transcript, explicit summary | No |
+| Slice 1: text confirmation | Validates intent broker and dispatch, but requires looking at Discord | No |
+| Slice 2: spoken confirmation | The operator can answer by voice, but the prompt is still text-only | Not fully |
+| Slice 3: TTS playback | Confirmation, sent, cancelled, and error prompts are audible | **First hands-free daily milestone** |
+| Slice 4: Realtime/Live | Improves conversational parsing and response latency | Enhancement |
+| Slice 5: observation | Enables "I will keep tracking and report back" | Full daily-assistant loop |
 
-### Issue #1368 and the Discord Voice receive ADR
+Text-first confirmation is implementation scaffolding, not the final product
+experience.
 
-#1368 and [the Discord Voice receive ADR](discord-voice.md) are channel-bound:
-OpenAB joins a Discord Voice Channel, receives several participants, associates
-audio with Discord speakers, and may summarize that meeting.
+## 5. V1 Intent State Machine
 
-This ADR is device-bound: the voice conversation happens on the operator's
-phone, outside Discord Voice. The broker enters Discord only after the operator
-confirms the semantic delegation.
-
-The two paths are independent. Discord Voice receive remains useful for meeting
-transcription; it is not a prerequisite for the hands-free daily assistant.
-
-### Typed ACP turn work
-
-The experimental typed ACP turn/completion refactor on this branch is also
-orthogonal to Track A and is not a release prerequisite. It can supply the
-authoritative completion boundary for Track B, where OpenAB emits structured
-execution and delivery events. Neither track creates a direct ACP executor in
-the voice broker.
-
-## 10. Prior Art Applied
-
-### OpenAI Realtime
-
-The Realtime API supports stateful speech-to-speech sessions and function calls.
-For client applications such as mobile devices, the official guide recommends
-WebRTC and supports server-minted short-lived client credentials. In this
-design, Realtime produces a `propose_delegation` event; the broker application
-stores it, performs the spoken intent-confirmation turn, and only then calls
-Discord.
-
-### Voice assistant delegation
-
-The UX follows the familiar assistant pattern:
+V1 keeps one pending intent per guild and active voice-session generation.
 
 ```text
-request → concise paraphrase → yes/correction → background execution → update
+Idle
+  │
+  ▼
+DraftingIntent
+  │
+  ├─ ambiguous ───────────────► Idle / ask for a new request
+  │
+  ▼
+WaitingConfirmation
+  │
+  ├─ explicit no ─────────────► Abandoned ─► Idle
+  ├─ timeout ─────────────────► Abandoned ─► Idle
+  ├─ correction ──────────────► DraftingIntent
+  └─ explicit yes ────────────► Dispatching
+                                    │
+                                    ├─ post failed ─► Abandoned / retryable
+                                    └─ post once ───► Dispatched ─► Idle
 ```
 
-The assistant is responsible for translating the operator's intent into a clear
-delegation. The operator is not expected to edit or approve its prose.
+Rules:
 
-### Existing OpenAB multi-agent routing
+1. Only one intent may wait for confirmation per guild/voice session in v1.
+2. Only an explicit yes or no resolves the confirmation question.
+3. A correction replaces the pending intent and produces a new paraphrase.
+4. A timeout abandons the intent; it never dispatches automatically.
+5. Stopping or replacing the voice session abandons its pending intent.
+6. A proposal engine cannot transition directly to `Dispatching`.
+7. Dispatch is idempotent and occurs at most once for an intent ID.
+8. After a successful post, repeated STT or provider events cannot post it again.
+9. A new task starts only after the previous pending confirmation is resolved.
 
-OpenAB already supports trusted bot mentions, multi-bot threads, turn limits,
-thread creation, normal ACP execution, and final Discord delivery. The broker
-uses that public interaction surface instead of adding a second agent runtime.
+These are interaction semantics, not model prompt conventions. They must be
+represented in Rust state and tested independently of STT, TTS, and Realtime.
 
-## 11. Current State
+## 6. Intent Contract
 
-Confirmed on 2026-07-12:
+All proposal engines emit the same semantic contract:
 
-- OpenAB's Discord adapter admits an explicit mention from a bot in
-  `trusted_bot_ids`, even when `allow_bot_messages = "off"`;
-- a top-level admitted message enters the normal thread and ACP path;
-- sender context retains the broker Discord ID and `is_bot = true`;
-- reactions and thread messages are observable progress signals;
-- existing Discord/OpenAB metadata provides a deterministic root-message to
-  thread correlation seam, with broker end-to-end validation pending; and
-- the current local Kubernetes environment can host another small broker
-  service.
+```rust
+struct IntentProposal {
+    target: String,
+    task: String,
+    context_refs: Vec<ContextRef>,
+}
 
-For Track B, the branch contains an in-progress typed ACP turn/completion seam,
-but no delegation event transport or origin-keyed control API has been wired to
-the voice broker.
+enum ContextRef {
+    GitHubIssue { repository: String, number: u64 },
+    GitHubPullRequest { repository: String, number: u64 },
+    Url(String),
+    Text(String),
+}
+```
 
-Not yet implemented:
+Equivalent provider output:
 
-- the mobile voice client;
-- Realtime session setup;
-- the intent-confirmation state machine;
-- the Discord broker bot service;
-- the persistent job ledger; and
-- spoken background progress/reporting.
+```json
+{
+  "type": "propose_delegation",
+  "target": "sam",
+  "task": "看 canyugs/openab issue 20",
+  "context_refs": ["github:issue/canyugs/openab#20"]
+}
+```
 
-## 12. Implementation Plan
+OpenAB normalizes this into a pending intent:
 
-### Track A1 — Text-driven broker and Discord handoff
+```rust
+struct PendingIntent {
+    intent_id: IntentId,
+    voice_session: VoiceSessionToken,
+    guild_id: GuildId,
+    speaker_id: UserId,
+    target: ResolvedTarget,
+    task: String,
+    context_refs: Vec<ContextRef>,
+    paraphrase: String,
+    state: IntentState,
+}
+```
 
-Build the broker service and exercise it with a small local text/fake-voice
-client before connecting audio.
+The proposal engine may be:
 
-- persist pending intents and delegation jobs;
-- implement `DraftingIntent → ConfirmingIntent → Dispatching`;
-- post as the dedicated broker bot;
-- target B0 with a real mention;
-- correlate the created thread;
-- observe progress through Gateway events with polling recovery; and
-- deploy the broker in `docker-desktop/openab-local`.
+- a small deterministic target/task grammar;
+- an LLM over the latest attributed transcript segment;
+- OpenAI Realtime function calling; or
+- a future GPT-Live delegation event.
 
-This phase proves that OpenAB itself needs no code change.
+Changing the proposal engine must not change confirmation or dispatch
+semantics.
 
-### Track A2 — Daily mobile Realtime client
+## 7. Target Resolution and Dispatch
 
-- add the device voice client;
-- create OpenAI Realtime WebRTC sessions from the broker backend;
-- expose only a structured `propose_delegation` function to the voice model;
-- implement concise spoken paraphrase-back and correction;
-- dispatch immediately after the single spoken confirmation; and
-- keep the session conversational while jobs run.
+### 7.1 Target registry
 
-### Track A3 — Background job experience
+Voice aliases resolve through configuration owned by the voice-dispatching bot:
 
-- support several concurrent jobs;
-- add natural job references and status questions;
-- coalesce Discord activity into useful spoken deltas;
-- speak blockers, questions, completion, and concise failure summaries;
-- support barge-in, "tell me later", and "give me the short version"; and
-- resume tracking after app, network, or broker restart.
+```toml
+[discord.voice.intent]
+enabled = false
+confirmation_timeout_seconds = 30
 
-### Track A4 — Daily-use soak and refinement
+[discord.voice.intent.targets.sam]
+discord_user_id = "<SAM_DISCORD_BOT_USER_ID>"
+aliases = ["sam", "山姆"]
+```
 
-- use the assistant for normal PR review, test, investigation, and coordination
-  flows;
-- validate Bluetooth/headset and driving interaction;
-- tune paraphrase length and update frequency;
-- measure false dispatches, duplicate dispatches, missed updates, and unwanted
-  interruptions; and
-- add an OpenAB status protocol only if Discord-visible correlation proves
-  insufficient.
+The exact configuration shape may change during implementation. Required
+properties are:
 
-### Track B1 — Structured OpenAB delegation events
+- a stable canonical target name;
+- the real Discord bot user ID;
+- spoken aliases; and
+- deterministic rejection of unknown or ambiguous targets.
 
-- define an origin-message-keyed `DelegationEvent` contract;
-- emit queue/start/tool/terminal/delivery events from the existing dispatch and
-  typed turn seams;
-- expose an ordered, reconnectable stream to the broker;
-- preserve the existing legacy Discord behavior when no subscriber exists;
-- let the broker attach structured events to an already-created Track A job;
-  and
-- deploy and validate the enhanced target agent in local Kubernetes.
+### 7.2 Dispatch message
 
-### Track B2 — Exact control and follow-up
+After confirmation, OpenAB constructs the Discord message itself:
 
-- expose current-turn status by origin message ID;
-- connect broker cancellation to the exact active turn ticket;
-- allow a confirmed voice follow-up to enter the same Discord/OAB thread;
-- return a typed result while continuing to post the normal Discord result; and
-- fall back to Track A behavior whenever the native control channel is absent.
+```text
+<@TARGET_BOT_USER_ID> Can asked via voice:
+請看 canyugs/openab#20
+```
+
+The model does not generate the mention token, destination channel, author, or
+idempotency key.
+
+The voice session's pinned control channel is the initial dispatch destination.
+The existing target OpenAB instance then creates or joins its normal task thread
+and executes through ACP.
+
+### 7.3 Receiving bot configuration
+
+The receiving target must include the voice bot in `trusted_bot_ids`. A trusted
+bot's explicit mention already passes the current Discord admission path even
+when `allow_bot_messages = "off"`.
+
+No target-agent Rust change is required.
+
+## 8. Confirmation UX
+
+### 8.1 Slice 1: text scaffold
+
+The first implementation posts the paraphrase in the pinned text channel and
+accepts an explicit text yes/no/correction. This validates parsing, state,
+timeout, and exactly-once dispatch.
+
+It is not described as hands-free or daily-ready because the operator must look
+at Discord.
+
+### 8.2 Slice 2: spoken response
+
+While `WaitingConfirmation`, new final STT segments from the same voice-session
+generation are interpreted as:
+
+- affirmative;
+- negative;
+- correction; or
+- unrelated speech.
+
+Unrelated speech leaves the intent pending. A correction replaces the intent
+and asks again.
+
+### 8.3 Slice 3: TTS prompt and feedback
+
+TTS speaks only bounded broker messages:
+
+```text
+intent drafted → "要請 Sam 看 canyugs/openab#20 嗎？"
+dispatched     → "已送出。"
+abandoned      → "已取消。"
+error          → "沒有送出，請稍後再試。"
+```
+
+V1 playback is half-duplex. While the bot is speaking, its own playback is
+suppressed or ignored by the capture/confirmation pipeline. Full duplex,
+barge-in, wake words, and application-level echo cancellation are later work.
+
+## 9. Realtime and GPT-Live Backends
+
+Realtime or GPT-Live sits behind the same `IntentProposal` contract.
+
+The only delegation-related model tool/event is equivalent to:
+
+```text
+propose_delegation(target, task, context_refs)
+```
+
+It is not given `send_discord_message`, raw Discord REST access, or direct ACP
+execution.
+
+When a proposal event arrives:
+
+1. OpenAB resolves the target;
+2. OpenAB stores a pending intent;
+3. OpenAB renders and speaks the semantic paraphrase;
+4. the same deterministic confirmation state handles yes/no/correction; and
+5. OpenAB performs the final Discord dispatch.
+
+This lets the first slice use existing STT plus a simple parser and later swap
+in Realtime/Live without rewriting dispatch behavior.
+
+## 10. Optional Observation and Spoken Results
+
+Observation is not a prerequisite for the first confirmed dispatch, but it is
+required for the complete daily-assistant experience described by:
+
+```text
+"Sam has started. I will keep tracking it and report back later."
+```
+
+The first observer may use existing Discord-visible state:
+
+- the dispatched root message ID;
+- the task thread created by the target bot;
+- queued/working/done/error reactions; and
+- final thread messages.
+
+The observer stores a small job record keyed by intent ID and root/thread IDs.
+It reports only meaningful changes and can speak a concise final result through
+the same TTS path.
+
+The typed ACP completion seam may later provide a more authoritative structured
+signal, but the first intent broker does not depend on it.
+
+## 11. Repository Seams
+
+| File | Existing responsibility | Intent-delegation change |
+|---|---|---|
+| `crates/openab-core/src/discord_voice.rs` | PCM segmentation and retained transcript primitives | Add transport-neutral intent/confirmation state types or keep them in a new sibling module. |
+| `crates/openab-core/src/discord_voice_runtime.rs` | Songbird receive, STT workers, session generation | Feed final attributed transcript events to the intent broker; later own playback suppression. |
+| `crates/openab-core/src/discord.rs` | `/voice` commands and pinned control channel | Add intent lifecycle command/status output and deterministic mention dispatch. |
+| `crates/openab-core/src/config.rs` | Discord Voice and STT configuration | Add opt-in intent targets, timeout, parser, TTS, and later Realtime settings. Defaults remain disabled. |
+| `crates/openab-core/src/stt.rs` | OpenAI-compatible transcription | Reuse unchanged for the first parser backend. |
+| `crates/openab-core/src/acp_turn.rs` | Typed ACP result boundary | Optional later observation input; not required for initial dispatch. |
+| `src/main.rs` | Adapter and voice manager construction | Construct the intent broker and optional TTS/proposal backend. |
+
+A new sibling module such as `discord_voice_intent.rs` is preferred over adding
+all state-machine logic directly to the Songbird callback/runtime file.
+
+## 12. Implementation Slices
+
+### Slice 0 — Discord Voice receive foundation
+
+**State: implemented on the branch.**
+
+- Voice commands;
+- Songbird receive;
+- Discord speaker mapping;
+- PCM segmentation;
+- STT workers;
+- retained transcript; and
+- explicit ACP summary.
+
+### Slice 1 — Intent broker without TTS
+
+**State: not started.**
+
+- add target/task proposal types;
+- implement one-pending-intent state per guild/voice session;
+- start with a small target/task grammar;
+- post the confirmation question in the pinned text channel;
+- accept text yes/no/correction;
+- implement timeout and session replacement;
+- dispatch one real Discord mention exactly once;
+- add unit tests for every state transition; and
+- validate in `docker-desktop/openab-local`.
+
+### Slice 2 — Spoken confirmation
+
+**State: not started.**
+
+- route final STT segments to confirmation matching while an intent is pending;
+- accept spoken yes/no/correction from the same session;
+- ensure unrelated conversation does not resolve the pending state;
+- make duplicate/replayed STT harmless; and
+- retain text confirmation as a development fallback.
+
+### Slice 3 — Songbird TTS playback
+
+**State: not started. This is the first hands-free daily milestone.**
+
+- add a TTS provider contract;
+- add Songbird playback;
+- speak confirmation/sent/cancelled/error prompts;
+- suppress or ignore playback during capture;
+- keep v1 half-duplex; and
+- validate the complete no-screen flow in real Discord Voice.
+
+### Slice 4 — Realtime / GPT-Live proposal backend
+
+**State: not started.**
+
+- add a backend that emits `propose_delegation`;
+- preserve deterministic OpenAB confirmation and dispatch;
+- compare latency and intent quality against STT + parser; and
+- keep provider selection configurable.
+
+### Slice 5 — Thread observation and spoken reporting
+
+**State: not started.**
+
+- correlate the dispatch root message with the target agent thread;
+- observe accepted/running/question/completed/error states;
+- coalesce updates;
+- speak meaningful progress and final results; and
+- retain job state across reconnect or restart if daily use requires it.
 
 ## 13. Acceptance Scenarios
 
-1. The operator delegates a group PR review, hears one concise paraphrase, says
-   yes, and the broker posts to B0 without requiring the phone screen.
-2. The operator corrects "review and merge" to "review only"; only the corrected
-   intent reaches Discord.
-3. The operator asks for status and receives an answer without another
-   confirmation turn.
-4. A second task is delegated while the first is running; both continue and can
-   be referenced naturally.
-5. After posting, the broker says "sent"; only after thread/reaction evidence
-   does it say B0 started.
-6. The broker does not read every Discord message aloud. It reports only a
-   blocker, question, meaningful milestone, completion, or requested status.
-7. The operator interrupts a spoken update and immediately starts another
-   request.
-8. A Discord post fails; the broker says it was not sent and can retry without
-   creating a duplicate job.
-9. The device disconnects after dispatch; server-side tracking continues and a
-   later voice session can ask for the result.
-10. A broker restart resumes from stored root/thread/message IDs without
-    re-posting the delegation.
-11. The Discord audit clearly shows `b0-voice-broker` as the author and the
-    operator as the stated delegator.
-12. Existing B0-B15 coordination and ACP execution work without an OpenAB core
-    patch; only receiver configuration changes.
-13. The same voice script passes against the OpenAB-assisted track without any
-    additional operator confirmation or different spoken command.
-14. If the structured event stream disconnects, the broker continues tracking
-    from Discord without re-dispatching the job.
-15. In the assisted track, a spoken cancellation maps to the exact active turn
-    and the terminal spoken report comes from the structured result.
+### Intent broker
 
-## 14. Consequences
+1. "叫 Sam 看 canyugs/openab issue 20" produces one normalized proposal.
+2. Unknown or ambiguous target produces clarification, not dispatch.
+3. Explicit yes dispatches one real mention exactly once.
+4. Explicit no abandons without dispatch.
+5. A correction replaces the proposal and asks again.
+6. Timeout, `/voice stop`, or session replacement abandons the pending intent.
+7. Duplicate STT/provider events cannot post the task twice.
+8. A model proposal alone cannot dispatch.
+
+### Discord integration
+
+9. The message is posted in the pinned text channel under the voice bot's own
+   Discord identity.
+10. The target receives a real `<@...>` mention and enters its unchanged normal
+    bot-to-bot/ACP path.
+11. `trusted_bot_ids` admits the voice-dispatching bot without enabling all bot
+    chatter.
+12. A dispatch failure is reported as not sent and remains safe to retry.
+
+### Daily voice UX
+
+13. The operator hears the semantic paraphrase and can answer without looking
+    at Discord after Slice 3.
+14. "對", "不是", and a corrected task are distinguished consistently.
+15. The bot does not hear its own TTS as an affirmative confirmation.
+16. Confirmation, sent, cancelled, and error speech is short and bounded;
+    `/voice stop` terminates playback cleanly while conversational barge-in is
+    deferred.
+
+### Optional observation
+
+17. After Slice 5, OpenAB can say that the target started only after observing
+    corresponding Discord evidence.
+18. A final result is associated with the correct dispatched intent and is not
+    spoken into a replacement voice session accidentally.
+
+## 14. Alternatives Considered
+
+### External phone voice broker with no OpenAB changes
+
+Not selected for the first implementation. It offers a clean independent voice
+client, but duplicates Discord Voice/session behavior already implemented on
+this branch and moves the product away from its strongest existing foundation.
+
+It may remain useful later for a device-native assistant outside Discord Voice.
+
+### OCP-mediated voice delegation
+
+Not selected. OCP coordinates stock OpenAB runtimes; it does not need to own a
+platform interaction already handled by OpenAB's Discord adapter.
+
+### Send every transcript directly to ACP or Discord
+
+Rejected. The desired unit is a confirmed semantic intent, not a raw transcript.
+
+### Let Realtime call Discord directly
+
+Rejected. Realtime proposes an intent; deterministic application state performs
+the dispatch after confirmation.
+
+### Build TTS/full duplex before the intent state machine
+
+Rejected. Confirmation and exactly-once dispatch are the reusable core. TTS is
+added after those semantics exist, and full duplex can wait.
+
+## 15. Consequences
 
 ### Positive
 
-- The operator gets a genuinely hands-free daily workflow.
-- Confirmation fixes misunderstanding without forcing screen interaction.
-- OpenAB agents retain all existing coding and program-execution capabilities.
-- Discord remains the shared coordination and audit surface.
-- The broker's distinct bot identity makes voice-originated delegation visible.
-- Long-running work does not freeze the foreground conversation.
-- The first implementation is much smaller than an in-core voice action
-  subsystem.
-- Realtime, STT, and TTS providers remain replaceable behind the broker.
-- OpenAB-assisted status can be added later without replacing the working
-  Discord-native daily UX.
+- Reuses the branch's working Discord Voice receive and STT code.
+- Keeps real program execution in existing ACP agents.
+- Adds one small state machine instead of another execution runtime.
+- Preserves Discord bot identity and the existing multi-agent audit trail.
+- Allows a simple parser first and Realtime/Live later.
+- Provides a clear path from engineering scaffold to hands-free daily use.
+- Keeps OCP and target-agent code out of the first implementation.
 
 ### Trade-offs
 
-- The broker infers progress from Discord presentation-level events rather than
-  a structured OpenAB job API in Track A.
-- Receiver bot configuration must trust the broker and allow the target channel.
-- Good daily UX requires persistent job state, reconnection, and careful spoken
-  notification design.
-- The phone client and broker are additional deployable components even though
-  OpenAB core remains unchanged in Track A.
-- Track B adds an event/control surface that must remain compatible with the
-  existing message path and legacy callers.
+- The voice-dispatching OpenAB instance now owns additional conversation state.
+- Slice 1 is not yet the intended no-screen UX.
+- TTS requires Discord playback and half-duplex handling.
+- V1 allows only one pending confirmation per guild/session.
+- Background progress/reporting arrives after the core dispatch loop.
+- Full duplex, barge-in, wake words, and echo cancellation remain later work.
 
 ## References
 
-- [OpenAI Realtime API with WebRTC](https://developers.openai.com/api/docs/guides/realtime-webrtc)
-- [OpenAI Realtime conversations and function calling](https://developers.openai.com/api/docs/guides/realtime-conversations)
+- [Updated direction on canyugs/openab#20](https://github.com/canyugs/openab/issues/20#issuecomment-4951151976)
+- [Discord Voice receive ADR](discord-voice.md)
 - [OpenAB Discord multi-agent guide](../multi-agent.md)
-- [OpenAB Discord bot admission](../discord.md#trusted_bot_ids)
+- [OpenAB trusted bot admission](../discord.md#trusted_bot_ids)
+- [OpenAI Realtime conversations and function calling](https://developers.openai.com/api/docs/guides/realtime-conversations)
+- [Songbird](https://github.com/serenity-rs/songbird)
 - [Issue #1364](https://github.com/openabdev/openab/issues/1364)
 - [Issue #1368](https://github.com/openabdev/openab/issues/1368)
