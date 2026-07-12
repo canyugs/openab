@@ -110,6 +110,58 @@ sent to the configured STT endpoint; OpenAB does not write temporary audio files
 See the [Discord Voice Channel guide](discord-voice.md) for lifecycle, limitations,
 and the current validation status.
 
+### `[discord.voice.intent]` (experimental)
+
+Opt-in intent delegation for an active Discord Voice session. Final STT text can
+propose a task for a configured target; OpenAB then asks the session operator to
+confirm the interpreted target and task in the pinned text channel before posting
+one real Discord mention. Omitting this table, or leaving `enabled = false`, keeps
+the existing receive, transcript, and summary behavior unchanged.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable the experimental Slice 1 intent broker. `[discord.voice].enabled` and `[stt].enabled` must also be `true`. |
+| `confirmation_timeout_seconds` | u64 | `30` | Time allowed for the operator's text yes, no, or correction. Expiration abandons the pending intent and never dispatches it automatically. |
+
+Targets form a registry keyed by a stable canonical name:
+
+```toml
+[discord.voice.intent]
+enabled = true
+confirmation_timeout_seconds = 30
+
+[discord.voice.intent.targets.sam]
+discord_user_id = "<SAM_DISCORD_BOT_USER_ID>"
+aliases = ["Samuel", "山姆"]
+```
+
+Each `[discord.voice.intent.targets.<name>]` table supports:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `discord_user_id` | string | *required* | Real Discord user ID of the target bot. OpenAB constructs the final `<@USER_ID>` mention from this value; a display name is not sufficient. |
+| `aliases` | string[] | `[]` | Additional spoken names that resolve to this target. The canonical `<name>` is already a recognized alias, so aliases must not duplicate it after trimming and case normalization. Normalized aliases must also be unique across targets. |
+
+When intent delegation is enabled, configure at least one target. Unknown or
+ambiguous target names do not dispatch. Slice 1 accepts confirmation in Discord
+text; spoken confirmation, Voice Channel TTS, and task-result observation are
+later slices.
+
+Each receiving target bot keeps its normal OpenAB Discord/ACP flow. Allow the
+pinned dispatch channel and trust the voice-dispatching bot's **Discord user ID**:
+
+```toml
+[discord]
+allowed_channels = ["<VOICE_CONTROL_CHANNEL_ID>"]
+allow_bot_messages = "off"
+trusted_bot_ids = ["<VOICE_DISPATCH_BOT_USER_ID>"]
+```
+
+The explicit mention from a trusted bot passes the existing Discord admission
+path even with `allow_bot_messages = "off"`; enabling all bot messages is not
+required. See [Discord Voice intent delegation](discord-voice.md#intent-delegation-slice-1)
+for the interaction flow.
+
 ---
 
 ## `[slack]`

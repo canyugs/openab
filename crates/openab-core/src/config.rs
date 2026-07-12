@@ -1,7 +1,7 @@
 use crate::markdown::TableMode;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// Controls how incoming messages are dispatched to ACP turns.
@@ -510,6 +510,9 @@ pub struct DiscordVoiceConfig {
     /// Maximum retained transcript size per voice session.
     #[serde(default = "default_voice_max_transcript_bytes")]
     pub max_transcript_bytes: usize,
+    /// Optional voice-to-Discord intent delegation broker. Disabled by default.
+    #[serde(default)]
+    pub intent: DiscordVoiceIntentConfig,
 }
 
 impl Default for DiscordVoiceConfig {
@@ -522,8 +525,115 @@ impl Default for DiscordVoiceConfig {
             max_session_minutes: default_voice_max_session_minutes(),
             max_pending_segments: default_voice_max_pending_segments(),
             max_transcript_bytes: default_voice_max_transcript_bytes(),
+            intent: DiscordVoiceIntentConfig::default(),
         }
     }
+}
+
+/// Opt-in configuration for delegating confirmed voice intents to Discord bots.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscordVoiceIntentConfig {
+    /// Enable intent proposal and confirmation for finalized voice transcripts.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Time allowed for the operator to confirm or correct a proposed intent.
+    #[serde(default = "default_voice_intent_confirmation_timeout_seconds")]
+    pub confirmation_timeout_seconds: u64,
+    /// Canonical target name to Discord bot identity and optional spoken aliases.
+    #[serde(default)]
+    pub targets: BTreeMap<String, DiscordVoiceIntentTargetConfig>,
+}
+
+impl Default for DiscordVoiceIntentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            confirmation_timeout_seconds: default_voice_intent_confirmation_timeout_seconds(),
+            targets: BTreeMap::new(),
+        }
+    }
+}
+
+impl DiscordVoiceIntentConfig {
+    /// Validate the intent broker configuration when it is explicitly enabled.
+    ///
+    /// Disabled configurations are intentionally ignored so existing deployments
+    /// retain their previous text/voice-transcription behavior.
+    pub fn validate(&self, voice_enabled: bool) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            voice_enabled,
+            "discord.voice.intent.enabled requires discord.voice.enabled = true"
+        );
+        anyhow::ensure!(
+            self.confirmation_timeout_seconds > 0,
+            "discord.voice.intent.confirmation_timeout_seconds must be > 0"
+        );
+        anyhow::ensure!(
+            !self.targets.is_empty(),
+            "discord.voice.intent.targets must contain at least one target"
+        );
+
+        let mut aliases = HashMap::<String, String>::new();
+        for (canonical, target) in &self.targets {
+            anyhow::ensure!(
+                !canonical.trim().is_empty(),
+                "discord.voice.intent.targets contains a blank canonical target name"
+            );
+
+            let discord_user_id = target.discord_user_id.trim().parse::<u64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "discord.voice.intent.targets.{canonical}.discord_user_id must be a valid nonzero Discord user ID"
+                )
+            })?;
+            anyhow::ensure!(
+                discord_user_id > 0,
+                "discord.voice.intent.targets.{canonical}.discord_user_id must be a valid nonzero Discord user ID"
+            );
+
+            validate_voice_intent_alias(&mut aliases, canonical, canonical)?;
+            for alias in &target.aliases {
+                anyhow::ensure!(
+                    !alias.trim().is_empty(),
+                    "discord.voice.intent.targets.{canonical}.aliases must not contain blank values"
+                );
+                validate_voice_intent_alias(&mut aliases, alias, canonical)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// One Discord bot that may be addressed by a voice intent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscordVoiceIntentTargetConfig {
+    /// Discord user ID used to render the final `<@ID>` mention.
+    pub discord_user_id: String,
+    /// Additional names accepted by the intent resolver.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+fn validate_voice_intent_alias(
+    aliases: &mut HashMap<String, String>,
+    alias: &str,
+    canonical: &str,
+) -> anyhow::Result<()> {
+    let normalized = alias.trim().to_lowercase();
+    if let Some(existing) = aliases.insert(normalized.clone(), canonical.to_string()) {
+        anyhow::bail!(
+            "discord.voice.intent alias '{alias}' normalizes to '{normalized}', which is already used by target '{existing}'"
+        );
+    }
+    Ok(())
+}
+
+fn default_voice_intent_confirmation_timeout_seconds() -> u64 {
+    30
 }
 
 fn default_voice_silence_ms() -> u64 {
@@ -1501,6 +1611,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
             d.max_batch_tokens > 0,
             "discord.max_batch_tokens must be > 0"
         );
+        d.voice.intent.validate(d.voice.enabled)?;
     }
     if let Some(ref s) = config.slack {
         anyhow::ensure!(
@@ -2245,6 +2356,9 @@ command = "echo"
         assert_eq!(voice.max_session_minutes, 120);
         assert_eq!(voice.max_pending_segments, 8);
         assert_eq!(voice.max_transcript_bytes, 80_000);
+        assert!(!voice.intent.enabled);
+        assert_eq!(voice.intent.confirmation_timeout_seconds, 30);
+        assert!(voice.intent.targets.is_empty());
     }
 
     #[test]
@@ -2274,6 +2388,152 @@ command = "echo"
         assert_eq!(voice.max_session_minutes, 90);
         assert_eq!(voice.max_pending_segments, 8);
         assert_eq!(voice.max_transcript_bytes, 50_000);
+    }
+
+    #[test]
+    fn discord_voice_intent_config_parses_explicit_values() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[discord.voice]
+enabled = true
+
+[discord.voice.intent]
+enabled = true
+confirmation_timeout_seconds = 45
+
+[discord.voice.intent.targets.sam]
+discord_user_id = "123456789012345678"
+aliases = ["Samuel", "山姆"]
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let intent = cfg.discord.unwrap().voice.intent;
+        assert!(intent.enabled);
+        assert_eq!(intent.confirmation_timeout_seconds, 45);
+        let sam = intent.targets.get("sam").unwrap();
+        assert_eq!(sam.discord_user_id, "123456789012345678");
+        assert_eq!(sam.aliases, ["Samuel", "山姆"]);
+    }
+
+    fn valid_voice_intent_config() -> DiscordVoiceIntentConfig {
+        DiscordVoiceIntentConfig {
+            enabled: true,
+            confirmation_timeout_seconds: 30,
+            targets: BTreeMap::from([(
+                "sam".to_string(),
+                DiscordVoiceIntentTargetConfig {
+                    discord_user_id: "123456789012345678".to_string(),
+                    aliases: vec!["Samuel".to_string(), "山姆".to_string()],
+                },
+            )]),
+        }
+    }
+
+    #[test]
+    fn discord_voice_intent_enabled_requires_voice_capture() {
+        let err = valid_voice_intent_config().validate(false).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires discord.voice.enabled = true"));
+    }
+
+    #[test]
+    fn discord_voice_intent_validation_runs_during_config_parse() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+
+[discord.voice.intent]
+enabled = true
+
+[discord.voice.intent.targets.sam]
+discord_user_id = "123456789012345678"
+
+[agent]
+command = "echo"
+"#;
+        let err = parse_config(toml, "test").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires discord.voice.enabled = true"));
+    }
+
+    #[test]
+    fn discord_voice_intent_enabled_requires_nonzero_timeout() {
+        let mut intent = valid_voice_intent_config();
+        intent.confirmation_timeout_seconds = 0;
+        let err = intent.validate(true).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("confirmation_timeout_seconds must be > 0"));
+    }
+
+    #[test]
+    fn discord_voice_intent_enabled_requires_targets() {
+        let mut intent = valid_voice_intent_config();
+        intent.targets.clear();
+        let err = intent.validate(true).unwrap_err();
+        assert!(err.to_string().contains("must contain at least one target"));
+    }
+
+    #[test]
+    fn discord_voice_intent_rejects_blank_canonical_name() {
+        let mut intent = valid_voice_intent_config();
+        let target = intent.targets.remove("sam").unwrap();
+        intent.targets.insert("  ".to_string(), target);
+        let err = intent.validate(true).unwrap_err();
+        assert!(err.to_string().contains("blank canonical target name"));
+    }
+
+    #[test]
+    fn discord_voice_intent_rejects_blank_alias() {
+        let mut intent = valid_voice_intent_config();
+        intent.targets.get_mut("sam").unwrap().aliases = vec!["  ".to_string()];
+        let err = intent.validate(true).unwrap_err();
+        assert!(err.to_string().contains("must not contain blank values"));
+    }
+
+    #[test]
+    fn discord_voice_intent_rejects_invalid_or_zero_discord_user_id() {
+        for invalid_id in ["not-a-snowflake", "0"] {
+            let mut intent = valid_voice_intent_config();
+            intent.targets.get_mut("sam").unwrap().discord_user_id = invalid_id.to_string();
+            let err = intent.validate(true).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("must be a valid nonzero Discord user ID"));
+        }
+    }
+
+    #[test]
+    fn discord_voice_intent_rejects_normalized_alias_collisions() {
+        let mut intent = valid_voice_intent_config();
+        intent.targets.insert(
+            "b0".to_string(),
+            DiscordVoiceIntentTargetConfig {
+                discord_user_id: "987654321098765432".to_string(),
+                aliases: vec![" SAMUEL ".to_string()],
+            },
+        );
+        let err = intent.validate(true).unwrap_err();
+        assert!(
+            err.to_string().contains("already used by target 'b0'")
+                || err.to_string().contains("already used by target 'sam'")
+        );
+    }
+
+    #[test]
+    fn discord_voice_intent_disabled_preserves_backward_compatibility() {
+        let intent = DiscordVoiceIntentConfig {
+            enabled: false,
+            confirmation_timeout_seconds: 0,
+            targets: BTreeMap::new(),
+        };
+        assert!(intent.validate(false).is_ok());
     }
 
     #[test]

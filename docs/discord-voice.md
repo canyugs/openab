@@ -3,7 +3,9 @@
 > **Experimental status snapshot (2026-07-12):** The implementation on
 > `feat/discord-voice-receive` can register and run the `/voice` lifecycle, join
 > through Songbird 0.6, segment per-user decoded PCM, transcribe it, and explicitly
-> send a retained transcript to ACP for summary. Real Discord/DAVE, two-speaker,
+> send a retained transcript to ACP for summary. The opt-in Slice 1 intent broker
+> adds configured target resolution, text confirmation in the pinned control
+> channel, and deterministic Discord mention dispatch. Real Discord/DAVE, two-speaker,
 > DAVE-specific behavior, two-speaker attribution, reconnect, and long-running
 > validation have not passed yet. A live local deployment
 > now connects Discord, receives and attributes decoded audio, transcribes with Groq,
@@ -20,7 +22,11 @@ This guide records the intended setup, command contract, test environment, and c
 
 ## Purpose
 
-The feature lets an OpenAB bot join the Voice Channel that a user is currently in, transcribe participants as separate Discord speakers, and post an ACP-generated summary to the text channel or thread that started the session.
+The feature lets an OpenAB bot join the Voice Channel that a user is currently in,
+transcribe participants as separate Discord speakers, and post an ACP-generated
+summary to the text channel or thread that started the session. An additional
+opt-in intent broker can turn an operator's attributed speech into a proposed task,
+confirm the interpreted intent once in text, and delegate it to another OpenAB bot.
 
 ```text
 Discord Voice Channel
@@ -34,7 +40,16 @@ Discord Voice Channel
   → invoking Discord text channel/thread
 ```
 
-The first version listens and replies in text. It does not speak into the Voice Channel.
+```text
+operator speech
+  → STT target/task proposal
+  → text paraphrase and confirmation
+  → real Discord mention in the pinned control channel
+  → target bot's existing Discord and ACP flow
+```
+
+Slice 1 listens, confirms, and dispatches in text. It does not speak into the
+Voice Channel and is not yet the final no-screen experience.
 
 ## Current State
 
@@ -50,7 +65,9 @@ path is not proof that Discord is delivering complete, correctly attributed audi
 | STT pipeline | **Implemented on branch.** A bounded queue feeds workers that encode WAV in memory and call the existing STT client. No temporary audio files are written. Queue loss and STT failures are counted. |
 | Transcript | **Implemented on branch.** Text is retained in bounded process memory with user ID and timing metadata; evictions and rejected entries are counted. |
 | ACP summary | **Implemented with a security limitation.** Only explicit `/voice summary` submits the transcript. It uses the normal tool-capable ACP path; instructions in the prompt say the transcript is untrusted, but tools are not technically disabled. |
-| Automated branch verification | **Partial pass.** Default and unified Clippy pass; 39 voice/config/runtime tests pass. Both Discord-only ring and unified AWS-LC regression tests call the original Rustls panic point successfully. Workspace tests reach 687 passes with one pre-existing macOS `/bin/false` failure. Repository-wide fmt, Windows, and complete live Discord validation remain pending. |
+| Intent delegation Slice 1 | **Experimental and opt-in on branch.** A configured target/task request creates one pending intent, posts a semantic paraphrase in the pinned text channel, accepts the session operator's text yes/no/correction, and dispatches one real Discord mention after confirmation. It is disabled by default. |
+| Spoken confirmation, TTS, and result observation | **Later slices.** Slice 1 does not interpret a spoken yes/no, play confirmation audio, or poll the target bot's task thread for progress and completion. |
+| Automated branch verification | **Partial pass.** `cargo clippy --all-targets --features discord -- -D warnings`, 78 voice/config/runtime tests, and the 16 binary tests pass. The core library run reaches 729/730 with one pre-existing macOS `/bin/false` assertion failure. Repository-wide fmt still reports pre-existing drift; Windows and complete live Discord validation remain pending. |
 | Local Kubernetes runtime smoke | **Passed and retired.** The original credential-free image reached `1/1 Running` with zero restarts. Its temporary Helm release was removed after the live deployment replaced it. |
 | Discord, Groq, and Claude readiness | **Passed locally.** The bot connects, global commands register, Groq accepts the configured STT model, Claude OAuth persists on PVC, and a Discord-to-Claude ACP turn completes without an authentication error. |
 | Live Discord receive evidence | **Passed for one speaker.** After commit `7b8f90f` fixed the unified Rustls provider ambiguity, `/voice join`, decoded receive, speaker attribution, timestamping, and transcript download worked in a real Voice Channel. The subsequent rollout ended the session; explicit `/voice stop` and DAVE behavior remain separate checks. |
@@ -186,7 +203,30 @@ max_pending_segments = 8
 max_transcript_bytes = 80000
 ```
 
+Intent delegation is independently opt-in. Register each target bot under a
+stable name and list the names that the operator may say:
+
+```toml
+[discord.voice.intent]
+enabled = true
+confirmation_timeout_seconds = 30
+
+[discord.voice.intent.targets.sam]
+discord_user_id = "<SAM_DISCORD_BOT_USER_ID>"
+aliases = ["Samuel", "山姆"]
+```
+
 The default is `false`. Omitting `[discord.voice]` must preserve all existing Discord behavior and must not cause the bot to join or listen to a Voice Channel.
+
+`[discord.voice.intent].enabled` also defaults to `false`. Omitting it preserves
+the existing Voice receive, transcript, and explicit summary behavior. Enabling
+it requires Voice Channel receive, STT, a positive confirmation timeout, and at
+least one target. The target table name is its canonical name and is recognized
+alongside its `aliases`; `discord_user_id` must be the target bot's real Discord
+user ID so OpenAB can emit a valid mention token. Because the canonical table name
+is already an alias, do not repeat it in `aliases`, including variants that differ
+only by surrounding whitespace or letter case. Normalized aliases must be unique
+across all targets.
 
 `allowed_channels` under `[discord.voice]` restricts which **Voice Channels** may
 be joined. `[discord].allowed_channels` independently gates the text channel or
@@ -216,6 +256,74 @@ timeout notice and requests no summary.
 After `/voice stop`, STT work that did not drain within 30 seconds may continue.
 The transcript remains in process memory for later explicit summary/status use until
 a new session for that guild replaces it or the OpenAB process exits.
+
+## Intent Delegation (Slice 1)
+
+The text channel or thread that runs `/voice join` is also the initial intent
+confirmation and dispatch destination. The user who starts that session is the
+operator allowed to resolve its pending intent.
+
+A typical Slice 1 interaction is:
+
+```text
+Can, in the Voice Channel:
+  "叫 Sam 看 canyugs/openab issue 20"
+
+OpenAB, in the pinned text channel:
+  "我理解為：要請 Sam 看 canyugs/openab#20 嗎？
+   請回覆「對」、「不是」，或用「更正：...」修正。"
+
+Can, in text:
+  "對"
+
+OpenAB:
+  <@SAM_DISCORD_BOT_USER_ID> Can asked via voice:
+  請看 canyugs/openab#20
+```
+
+The confirmation approves the semantic target and task, not the exact wording of
+the final Discord message. The broker owns the destination, mention token, and
+dispatch idempotency; a parser, LLM, or future Realtime/Live backend may only
+propose the intent.
+
+Slice 1 rules:
+
+1. One guild and active Voice-session generation can have only one pending intent.
+2. A text yes dispatches it at most once; repeated confirmation cannot duplicate the task.
+3. A text no cancels it without dispatch.
+4. A text correction replaces the pending target/task and asks for confirmation again.
+5. Timeout, `/voice stop`, or replacing the Voice session abandons the pending intent.
+6. Unknown or ambiguous configured targets do not dispatch.
+
+The initial deterministic parser deliberately recognizes only a simple,
+single-target command shape such as `叫 Sam review openab issue 20`. If another
+configured target alias appears later in the task, the whole utterance is
+rejected rather than guessing the addressee. Unknown, ambiguous, or incomplete
+commands are currently silent no-ops; typed clarification and target-head
+coordination grammar remain follow-up work. During validation, use
+`/voice transcript` to distinguish an STT mismatch from a parser rejection.
+
+The receiving target does not need new Rust code. It handles the broker's message
+through the existing bot-to-bot Discord and ACP path. On every target bot, allow
+the pinned text channel and trust the voice-dispatching bot identity:
+
+```toml
+[discord]
+allowed_channels = ["<VOICE_CONTROL_CHANNEL_ID>"]
+allow_bot_messages = "off"
+trusted_bot_ids = ["<VOICE_DISPATCH_BOT_USER_ID>"]
+```
+
+The final dispatch contains a real `<@TARGET_BOT_USER_ID>` mention, so the existing
+trusted-bot mention admission works without changing `allow_bot_messages` to
+`"all"`.
+
+This first slice is an engineering scaffold, not the final daily hands-free UX:
+
+- Slice 2 accepts spoken yes/no/correction from the same Voice session.
+- Slice 3 adds Songbird TTS for confirmation, sent, cancelled, and error prompts.
+- A later observation slice follows the target thread and reports meaningful
+  progress and the final result.
 
 Intended flow:
 
@@ -268,6 +376,14 @@ Code compiling is not sufficient. Before reporting the feature as usable, record
 - [ ] No PCM/WAV files are written; in-memory WAV buffers are released after STT work.
 - [ ] Consent/start/stop notices are visible in the control channel.
 - [ ] Session timeout causes a leave and an observable log; the lack of a public timeout notice is recorded as a known limitation.
+
+For the optional Slice 1 intent broker, also verify:
+
+- [ ] A configured spoken target produces one paraphrased confirmation in the pinned text channel.
+- [ ] Text yes sends exactly one real target-bot mention; duplicate yes does not send twice.
+- [ ] Text no, correction, timeout, `/voice stop`, and session replacement follow the documented pending-intent rules.
+- [ ] An unknown or ambiguous target never dispatches.
+- [ ] The receiving bot admits the trusted voice bot's mention and starts its normal Discord/ACP flow.
 
 Keep the feature marked experimental until these checks pass on the same build artifact intended for deployment.
 

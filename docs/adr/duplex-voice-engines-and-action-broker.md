@@ -1,8 +1,8 @@
 # ADR: Discord Voice Intent Delegation
 
-- **Status:** Proposed — Discord Voice intent-delegation direction selected
+- **Status:** Accepted — Slice 1 implemented; local end-to-end validation pending
 - **Date:** 2026-07-12
-- **Implementation:** Voice receive foundation implemented; intent broker not started
+- **Implementation:** Voice receive foundation and opt-in text-confirmed intent broker implemented
 - **Implementation branch:** `feat/discord-voice-receive`
 - **Direction update:** [canyugs/openab#20 comment 4951151976](https://github.com/canyugs/openab/issues/20#issuecomment-4951151976)
 - **Related:** [Discord Voice receive ADR](discord-voice.md), [Discord multi-agent guide](../multi-agent.md), [Issue #1364](https://github.com/openabdev/openab/issues/1364), [Issue #1368](https://github.com/openabdev/openab/issues/1368)
@@ -157,9 +157,9 @@ without helping the initial intent-confirmation loop.
 | PCM segmentation and bounded STT queue | **Implemented** | Per-user 48 kHz stereo segmentation, in-memory WAV encoding, bounded workers, and drop accounting exist. |
 | STT and retained transcript | **Implemented; accuracy retry pending** | Groq `whisper-large-v3` with `language = "zh"` is deployed. The first sample was not reliable enough. |
 | Explicit ACP transcript summary | **Implemented** | `/voice summary` uses the current normal ACP path. This remains separate from intent delegation. |
-| Intent proposal/parser | **Not started** | No target/task parser or `propose_delegation` backend exists. |
-| Pending intent state machine | **Not started** | No `WaitingConfirmation`, correction, timeout, or exactly-once dispatch state exists. |
-| Text confirmation and voice-specific mention dispatch | **Not started** | Slice 1 has not been implemented. |
+| Intent proposal/parser | **Implemented for the Slice 1 simple grammar** | Resolves one configured target in command-shaped speech. Target-head coordination grammar and typed clarification remain pending. |
+| Pending intent state machine | **Implemented and unit-tested** | Session/operator binding, posting/waiting/dispatching phases, correction, timeout generations, replay protection, and stale-session cleanup exist. |
+| Text confirmation and voice-specific mention dispatch | **Implemented; live flow pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch are wired. Local Discord end-to-end validation is still required. |
 | Spoken yes/no/correction | **Not started** | Captured transcript is not interpreted as confirmation state. |
 | TTS and Songbird playback | **Not started** | There is no TTS provider or playback consumer. |
 | Realtime / GPT-Live proposal backend | **Not started** | No Realtime session or tool/event integration exists. |
@@ -454,7 +454,7 @@ all state-machine logic directly to the Songbird callback/runtime file.
 
 ### Slice 1 — Intent broker without TTS
 
-**State: not started.**
+**State: implemented in code and automated tests; local Discord end-to-end validation pending.**
 
 - add target/task proposal types;
 - implement one-pending-intent state per guild/voice session;
@@ -465,6 +465,17 @@ all state-machine logic directly to the Songbird callback/runtime file.
 - dispatch one real Discord mention exactly once;
 - add unit tests for every state transition; and
 - validate in `docker-desktop/openab-local`.
+
+The first deterministic parser intentionally has two documented limitations:
+
+- it supports command-shaped speech with one configured target, such as
+  `叫 Sam review openab issue 20`; if another configured target alias appears
+  later in the task text, the utterance is rejected rather than guessing which
+  bot is the addressee; and
+- unknown, ambiguous, or missing-target requests are currently ignored instead
+  of producing the clarification required by acceptance scenario 2. Use
+  `/voice transcript` while validating STT/parser mismatches. Typed resolution
+  reasons and spoken/text clarification are follow-up work.
 
 ### Slice 2 — Spoken confirmation
 

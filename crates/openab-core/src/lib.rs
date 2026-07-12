@@ -32,6 +32,8 @@ pub mod discord;
 #[cfg(feature = "discord")]
 pub mod discord_voice;
 #[cfg(feature = "discord")]
+pub mod discord_voice_intent;
+#[cfg(feature = "discord")]
 pub mod discord_voice_runtime;
 #[cfg(feature = "discord")]
 pub mod ambient;

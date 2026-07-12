@@ -20,12 +20,12 @@ This table records implementation state separately from runtime validation. Upda
 | `VoiceTick`/`SpeakingStateUpdate` capture | **Implemented on branch** | SSRCs map to Discord users; per-user 48 kHz stereo buffers segment decoded PCM in the callback using audio-sample silence and duration bounds. |
 | Bounded STT and transcript pipeline | **Implemented on branch** | Only completed segments enter a bounded queue. Workers encode WAV in memory, call `stt::transcribe`, and append to a bounded transcript; no audio files are written. |
 | ACP summary dispatch | **Implemented with an unresolved security limitation** | Only explicit `/voice summary` uses the pinned control channel's normal, tool-capable ACP path. Transcript-as-data behavior is prompt-enforced, not sandbox-enforced. |
-| Automated verification | **Partial pass** | Default and unified Clippy pass; 39 voice/config/runtime tests pass. Discord-only ring and unified AWS-LC tests both call the original Rustls builder panic point successfully. The current core library suite lists 690 tests; the most recent full run had one pre-existing macOS `/bin/false` assertion failure while the new typed-turn suites passed. Repository-wide fmt and Windows verification remain pending. |
+| Automated verification | **Partial pass** | `cargo clippy --all-targets --features discord -- -D warnings`, 78 voice/config/runtime tests, and 16 binary tests pass. The current core library run reaches 729/730 with one pre-existing macOS `/bin/false` assertion failure. Repository-wide fmt still reports pre-existing drift; Windows verification remains pending. |
 | Local Kubernetes artifact/runtime smoke | **Passed** | Image `sha256:661d58c5934332ccb4222b7b18e4063cb0d8f9949aec110938bf1928bb1250b9` reached `1/1 Running` with zero restarts in `docker-desktop/openab-local` as Helm release `openab-voice-smoke`. The smoke ran without Discord/STT credentials and is not Voice receive evidence. |
 | Local Discord/Groq/Claude readiness | **Passed** | The live `openab-voice` release connects the bot, registers global commands, verifies the configured Groq model, persists Claude OAuth, and completes a Discord-to-Claude ACP turn. |
 | Real Discord receive | **Passed for one speaker** | The first Songbird join exposed a Rustls 0.23 provider ambiguity in unified builds. Commit `7b8f90f` explicitly selects AWS-LC when AgentCore features are present and ring for Discord-only builds. After that fix, join, decoded receive, attribution, timestamps, and raw transcript download passed. The rollout ended the session; explicit stop and DAVE remain separate checks. |
 | STT accuracy sample | **Failed; controlled retry pending** | The first four-segment raw transcript preserved one-speaker attribution and timing, but contained an ellipsis-only segment, an incorrect-language hallucination, and unreliable Chinese text. Image `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88` is deployed with `whisper-large-v3` plus `language = "zh"` for the next A/B sample. |
-| Voice intent broker | **Direction selected; implementation not started** | The follow-on path will turn attributed transcript into a pending semantic intent, confirm it, and dispatch a real Discord mention exactly once. |
+| Voice intent broker | **Slice 1 implemented; live validation pending** | Attributed operator transcript can resolve a simple one-target command, ask for text confirmation, and dispatch a nonce-enforced real Discord mention exactly once. Target-head coordination grammar and typed clarification remain follow-up work. |
 | Spoken confirmation and TTS | **Not started** | Text confirmation is the first engineering slice. Spoken yes/no plus Songbird TTS is the first hands-free daily milestone. |
 | Realtime/Live and result observation | **Not started; optional later slices** | Realtime/Live must emit the same proposal contract. Thread observation must not block the initial confirmed-dispatch loop. |
 | Two-speaker and reconnect soak test | **Pending real-world validation** | Attribution, reconnect health beyond a unit state transition, and a 30-minute minimum soak remain unverified. |
@@ -392,10 +392,10 @@ observability gap rather than inferring health from connection state.
 ### Code and Unit Verification
 
 - [x] Targeted Discord-feature `cargo check` passes.
-- [x] 39 targeted voice/config/runtime tests pass.
+- [x] 78 targeted voice/config/runtime tests pass.
 - [ ] `cargo fmt`
 - [x] `cargo clippy -- -D warnings`
-- [ ] `cargo test --workspace` (one unrelated macOS `/bin/false` test fails locally; targeted new suites pass and the current core library lists 690 tests)
+- [ ] `cargo test --workspace` (the core library reaches 729/730; one unrelated macOS `/bin/false` assertion still fails locally while the targeted new suites pass)
 - [ ] `cargo check --target x86_64-pc-windows-gnu`
 - [x] Default/omitted `[discord.voice]` leaves voice disabled in config/runtime tests.
 - [ ] Disabled voice does not register active receive work or join channels.
@@ -435,7 +435,7 @@ observability gap rather than inferring health from connection state.
 ## 13. Rollout
 
 1. Land the receive-only implementation behind `enabled = false`.
-2. Complete full-repository verification beyond the passing targeted check and 39 tests.
+2. Complete full-repository verification beyond the passing targeted check and 78 tests.
 3. Run the real Discord/DAVE checklist in a private test server.
 4. Record measured loss, STT latency, memory growth, and reconnect behavior.
 5. Keep the feature experimental until the soak criteria pass.

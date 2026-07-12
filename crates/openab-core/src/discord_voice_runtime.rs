@@ -9,6 +9,7 @@ use crate::discord_voice::{
     PcmCaptureConfig, PcmSegment, SpeakerPcmBuffer, TranscriptEntry, TranscriptStore,
     VoiceDropCounters, VoiceDropSnapshot,
 };
+use crate::discord_voice_intent::{DiscordVoiceIntentBroker, FinalTranscriptEvent, TranscriptKey};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use songbird::model::payload::{ClientDisconnect, Speaking};
@@ -74,6 +75,14 @@ impl VoiceSessionToken {
     pub fn guild_id(self) -> u64 {
         self.guild_id
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(guild_id: u64, session_id: u64) -> Self {
+        Self {
+            guild_id,
+            session_id,
+        }
+    }
 }
 
 struct SegmentJob {
@@ -81,6 +90,19 @@ struct SegmentJob {
     start_frame: u64,
     end_frame: u64,
     segment: PcmSegment,
+}
+
+struct CompletedSegment {
+    speaker_id: u64,
+    start_frame: u64,
+    end_frame: u64,
+    transcript: Option<String>,
+}
+
+struct IntentWorkerContext {
+    tx: mpsc::Sender<FinalTranscriptEvent>,
+    token: VoiceSessionToken,
+    control_channel_id: u64,
 }
 
 struct SpeakerCapture {
@@ -116,6 +138,7 @@ pub struct DiscordVoiceManager {
     allowed_voice_channels: HashSet<u64>,
     sessions: Mutex<HashMap<u64, VoiceSession>>,
     songbird: OnceLock<Arc<songbird::Songbird>>,
+    intent_broker: OnceLock<Arc<DiscordVoiceIntentBroker>>,
     next_session_id: AtomicU64,
 }
 
@@ -170,6 +193,7 @@ impl DiscordVoiceManager {
             allowed_voice_channels,
             sessions: Mutex::new(HashMap::new()),
             songbird: OnceLock::new(),
+            intent_broker: OnceLock::new(),
             next_session_id: AtomicU64::new(1),
         }))
     }
@@ -188,6 +212,19 @@ impl DiscordVoiceManager {
 
     pub fn attach_songbird(&self, songbird: Arc<songbird::Songbird>) {
         let _ = self.songbird.set(songbird);
+    }
+
+    /// Attaches the optional intent broker before the first voice session.
+    /// Existing deployments that do not attach one retain transcript-only
+    /// behavior.
+    pub fn attach_intent_broker(&self, broker: Arc<DiscordVoiceIntentBroker>) {
+        let _ = self.intent_broker.set(broker);
+    }
+
+    fn abandon_intent_session(&self, token: VoiceSessionToken) {
+        if let Some(broker) = self.intent_broker.get() {
+            broker.abandon_session(token);
+        }
     }
 
     /// Creates capture state before Songbird joins so early receive events are
@@ -213,6 +250,10 @@ impl DiscordVoiceManager {
         }
 
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        let token = VoiceSessionToken {
+            guild_id,
+            session_id,
+        };
         let transcript = Arc::new(Mutex::new(
             TranscriptStore::new(MAX_TRANSCRIPT_ENTRIES, self.config.max_transcript_bytes)
                 .context("invalid Discord voice transcript limits")?,
@@ -258,8 +299,27 @@ impl DiscordVoiceManager {
                 ));
             }
         }
-        sessions.insert(guild_id, session);
+        let replaced_token = sessions
+            .insert(guild_id, session)
+            .map(|replaced| VoiceSessionToken {
+                guild_id,
+                session_id: replaced.id,
+            });
         drop(sessions);
+
+        if let Some(replaced_token) = replaced_token {
+            self.abandon_intent_session(replaced_token);
+        }
+
+        let intent = self.intent_broker.get().cloned().map(|broker| {
+            let (tx, rx) = mpsc::channel(self.config.max_pending_segments);
+            drop(spawn_intent_worker(rx, broker));
+            IntentWorkerContext {
+                tx,
+                token,
+                control_channel_id,
+            }
+        });
 
         spawn_stt_worker(
             segment_rx,
@@ -268,12 +328,9 @@ impl DiscordVoiceManager {
             stt_failures,
             drops,
             self.stt_config.clone(),
+            intent,
         );
 
-        let token = VoiceSessionToken {
-            guild_id,
-            session_id,
-        };
         let manager = Arc::downgrade(self);
         let timeout = Duration::from_secs(self.config.max_session_minutes.saturating_mul(60));
         tokio::spawn(async move {
@@ -302,12 +359,11 @@ impl DiscordVoiceManager {
 
     pub fn note_reconnected(&self, token: VoiceSessionToken, channel_id: u64) -> bool {
         let channel_allowed = self.voice_channel_allowed(channel_id);
-        if let Some(session) = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&token.guild_id)
-        {
+        let (reconnected, abandon_intent) = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(session) = sessions.get_mut(&token.guild_id) else {
+                return false;
+            };
             if session.id != token.session_id {
                 return false;
             }
@@ -316,29 +372,35 @@ impl DiscordVoiceManager {
                 session.state = VoiceConnectionState::Failed;
                 session.ended_at.get_or_insert_with(Instant::now);
                 session.segment_tx.take();
-                return false;
+                (false, true)
+            } else {
+                if session.state == VoiceConnectionState::Listening {
+                    flush_all_captures(session);
+                    session.captures.clear();
+                    session.ssrc_to_user.clear();
+                    session.user_to_ssrc.clear();
+                }
+                (
+                    matches!(
+                        session.state,
+                        VoiceConnectionState::Connecting | VoiceConnectionState::Listening
+                    ),
+                    false,
+                )
             }
-            if session.state == VoiceConnectionState::Listening {
-                flush_all_captures(session);
-                session.captures.clear();
-                session.ssrc_to_user.clear();
-                session.user_to_ssrc.clear();
-            }
-            return matches!(
-                session.state,
-                VoiceConnectionState::Connecting | VoiceConnectionState::Listening
-            );
+        };
+        if abandon_intent {
+            self.abandon_intent_session(token);
         }
-        false
+        reconnected
     }
 
     pub fn mark_driver_failed(&self, token: VoiceSessionToken) {
-        if let Some(session) = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&token.guild_id)
-        {
+        let abandon_intent = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(session) = sessions.get_mut(&token.guild_id) else {
+                return;
+            };
             if session.id == token.session_id
                 && matches!(
                     session.state,
@@ -349,17 +411,30 @@ impl DiscordVoiceManager {
                 session.state = VoiceConnectionState::Failed;
                 session.ended_at.get_or_insert_with(Instant::now);
                 session.segment_tx.take();
+                true
+            } else {
+                false
             }
+        };
+        if abandon_intent {
+            self.abandon_intent_session(token);
         }
     }
 
     pub fn discard_session(&self, token: VoiceSessionToken) {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if sessions
+        let removed = if sessions
             .get(&token.guild_id)
             .is_some_and(|session| session.id == token.session_id)
         {
             sessions.remove(&token.guild_id);
+            true
+        } else {
+            false
+        };
+        drop(sessions);
+        if removed {
+            self.abandon_intent_session(token);
         }
     }
 
@@ -368,30 +443,30 @@ impl DiscordVoiceManager {
         let session = sessions
             .get_mut(&guild_id)
             .ok_or_else(|| anyhow!("no Discord voice session exists in this guild"))?;
-        if session.state == VoiceConnectionState::Stopping {
-            let token = VoiceSessionToken {
-                guild_id,
-                session_id: session.id,
-            };
-            return Ok((token, status_snapshot(guild_id, session)));
-        }
-        if !matches!(
-            session.state,
-            VoiceConnectionState::Connecting
-                | VoiceConnectionState::Listening
-                | VoiceConnectionState::Failed
-        ) {
-            return Err(anyhow!("the Discord voice session is not active"));
-        }
-        flush_all_captures(session);
-        session.state = VoiceConnectionState::Stopping;
-        session.ended_at.get_or_insert_with(Instant::now);
-        session.segment_tx.take();
         let token = VoiceSessionToken {
             guild_id,
             session_id: session.id,
         };
-        Ok((token, status_snapshot(guild_id, session)))
+        let status = if session.state == VoiceConnectionState::Stopping {
+            status_snapshot(guild_id, session)
+        } else {
+            if !matches!(
+                session.state,
+                VoiceConnectionState::Connecting
+                    | VoiceConnectionState::Listening
+                    | VoiceConnectionState::Failed
+            ) {
+                return Err(anyhow!("the Discord voice session is not active"));
+            }
+            flush_all_captures(session);
+            session.state = VoiceConnectionState::Stopping;
+            session.ended_at.get_or_insert_with(Instant::now);
+            session.segment_tx.take();
+            status_snapshot(guild_id, session)
+        };
+        drop(sessions);
+        self.abandon_intent_session(token);
+        Ok((token, status))
     }
 
     pub fn start_stopping_token(&self, token: VoiceSessionToken) -> Result<VoiceSessionStatus> {
@@ -402,22 +477,26 @@ impl DiscordVoiceManager {
         if session.id != token.session_id {
             return Err(anyhow!("the Discord voice session was replaced"));
         }
-        if session.state == VoiceConnectionState::Stopping {
-            return Ok(status_snapshot(token.guild_id, session));
-        }
-        if !matches!(
-            session.state,
-            VoiceConnectionState::Connecting
-                | VoiceConnectionState::Listening
-                | VoiceConnectionState::Failed
-        ) {
-            return Err(anyhow!("the Discord voice session is not active"));
-        }
-        flush_all_captures(session);
-        session.state = VoiceConnectionState::Stopping;
-        session.ended_at.get_or_insert_with(Instant::now);
-        session.segment_tx.take();
-        Ok(status_snapshot(token.guild_id, session))
+        let status = if session.state == VoiceConnectionState::Stopping {
+            status_snapshot(token.guild_id, session)
+        } else {
+            if !matches!(
+                session.state,
+                VoiceConnectionState::Connecting
+                    | VoiceConnectionState::Listening
+                    | VoiceConnectionState::Failed
+            ) {
+                return Err(anyhow!("the Discord voice session is not active"));
+            }
+            flush_all_captures(session);
+            session.state = VoiceConnectionState::Stopping;
+            session.ended_at.get_or_insert_with(Instant::now);
+            session.segment_tx.take();
+            status_snapshot(token.guild_id, session)
+        };
+        drop(sessions);
+        self.abandon_intent_session(token);
+        Ok(status)
     }
 
     pub fn finish_stop(&self, token: VoiceSessionToken) -> Option<VoiceSessionStatus> {
@@ -561,6 +640,7 @@ impl DiscordVoiceManager {
             true
         };
         if should_remove {
+            self.abandon_intent_session(token);
             warn!(
                 guild_id = token.guild_id,
                 "Discord voice session reached its maximum duration"
@@ -787,6 +867,7 @@ fn spawn_stt_worker(
     stt_failures: Arc<AtomicU64>,
     drops: Arc<VoiceDropCounters>,
     stt_config: SttConfig,
+    intent: Option<IntentWorkerContext>,
 ) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
@@ -828,28 +909,92 @@ fn spawn_stt_worker(
                 }
             };
 
-            if let Some(text) = result {
-                let entry = TranscriptEntry {
+            complete_segment_job(
+                &transcript,
+                &pending_segments,
+                &stt_failures,
+                &drops,
+                intent.as_ref(),
+                CompletedSegment {
                     speaker_id,
-                    speaker_name: format!("<@{speaker_id}>"),
                     start_frame,
                     end_frame,
-                    text,
-                };
-                let outcome = transcript
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(entry);
-                if !outcome.accepted {
-                    drops.record_transcript();
-                }
-            } else {
-                stt_failures.fetch_add(1, Ordering::Relaxed);
-            }
-            pending_segments.fetch_sub(1, Ordering::Relaxed);
+                    transcript: result,
+                },
+            );
         }
         debug!("Discord voice STT worker stopped");
     });
+}
+
+fn complete_segment_job(
+    transcript: &Mutex<TranscriptStore>,
+    pending_segments: &AtomicU64,
+    stt_failures: &AtomicU64,
+    drops: &VoiceDropCounters,
+    intent: Option<&IntentWorkerContext>,
+    completed: CompletedSegment,
+) {
+    if let Some(text) = completed.transcript {
+        let entry = TranscriptEntry {
+            speaker_id: completed.speaker_id,
+            speaker_name: format!("<@{}>", completed.speaker_id),
+            start_frame: completed.start_frame,
+            end_frame: completed.end_frame,
+            text,
+        };
+        let intent_text = intent.map(|_| entry.text.clone());
+        let outcome = {
+            let mut transcript = transcript.lock().unwrap_or_else(|e| e.into_inner());
+            transcript.push(entry)
+        };
+        if !outcome.accepted {
+            drops.record_transcript();
+        } else if let (Some(intent), Some(text)) = (intent, intent_text) {
+            let event = FinalTranscriptEvent {
+                token: intent.token,
+                control_channel_id: intent.control_channel_id,
+                key: TranscriptKey {
+                    speaker_id: completed.speaker_id,
+                    start_frame: completed.start_frame,
+                    end_frame: completed.end_frame,
+                },
+                text,
+            };
+            if let Err(err) = intent.tx.try_send(event) {
+                warn!(
+                    guild_id = intent.token.guild_id,
+                    speaker_id = completed.speaker_id,
+                    error = %err,
+                    "dropping Discord voice intent event because its bounded queue is unavailable"
+                );
+            }
+        }
+    } else {
+        stt_failures.fetch_add(1, Ordering::Relaxed);
+    }
+    pending_segments.fetch_sub(1, Ordering::Relaxed);
+}
+
+fn spawn_intent_worker(
+    mut rx: mpsc::Receiver<FinalTranscriptEvent>,
+    broker: Arc<DiscordVoiceIntentBroker>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let guild_id = event.token.guild_id;
+            let speaker_id = event.key.speaker_id;
+            if let Err(err) = broker.handle_final_transcript(event).await {
+                warn!(
+                    guild_id,
+                    speaker_id,
+                    error = %err,
+                    "Discord voice intent broker failed to handle a final transcript event"
+                );
+            }
+        }
+        debug!("Discord voice intent worker stopped");
+    })
 }
 
 fn status_snapshot(guild_id: u64, session: &VoiceSession) -> VoiceSessionStatus {
@@ -976,6 +1121,78 @@ impl VoiceEventHandler for DiscordVoiceReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DiscordVoiceIntentConfig, DiscordVoiceIntentTargetConfig};
+    use crate::discord_voice_intent::VoiceIntentMessenger;
+    use std::collections::BTreeMap;
+    use tokio::sync::Notify;
+
+    struct NoopIntentMessenger;
+
+    #[async_trait]
+    impl VoiceIntentMessenger for NoopIntentMessenger {
+        async fn send_message(
+            &self,
+            _channel_id: u64,
+            _content: &str,
+            _nonce: Option<&str>,
+        ) -> Result<String> {
+            Ok("noop-message".to_string())
+        }
+
+        async fn delete_message(&self, _channel_id: u64, _message_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingIntentMessenger {
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl VoiceIntentMessenger for BlockingIntentMessenger {
+        async fn send_message(
+            &self,
+            _channel_id: u64,
+            _content: &str,
+            _nonce: Option<&str>,
+        ) -> Result<String> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok("blocking-message".to_string())
+        }
+
+        async fn delete_message(&self, _channel_id: u64, _message_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn voice_manager_with_intent() -> (Arc<DiscordVoiceManager>, Arc<DiscordVoiceIntentBroker>) {
+        let voice = DiscordVoiceConfig {
+            enabled: true,
+            ..DiscordVoiceConfig::default()
+        };
+        let stt = SttConfig {
+            enabled: true,
+            api_key: "test".into(),
+            ..SttConfig::default()
+        };
+        let manager = DiscordVoiceManager::new(voice, stt).unwrap();
+        let intent = DiscordVoiceIntentConfig {
+            enabled: true,
+            confirmation_timeout_seconds: 30,
+            targets: BTreeMap::from([(
+                "B0".to_string(),
+                DiscordVoiceIntentTargetConfig {
+                    discord_user_id: "9000".to_string(),
+                    aliases: Vec::new(),
+                },
+            )]),
+        };
+        let broker = DiscordVoiceIntentBroker::new(intent, Arc::new(NoopIntentMessenger)).unwrap();
+        manager.attach_intent_broker(broker.clone());
+        (manager, broker)
+    }
 
     #[test]
     fn voice_manager_defaults_are_backward_compatible() {
@@ -1045,6 +1262,158 @@ mod tests {
         manager.expire_session(old).await;
         assert!(manager.status(1).unwrap().is_active());
         assert_eq!(manager.session_token(1), Some(replacement));
+    }
+
+    #[tokio::test]
+    async fn terminal_voice_lifecycle_abandons_the_exact_intent_session() {
+        let (manager, broker) = voice_manager_with_intent();
+        let stopped = manager.begin_session(1, 2, 3).unwrap();
+        assert!(broker.bind_session(stopped, 3, 4, "Can"));
+        manager.start_stopping_token(stopped).unwrap();
+        assert!(!broker.abandon_session(stopped));
+
+        let (manager, broker) = voice_manager_with_intent();
+        let failed = manager.begin_session(1, 2, 3).unwrap();
+        assert!(broker.bind_session(failed, 3, 4, "Can"));
+        manager.mark_driver_failed(failed);
+        assert!(!broker.abandon_session(failed));
+
+        let (manager, broker) = voice_manager_with_intent();
+        let reconnected_wrong = manager.begin_session(1, 2, 3).unwrap();
+        assert!(broker.bind_session(reconnected_wrong, 3, 4, "Can"));
+        assert!(!manager.note_reconnected(reconnected_wrong, 9));
+        assert!(!broker.abandon_session(reconnected_wrong));
+
+        let (manager, broker) = voice_manager_with_intent();
+        let discarded = manager.begin_session(1, 2, 3).unwrap();
+        assert!(broker.bind_session(discarded, 3, 4, "Can"));
+        manager.discard_session(discarded);
+        assert!(!broker.abandon_session(discarded));
+
+        let (manager, broker) = voice_manager_with_intent();
+        let expired = manager.begin_session(1, 2, 3).unwrap();
+        assert!(broker.bind_session(expired, 3, 4, "Can"));
+        manager.expire_session(expired).await;
+        assert!(!broker.abandon_session(expired));
+    }
+
+    #[tokio::test]
+    async fn slow_intent_delivery_does_not_block_the_transcript_event_producer() {
+        let messenger = Arc::new(BlockingIntentMessenger {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let intent = DiscordVoiceIntentConfig {
+            enabled: true,
+            confirmation_timeout_seconds: 30,
+            targets: BTreeMap::from([(
+                "B0".to_string(),
+                DiscordVoiceIntentTargetConfig {
+                    discord_user_id: "9000".to_string(),
+                    aliases: Vec::new(),
+                },
+            )]),
+        };
+        let broker = DiscordVoiceIntentBroker::new(intent, messenger.clone()).unwrap();
+        let token = VoiceSessionToken::for_test(1, 1);
+        assert!(broker.bind_session(token, 3, 4, "Can"));
+
+        let (tx, rx) = mpsc::channel(1);
+        let worker = spawn_intent_worker(rx, broker);
+        tx.try_send(FinalTranscriptEvent {
+            token,
+            control_channel_id: 3,
+            key: TranscriptKey {
+                speaker_id: 4,
+                start_frame: 0,
+                end_frame: 48_000,
+            },
+            text: "請 B0 review PR #123".to_string(),
+        })
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), messenger.entered.notified())
+            .await
+            .expect("intent worker should reach the slow Discord messenger");
+
+        // The worker has removed the first event from the queue and is blocked
+        // on Discord. The producer can still enqueue the next transcript
+        // without awaiting that network request.
+        tx.try_send(FinalTranscriptEvent {
+            token,
+            control_channel_id: 3,
+            key: TranscriptKey {
+                speaker_id: 4,
+                start_frame: 48_000,
+                end_frame: 96_000,
+            },
+            text: "請 B0 run CI".to_string(),
+        })
+        .expect("slow Discord delivery must not block the transcript producer");
+
+        drop(tx);
+        messenger.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("intent worker should stop after its sender closes")
+            .expect("intent worker should not panic");
+    }
+
+    #[tokio::test]
+    async fn full_intent_queue_drops_only_the_broker_event_and_releases_stt_pending() {
+        let transcript = Mutex::new(TranscriptStore::new(10, 1_000).unwrap());
+        let pending_segments = AtomicU64::new(2);
+        let stt_failures = AtomicU64::new(0);
+        let drops = VoiceDropCounters::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        let intent = IntentWorkerContext {
+            tx,
+            token: VoiceSessionToken::for_test(1, 1),
+            control_channel_id: 3,
+        };
+
+        for (start_frame, text) in [(0, "請 B0 review"), (48_000, "請 B0 run CI")] {
+            complete_segment_job(
+                &transcript,
+                &pending_segments,
+                &stt_failures,
+                &drops,
+                Some(&intent),
+                CompletedSegment {
+                    speaker_id: 4,
+                    start_frame,
+                    end_frame: start_frame + 48_000,
+                    transcript: Some(text.to_string()),
+                },
+            );
+        }
+
+        assert_eq!(pending_segments.load(Ordering::Relaxed), 0);
+        assert_eq!(stt_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(transcript.lock().unwrap().len(), 2);
+        assert_eq!(rx.try_recv().unwrap().key.start_frame, 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_voice_token_cannot_abandon_replacement_intent_session() {
+        let (manager, broker) = voice_manager_with_intent();
+        let old = manager.begin_session(1, 2, 3).unwrap();
+        manager.start_stopping_token(old).unwrap();
+        manager.finish_stop(old).unwrap();
+
+        // Rebinding the terminal generation isolates the replacement hook from
+        // the ordinary stop hook exercised above.
+        assert!(broker.bind_session(old, 3, 4, "Can"));
+        let replacement = manager.begin_session(1, 2, 3).unwrap();
+        assert!(!broker.abandon_session(old));
+        assert!(broker.bind_session(replacement, 3, 4, "Can"));
+        manager.discard_session(old);
+
+        assert!(broker.abandon_session(replacement));
     }
 
     #[tokio::test]

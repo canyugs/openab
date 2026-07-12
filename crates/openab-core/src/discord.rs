@@ -3,10 +3,11 @@ use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
-use crate::dispatch::DispatchTarget;
+use crate::discord_voice_intent::{DiscordVoiceIntentBroker, VoiceIntentMessenger};
 use crate::discord_voice_runtime::{
     DiscordVoiceManager, DiscordVoiceReceiver, VoiceSessionStatus, VoiceSessionToken,
 };
+use crate::dispatch::DispatchTarget;
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
@@ -22,7 +23,9 @@ use serenity::model::application::ButtonStyle;
 use serenity::model::application::{
     Command, CommandDataOptionValue, CommandOptionType, ComponentInteractionDataKind, Interaction,
 };
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reaction, ReactionType};
+use serenity::model::channel::{
+    AutoArchiveDuration, Message, MessageType, Nonce, Reaction, ReactionType,
+};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -59,6 +62,49 @@ impl DiscordAdapter {
     /// Discord threads are channels, so prefer thread_id when set.
     fn resolve_channel(channel: &ChannelRef) -> &str {
         channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
+    }
+}
+
+/// Narrow Discord transport used by the voice intent broker.
+///
+/// The broker owns intent state and message content; this type only performs
+/// the final HTTP post and enables Discord nonce de-duplication when requested.
+pub struct DiscordVoiceIntentMessenger {
+    http: Arc<Http>,
+}
+
+impl DiscordVoiceIntentMessenger {
+    pub fn new(http: Arc<Http>) -> Self {
+        Self { http }
+    }
+}
+
+#[async_trait]
+impl VoiceIntentMessenger for DiscordVoiceIntentMessenger {
+    async fn send_message(
+        &self,
+        channel_id: u64,
+        content: &str,
+        nonce: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let mut message = serenity::builder::CreateMessage::new().content(content);
+        if let Some(nonce) = nonce {
+            message = message
+                .nonce(Nonce::String(nonce.to_string()))
+                .enforce_nonce(true);
+        }
+        let sent = ChannelId::new(channel_id)
+            .send_message(&self.http, message)
+            .await?;
+        Ok(sent.id.to_string())
+    }
+
+    async fn delete_message(&self, channel_id: u64, message_id: &str) -> anyhow::Result<()> {
+        let message_id = message_id.parse::<u64>()?;
+        ChannelId::new(channel_id)
+            .delete_message(&self.http, MessageId::new(message_id))
+            .await?;
+        Ok(())
     }
 }
 
@@ -251,6 +297,8 @@ pub struct Handler {
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
     /// Opt-in Discord voice-channel capture runtime.
     pub voice_manager: Option<Arc<DiscordVoiceManager>>,
+    /// Opt-in semantic confirmation and delegation state for Discord Voice.
+    pub voice_intent_broker: Option<Arc<DiscordVoiceIntentBroker>>,
 }
 
 impl Handler {
@@ -452,6 +500,40 @@ impl EventHandler for Handler {
         // Ignore own messages (after counting toward bot turns above)
         if msg.author.id == bot_id {
             return;
+        }
+
+        // Voice-intent confirmations are control-plane replies, not ACP prompts.
+        // Intercept them before ordinary channel/mention gating so a bare
+        // "對" in the pinned control channel can resolve the pending intent.
+        if !msg.author.bot {
+            if let (Some(broker), Some(guild_id)) = (&self.voice_intent_broker, msg.guild_id) {
+                let intent_reply = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
+                match broker
+                    .handle_text_message(
+                        guild_id.get(),
+                        msg.channel_id.get(),
+                        msg.author.id.get(),
+                        &intent_reply,
+                    )
+                    .await
+                {
+                    Ok(outcome) if outcome.consumed() => return,
+                    Ok(_) => {}
+                    Err(err) => {
+                        // A broker error is only returned after recognizing a
+                        // confirmation reply. Consume it so a bare yes/no is
+                        // never forwarded into the normal ACP path.
+                        warn!(
+                            guild_id = guild_id.get(),
+                            channel_id = msg.channel_id.get(),
+                            user_id = msg.author.id.get(),
+                            error = %err,
+                            "failed to handle Discord voice intent confirmation"
+                        );
+                        return;
+                    }
+                }
+            }
         }
 
         let adapter = self
@@ -1661,6 +1743,19 @@ impl Handler {
                     ) {
                         Err(err) => Err(err),
                         Ok(token) => {
+                            if let Some(broker) = &self.voice_intent_broker {
+                                let operator_display_name = cmd
+                                    .user
+                                    .global_name
+                                    .clone()
+                                    .unwrap_or_else(|| cmd.user.name.clone());
+                                broker.bind_session(
+                                    token,
+                                    cmd.channel_id.get(),
+                                    cmd.user.id.get(),
+                                    operator_display_name,
+                                );
+                            }
                             let voice = songbird::get(ctx)
                                 .await
                                 .ok_or_else(|| anyhow::anyhow!("Songbird is not registered"));
@@ -3718,6 +3813,13 @@ mod tests {
         let bot_id = UserId::new(111);
         let result = resolve_mentions("hello <@111> world", bot_id, &HashSet::new());
         assert_eq!(result, "hello  world");
+    }
+
+    #[test]
+    fn resolve_mentions_exposes_exact_voice_confirmation_reply() {
+        let bot_id = UserId::new(111);
+        let result = resolve_mentions("<@111> 對", bot_id, &HashSet::new());
+        assert_eq!(result, "對");
     }
 
     /// Bot's own legacy <@!UID> mention is also stripped.

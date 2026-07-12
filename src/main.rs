@@ -16,6 +16,8 @@ use openab_core::cron;
 #[cfg(feature = "discord")]
 use openab_core::discord;
 #[cfg(feature = "discord")]
+use openab_core::discord_voice_intent::DiscordVoiceIntentBroker;
+#[cfg(feature = "discord")]
 use openab_core::discord_voice_runtime::DiscordVoiceManager;
 use openab_core::dispatch;
 use openab_core::gateway;
@@ -996,6 +998,22 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
+        let voice_intent_broker = if discord_cfg.voice.intent.enabled {
+            let messenger = Arc::new(discord::DiscordVoiceIntentMessenger::new(Arc::new(
+                serenity::http::Http::new(&discord_cfg.bot_token),
+            )));
+            let broker =
+                DiscordVoiceIntentBroker::new(discord_cfg.voice.intent.clone(), messenger)?;
+            let manager = voice_manager.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "discord.voice.intent.enabled requires an active Discord voice manager"
+                )
+            })?;
+            manager.attach_intent_broker(broker.clone());
+            Some(broker)
+        } else {
+            None
+        };
         info!(
             allow_all_channels,
             allow_all_users,
@@ -1007,6 +1025,7 @@ async fn main() -> anyhow::Result<()> {
             allow_user_messages = ?discord_cfg.allow_user_messages,
             allow_dm = discord_cfg.allow_dm,
             voice_enabled = voice_manager.is_some(),
+            voice_intent_enabled = voice_intent_broker.is_some(),
             "starting discord adapter"
         );
 
@@ -1075,6 +1094,7 @@ async fn main() -> anyhow::Result<()> {
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             voice_manager: voice_manager.clone(),
+            voice_intent_broker: voice_intent_broker.clone(),
         };
 
         let mut intents = GatewayIntents::GUILD_MESSAGES
