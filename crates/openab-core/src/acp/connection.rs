@@ -1,6 +1,7 @@
 use crate::acp::protocol::{
     parse_config_options, ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
 };
+use crate::acp_turn::{TurnStartError, TurnTicket};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -11,6 +12,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace};
+use uuid::Uuid;
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -169,11 +171,275 @@ impl SessionActivity {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TurnPhase {
+    Idle,
+    InFlight { request_id: u64, session_id: String },
+    CancelRequested { request_id: u64, session_id: String },
+    CancelWriteIndeterminate { request_id: u64 },
+    Finished { request_id: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelRejection {
+    DifferentConnection,
+    NoActiveTurn,
+    StaleRequest,
+    Duplicate,
+    WriteIndeterminate,
+    Finished,
+}
+
+impl std::fmt::Display for CancelRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::DifferentConnection => "turn ticket belongs to a different ACP connection",
+            Self::NoActiveTurn => "there is no active ACP turn to cancel",
+            Self::StaleRequest => "turn ticket is stale",
+            Self::Duplicate => "cancellation was already requested for this turn",
+            Self::WriteIndeterminate => {
+                "the previous cancellation write had an indeterminate outcome"
+            }
+            Self::Finished => "ACP turn has already finished",
+        };
+        f.write_str(message)
+    }
+}
+
+#[derive(Debug)]
+struct TurnCancelState {
+    phase: TurnPhase,
+}
+
+impl Default for TurnCancelState {
+    fn default() -> Self {
+        Self {
+            phase: TurnPhase::Idle,
+        }
+    }
+}
+
+impl TurnCancelState {
+    fn can_start(&self) -> bool {
+        matches!(self.phase, TurnPhase::Idle | TurnPhase::Finished { .. })
+    }
+
+    fn activate(&mut self, request_id: u64, session_id: String) -> bool {
+        if !self.can_start() {
+            return false;
+        }
+        self.phase = TurnPhase::InFlight {
+            request_id,
+            session_id,
+        };
+        true
+    }
+
+    fn begin_cancel(
+        &mut self,
+        connection_id: Uuid,
+        ticket: &TurnTicket,
+    ) -> std::result::Result<String, CancelRejection> {
+        if ticket.connection_id() != connection_id {
+            return Err(CancelRejection::DifferentConnection);
+        }
+
+        let ticket_request_id = ticket.request_id();
+        match &self.phase {
+            TurnPhase::Idle => Err(CancelRejection::NoActiveTurn),
+            TurnPhase::InFlight {
+                request_id,
+                session_id,
+            } if *request_id == ticket_request_id => {
+                let session_id = session_id.clone();
+                self.phase = TurnPhase::CancelRequested {
+                    request_id: ticket_request_id,
+                    session_id: session_id.clone(),
+                };
+                Ok(session_id)
+            }
+            TurnPhase::CancelRequested { request_id, .. } if *request_id == ticket_request_id => {
+                Err(CancelRejection::Duplicate)
+            }
+            TurnPhase::CancelWriteIndeterminate { request_id }
+                if *request_id == ticket_request_id =>
+            {
+                Err(CancelRejection::WriteIndeterminate)
+            }
+            TurnPhase::Finished { request_id } if *request_id == ticket_request_id => {
+                Err(CancelRejection::Finished)
+            }
+            TurnPhase::InFlight { .. }
+            | TurnPhase::CancelRequested { .. }
+            | TurnPhase::CancelWriteIndeterminate { .. }
+            | TurnPhase::Finished { .. } => Err(CancelRejection::StaleRequest),
+        }
+    }
+
+    fn is_open_for(&self, connection_id: Uuid, ticket: &TurnTicket) -> bool {
+        if ticket.connection_id() != connection_id {
+            return false;
+        }
+        let ticket_request_id = ticket.request_id();
+        matches!(
+            self.phase,
+            TurnPhase::InFlight { request_id, .. }
+                | TurnPhase::CancelRequested { request_id, .. }
+                | TurnPhase::CancelWriteIndeterminate { request_id }
+                if request_id == ticket_request_id
+        )
+    }
+
+    fn current_ticket(&self, connection_id: Uuid) -> Option<TurnTicket> {
+        let request_id = match self.phase {
+            TurnPhase::Idle => return None,
+            TurnPhase::InFlight { request_id, .. }
+            | TurnPhase::CancelRequested { request_id, .. }
+            | TurnPhase::CancelWriteIndeterminate { request_id }
+            | TurnPhase::Finished { request_id } => request_id,
+        };
+        Some(TurnTicket::new(connection_id, request_id))
+    }
+
+    fn cancel_write_failed(&mut self, connection_id: Uuid, ticket: &TurnTicket) -> bool {
+        if ticket.connection_id() != connection_id {
+            return false;
+        }
+        let ticket_request_id = ticket.request_id();
+        match self.phase {
+            TurnPhase::CancelRequested { request_id, .. } if request_id == ticket_request_id => {
+                self.phase = TurnPhase::CancelWriteIndeterminate {
+                    request_id: ticket_request_id,
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn cancel_write_is_indeterminate(&self, connection_id: Uuid, ticket: &TurnTicket) -> bool {
+        ticket.connection_id() == connection_id
+            && matches!(
+                self.phase,
+                TurnPhase::CancelWriteIndeterminate { request_id }
+                    if request_id == ticket.request_id()
+            )
+    }
+
+    /// Mark a matching turn finished. Returning true for an already-finished
+    /// matching ticket lets `prompt_done` perform its remaining cleanup after
+    /// `abandon_request` has terminalized the same turn.
+    fn finish(&mut self, connection_id: Uuid, ticket: &TurnTicket) -> bool {
+        if ticket.connection_id() != connection_id {
+            return false;
+        }
+        let ticket_request_id = ticket.request_id();
+        match self.phase {
+            TurnPhase::InFlight { request_id, .. }
+            | TurnPhase::CancelRequested { request_id, .. }
+            | TurnPhase::CancelWriteIndeterminate { request_id }
+                if request_id == ticket_request_id =>
+            {
+                self.phase = TurnPhase::Finished {
+                    request_id: ticket_request_id,
+                };
+                true
+            }
+            TurnPhase::Finished { request_id } if request_id == ticket_request_id => true,
+            TurnPhase::Idle
+            | TurnPhase::InFlight { .. }
+            | TurnPhase::CancelRequested { .. }
+            | TurnPhase::CancelWriteIndeterminate { .. }
+            | TurnPhase::Finished { .. } => false,
+        }
+    }
+}
+
+/// Cloneable, turn-scoped cancellation handle.
+///
+/// Unlike the legacy raw stdin handle, this validates both the connection and
+/// request identity before writing `session/cancel`. The lifecycle mutex stays
+/// locked through the stdin write, so a late cancellation cannot race turn
+/// completion and cancel a subsequently-started prompt on the same session.
+#[derive(Clone)]
+pub struct TurnCancelHandle {
+    connection_id: Uuid,
+    child_pgid: Option<i32>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    state: Arc<Mutex<TurnCancelState>>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl TurnCancelHandle {
+    pub fn connection_id(&self) -> Uuid {
+        self.connection_id
+    }
+
+    pub async fn cancel(&self, ticket: &TurnTicket) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let session_id = state
+            .begin_cancel(self.connection_id, ticket)
+            .map_err(|rejection| anyhow!(rejection.to_string()))?;
+
+        let data = match serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": session_id},
+        })) {
+            Ok(data) => data,
+            Err(error) => {
+                let _ = state.cancel_write_failed(self.connection_id, ticket);
+                self.poisoned.store(true, Ordering::Release);
+                terminate_process_group(self.child_pgid);
+                return Err(error.into());
+            }
+        };
+
+        // Keep `state` locked until the complete JSON line is flushed. This
+        // serializes validation and delivery with prompt completion/start.
+        let write_result = match tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut writer = self.stdin.lock().await;
+            writer.write_all(data.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("stdin write timeout while cancelling ACP turn")),
+        };
+        if let Err(error) = write_result {
+            let _ = state.cancel_write_failed(self.connection_id, ticket);
+            self.poisoned.store(true, Ordering::Release);
+            // Cancellation delivery is indeterminate: the agent may not have
+            // observed the notification and could otherwise keep mutating the
+            // workspace. Terminate the exact child process tree immediately;
+            // this poisoned connection can never accept another turn.
+            terminate_process_group(self.child_pgid);
+            return Err(error);
+        }
+
+        debug!(
+            connection_id = %self.connection_id,
+            request_id = ticket.request_id(),
+            "sent targeted ACP turn cancellation"
+        );
+        drop(state);
+        Ok(())
+    }
+}
+
 pub struct AcpConnection {
     _proc: Child,
     /// PID of the direct child, used as the process group ID for cleanup.
     child_pgid: Option<i32>,
     stdin: Arc<Mutex<ChildStdin>>,
+    connection_id: Uuid,
+    turn_cancel_state: Arc<Mutex<TurnCancelState>>,
+    /// Set when a prompt write may have only partially reached stdin. Such a
+    /// JSON stream cannot be repaired safely and the connection must be replaced.
+    poisoned: Arc<AtomicBool>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
@@ -464,11 +730,16 @@ impl AcpConnection {
         ));
 
         let activity = Arc::new(SessionActivity::new());
+        let connection_id = Uuid::new_v4();
+        let turn_cancel_state = Arc::new(Mutex::new(TurnCancelState::default()));
 
         Ok(Self {
             _proc: proc,
             child_pgid,
             stdin,
+            connection_id,
+            turn_cancel_state,
+            poisoned: Arc::new(AtomicBool::new(false)),
             next_id: AtomicU64::new(1),
             pending,
             notify_tx,
@@ -638,24 +909,44 @@ impl AcpConnection {
         Ok(self.config_options.clone())
     }
 
-    /// Send a prompt with content blocks (text and/or images) and return a receiver
-    /// for streaming notifications. The final message on the channel will have id set
-    /// (the prompt response).
+    /// Send a prompt using the historical request-ID return contract.
+    ///
+    /// New turn-scoped code should call [`Self::session_prompt_typed`].
     pub async fn session_prompt(
         &mut self,
         content_blocks: Vec<ContentBlock>,
     ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
-        self.last_active = Instant::now();
-        self.activity.touch();
-        self.activity.set_in_flight(true);
+        match self.session_prompt_typed(content_blocks).await {
+            Ok((receiver, ticket)) => Ok((receiver, ticket.request_id())),
+            Err(TurnStartError::NotStarted { error }) => Err(anyhow!(error)),
+            Err(TurnStartError::WriteIndeterminate { ticket, error }) => {
+                self.prompt_done_typed(&ticket).await;
+                Err(anyhow!(error))
+            }
+        }
+    }
+
+    /// Send a prompt with content blocks (text and/or images), returning a
+    /// receiver for streaming notifications and its exact turn ticket. The
+    /// final message on the channel will have id set (the prompt response).
+    pub async fn session_prompt_typed(
+        &mut self,
+        content_blocks: Vec<ContentBlock>,
+    ) -> std::result::Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, TurnTicket), TurnStartError>
+    {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(TurnStartError::NotStarted {
+                error: "ACP connection is unusable after an indeterminate prompt write".to_string(),
+            });
+        }
 
         let session_id = self
             .acp_session_id
             .as_ref()
-            .ok_or_else(|| anyhow!("no session"))?;
-
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.notify_tx.lock().await = Some(tx);
+            .ok_or_else(|| TurnStartError::NotStarted {
+                error: "no session".to_string(),
+            })?
+            .clone();
 
         let id = self.next_id();
 
@@ -670,46 +961,164 @@ impl AcpConnection {
                 "prompt": prompt_json,
             })),
         );
-        let data = serde_json::to_string(&req)?;
+        let data = serde_json::to_string(&req).map_err(|error| TurnStartError::NotStarted {
+            error: error.to_string(),
+        })?;
+
+        // Refuse overlapping turns before publishing a subscriber or pending
+        // request. Connections are normally serialized by SessionPool, but
+        // enforcing the invariant here keeps the turn ticket trustworthy.
+        if !self.turn_cancel_state.lock().await.can_start() {
+            return Err(TurnStartError::NotStarted {
+                error: "an ACP turn is already in flight".to_string(),
+            });
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.notify_tx.lock().await = Some(tx);
 
         let (resp_tx, _resp_rx) = oneshot::channel();
         self.pending.lock().await.insert(id, resp_tx);
 
-        self.send_raw(&data).await?;
-        Ok((rx, id))
+        let ticket = TurnTicket::new(self.connection_id, id);
+        let activated = self.turn_cancel_state.lock().await.activate(id, session_id);
+        if !activated {
+            self.pending.lock().await.remove(&id);
+            *self.notify_tx.lock().await = None;
+            return Err(TurnStartError::NotStarted {
+                error: format!("ACP turn lifecycle changed while starting request {id}"),
+            });
+        }
+
+        self.last_active = Instant::now();
+        self.activity.touch();
+        self.activity.set_in_flight(true);
+
+        if let Err(error) = self.send_raw(&data).await {
+            self.pending.lock().await.remove(&id);
+            self.poisoned.store(true, Ordering::Release);
+            // A failed write_all/newline/flush may have left a partial JSON
+            // object on stdin. Do not append cancellation or another request;
+            // terminate the process tree and force SessionPool replacement.
+            self.kill_process_group();
+            let _ = self._proc.start_kill();
+            return Err(TurnStartError::WriteIndeterminate {
+                ticket,
+                error: error.to_string(),
+            });
+        }
+
+        Ok((rx, ticket))
     }
 
-    /// Call after prompt streaming is done to clean up subscriber.
+    /// Clean up the currently active prompt using the historical unscoped API.
+    /// New turn-scoped code should call [`Self::prompt_done_typed`].
     pub async fn prompt_done(&mut self) {
+        let ticket = self
+            .turn_cancel_state
+            .lock()
+            .await
+            .current_ticket(self.connection_id);
+        if let Some(ticket) = ticket {
+            self.prompt_done_typed(&ticket).await;
+        } else {
+            *self.notify_tx.lock().await = None;
+            self.activity.touch();
+            self.activity.set_in_flight(false);
+            self.last_active = Instant::now();
+        }
+    }
+
+    /// Call after prompt streaming is done to clean up the exact subscriber.
+    pub async fn prompt_done_typed(&mut self, ticket: &TurnTicket) {
+        let matched = self
+            .turn_cancel_state
+            .lock()
+            .await
+            .finish(self.connection_id, ticket);
+        if !matched {
+            debug!(
+                connection_id = %self.connection_id,
+                ticket_connection_id = %ticket.connection_id(),
+                request_id = ticket.request_id(),
+                "ignored prompt_done for a non-current ACP turn"
+            );
+            return;
+        }
+
+        self.pending.lock().await.remove(&ticket.request_id());
         *self.notify_tx.lock().await = None;
         self.activity.touch();
         self.activity.set_in_flight(false);
         self.last_active = Instant::now();
     }
 
-    /// Drop the pending entry for `request_id` and best-effort send
+    /// Drop the pending entry for the exact turn ticket and best-effort send
     /// `session/cancel` as a JSON-RPC notification (no id; per ACP spec the
     /// agent does not reply). Errors are swallowed: the agent process may
     /// already be dead, in which case the stdin write fails harmlessly.
     /// See #732.
     pub async fn abandon_request(&self, request_id: u64) {
-        self.pending.lock().await.remove(&request_id);
-        let Some(session_id) = self.acp_session_id.as_deref() else {
+        let ticket = TurnTicket::new(self.connection_id, request_id);
+        self.abandon_request_typed(&ticket).await;
+    }
+
+    /// Abandon only the exact connection-qualified turn ticket.
+    pub async fn abandon_request_typed(&self, ticket: &TurnTicket) {
+        let is_current = self
+            .turn_cancel_state
+            .lock()
+            .await
+            .is_open_for(self.connection_id, ticket);
+        if !is_current {
+            debug!(
+                connection_id = %self.connection_id,
+                ticket_connection_id = %ticket.connection_id(),
+                request_id = ticket.request_id(),
+                "ignored abandon_request for a non-current ACP turn"
+            );
             return;
-        };
-        let req = json!({
-            "jsonrpc": "2.0",
-            "method": "session/cancel",
-            "params": {"sessionId": session_id},
-        });
-        if let Ok(data) = serde_json::to_string(&req) {
-            let _ = self.send_raw(&data).await;
+        }
+
+        self.pending.lock().await.remove(&ticket.request_id());
+        // Best effort: a concurrent targeted caller may already have sent the
+        // cancellation, and a dead child may reject the write. Either way this
+        // broker is abandoning the request and must terminalize only its exact
+        // ticket before a later prompt can begin.
+        let _ = self.turn_cancel_handle().cancel(ticket).await;
+        let _ = self
+            .turn_cancel_state
+            .lock()
+            .await
+            .finish(self.connection_id, ticket);
+    }
+
+    /// Return a clone of the stdin handle for legacy session-wide cancel.
+    /// New turn-scoped callers should use [`Self::turn_cancel_handle`].
+    pub fn cancel_handle(&self) -> Arc<Mutex<ChildStdin>> {
+        Arc::clone(&self.stdin)
+    }
+
+    /// Return a cloneable handle that can cancel only the supplied active turn.
+    pub fn turn_cancel_handle(&self) -> TurnCancelHandle {
+        TurnCancelHandle {
+            connection_id: self.connection_id,
+            child_pgid: self.child_pgid,
+            stdin: Arc::clone(&self.stdin),
+            state: Arc::clone(&self.turn_cancel_state),
+            poisoned: Arc::clone(&self.poisoned),
         }
     }
 
-    /// Return a clone of the stdin handle for lock-free cancel.
-    pub fn cancel_handle(&self) -> Arc<Mutex<ChildStdin>> {
-        Arc::clone(&self.stdin)
+    pub(crate) async fn cancel_write_is_indeterminate(&self, ticket: &TurnTicket) -> bool {
+        self.turn_cancel_state
+            .lock()
+            .await
+            .cancel_write_is_indeterminate(self.connection_id, ticket)
+    }
+
+    pub fn connection_id(&self) -> Uuid {
+        self.connection_id
     }
 
     pub fn activity_handle(&self) -> Arc<SessionActivity> {
@@ -722,7 +1131,7 @@ impl AcpConnection {
     }
 
     pub fn alive(&self) -> bool {
-        !self._reader_handle.is_finished()
+        !self.poisoned.load(Ordering::Acquire) && !self._reader_handle.is_finished()
     }
 
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
@@ -746,32 +1155,43 @@ impl AcpConnection {
         Ok(())
     }
 
-    /// Kill the entire process group: SIGTERM → SIGKILL.
-    /// Uses std::thread (not tokio::spawn) so SIGKILL fires even during
-    /// runtime shutdown or panic unwinding.
     fn kill_process_group(&mut self) {
-        let pgid = match self.child_pgid {
-            Some(pid) if pid > 0 => pid,
-            _ => return,
-        };
-        #[cfg(unix)]
-        {
-            // Stage 1: SIGTERM the process group
+        terminate_process_group(self.child_pgid);
+    }
+}
+
+/// Terminate the child process tree after an indeterminate protocol write.
+///
+/// Unix agents run in their own process group. Windows agents are created with
+/// `CREATE_NEW_PROCESS_GROUP`, and `taskkill /T` is the available tree-aware
+/// termination primitive. The delayed Unix SIGKILL uses a standard thread so
+/// it still fires during runtime shutdown or panic unwinding.
+fn terminate_process_group(child_pgid: Option<i32>) {
+    let pgid = match child_pgid {
+        Some(pid) if pid > 0 => pid,
+        _ => return,
+    };
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
             unsafe {
-                libc::kill(-pgid, libc::SIGTERM);
+                libc::kill(-pgid, libc::SIGKILL);
             }
-            // Stage 2: SIGKILL after brief grace (std::thread survives runtime shutdown)
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-            });
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = pgid; // suppress unused warning on Windows
-        }
+        });
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pgid.to_string(), "/T", "/F"])
+            .spawn();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pgid;
     }
 }
 
@@ -786,8 +1206,13 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{
+        build_agent_env, build_permission_response, pick_best_option, CancelRejection,
+        TurnCancelState, TurnPhase,
+    };
+    use crate::acp_turn::TurnTicket;
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn picks_allow_always_over_other_options() {
@@ -918,6 +1343,101 @@ mod tests {
 
         assert!(!result.contains_key("OAB_TEST_NONEXISTENT_VAR_12345"));
         assert!(inherited.is_empty());
+    }
+
+    #[test]
+    fn targeted_cancel_rejects_stale_ticket_after_later_turn_starts() {
+        let connection_id = Uuid::new_v4();
+        let first = TurnTicket::new(connection_id, 10);
+        let second = TurnTicket::new(connection_id, 11);
+        let mut state = TurnCancelState::default();
+
+        assert!(state.activate(first.request_id(), "session-a".into()));
+        assert!(state.finish(connection_id, &first));
+        assert!(state.activate(second.request_id(), "session-a".into()));
+
+        assert!(!state.finish(connection_id, &first));
+        assert_eq!(
+            state.begin_cancel(connection_id, &first),
+            Err(CancelRejection::StaleRequest)
+        );
+        assert_eq!(
+            state.phase,
+            TurnPhase::InFlight {
+                request_id: second.request_id(),
+                session_id: "session-a".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn targeted_cancel_rejects_duplicate_request() {
+        let connection_id = Uuid::new_v4();
+        let ticket = TurnTicket::new(connection_id, 20);
+        let mut state = TurnCancelState::default();
+        assert!(state.activate(ticket.request_id(), "session-b".into()));
+
+        assert_eq!(
+            state.begin_cancel(connection_id, &ticket),
+            Ok("session-b".into())
+        );
+        assert_eq!(
+            state.begin_cancel(connection_id, &ticket),
+            Err(CancelRejection::Duplicate)
+        );
+    }
+
+    #[test]
+    fn failed_cancel_write_is_distinct_from_duplicate_request() {
+        let connection_id = Uuid::new_v4();
+        let ticket = TurnTicket::new(connection_id, 21);
+        let mut state = TurnCancelState::default();
+        assert!(state.activate(ticket.request_id(), "session-b".into()));
+        assert_eq!(
+            state.begin_cancel(connection_id, &ticket),
+            Ok("session-b".into())
+        );
+
+        assert!(state.cancel_write_failed(connection_id, &ticket));
+        assert!(state.cancel_write_is_indeterminate(connection_id, &ticket));
+        assert!(!state.cancel_write_is_indeterminate(Uuid::new_v4(), &ticket));
+        assert_eq!(
+            state.begin_cancel(connection_id, &ticket),
+            Err(CancelRejection::WriteIndeterminate)
+        );
+        assert_eq!(
+            state.phase,
+            TurnPhase::CancelWriteIndeterminate {
+                request_id: ticket.request_id()
+            }
+        );
+    }
+
+    #[test]
+    fn targeted_cancel_rejects_finished_turn() {
+        let connection_id = Uuid::new_v4();
+        let ticket = TurnTicket::new(connection_id, 30);
+        let mut state = TurnCancelState::default();
+        assert!(state.activate(ticket.request_id(), "session-c".into()));
+        assert!(state.finish(connection_id, &ticket));
+
+        assert_eq!(
+            state.begin_cancel(connection_id, &ticket),
+            Err(CancelRejection::Finished)
+        );
+    }
+
+    #[test]
+    fn targeted_cancel_rejects_ticket_from_another_connection() {
+        let connection_id = Uuid::new_v4();
+        let ticket = TurnTicket::new(Uuid::new_v4(), 40);
+        let mut state = TurnCancelState::default();
+        assert!(state.activate(ticket.request_id(), "session-d".into()));
+
+        assert_eq!(
+            state.begin_cancel(connection_id, &ticket),
+            Err(CancelRejection::DifferentConnection)
+        );
     }
 }
 

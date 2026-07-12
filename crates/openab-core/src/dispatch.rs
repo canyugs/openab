@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::acp::ContentBlock;
+use crate::acp_turn::TurnCompletion;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
@@ -137,7 +138,8 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Destroy the session for `session_key` (used to rollback on directive failure).
     async fn reset_session(&self, session_key: &str);
 
-    /// Drive one ACP turn with the pre-packed `content_blocks`.
+    /// Drive one ACP turn with the pre-packed `content_blocks` using the
+    /// historical `Result<()>` contract.
     #[allow(clippy::too_many_arguments)]
     async fn stream_prompt_blocks(
         &self,
@@ -149,6 +151,46 @@ pub trait DispatchTarget: Send + Sync + 'static {
         other_bot_present: bool,
         recipient: Option<(String, String)>,
     ) -> Result<()>;
+
+    /// Drive one ACP turn and return structured completion evidence.
+    ///
+    /// The default preserves source and runtime compatibility for external
+    /// `DispatchTarget` implementations compiled against the legacy method.
+    /// Such targets cannot expose authoritative execution/output evidence, so
+    /// the typed fields fail closed while `legacy_dispatch` remains successful.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_prompt_blocks_typed(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        session_key: &str,
+        content_blocks: Vec<ContentBlock>,
+        thread_channel: &ChannelRef,
+        reactions: Arc<StatusReactionController>,
+        other_bot_present: bool,
+        recipient: Option<(String, String)>,
+    ) -> Result<TurnCompletion> {
+        self.stream_prompt_blocks(
+            adapter,
+            session_key,
+            content_blocks,
+            thread_channel,
+            reactions,
+            other_bot_present,
+            recipient,
+        )
+        .await?;
+
+        Ok(TurnCompletion {
+            ticket: crate::acp_turn::TurnTicket::new(uuid::Uuid::nil(), 0),
+            execution: crate::acp_turn::ExecutionOutcome::OutcomeUnknown {
+                reason: crate::acp_turn::UnknownReason::LegacyDispatchTarget,
+                observed_tool_calls: Vec::new(),
+            },
+            output: None,
+            delivery: crate::acp_turn::DeliveryOutcome::NotAttempted,
+            legacy_dispatch: crate::acp_turn::LegacyDispatchDisposition::Succeeded,
+        })
+    }
 }
 
 #[async_trait]
@@ -184,6 +226,29 @@ impl DispatchTarget for AdapterRouter {
         recipient: Option<(String, String)>,
     ) -> Result<()> {
         AdapterRouter::stream_prompt_blocks(
+            self,
+            adapter,
+            session_key,
+            content_blocks,
+            thread_channel,
+            reactions,
+            other_bot_present,
+            recipient,
+        )
+        .await
+    }
+
+    async fn stream_prompt_blocks_typed(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        session_key: &str,
+        content_blocks: Vec<ContentBlock>,
+        thread_channel: &ChannelRef,
+        reactions: Arc<StatusReactionController>,
+        other_bot_present: bool,
+        recipient: Option<(String, String)>,
+    ) -> Result<TurnCompletion> {
+        AdapterRouter::stream_prompt_blocks_typed(
             self,
             adapter,
             session_key,
@@ -768,7 +833,7 @@ async fn dispatch_batch(
     // 👀 already applied above; skip set_queued() to avoid double-reaction.
 
     let result = target
-        .stream_prompt_blocks(
+        .stream_prompt_blocks_typed(
             adapter,
             &session_key,
             content_blocks,
@@ -777,7 +842,8 @@ async fn dispatch_batch(
             other_bot_present,
             recipient,
         )
-        .await;
+        .await
+        .and_then(|completion| completion.legacy_dispatch.into_result());
 
     // In assistant status mode, all status is conveyed via
     // assistant.threads.setStatus — skip emoji reactions entirely.
@@ -1443,6 +1509,28 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn legacy_dispatch_mapping_ignores_contradictory_typed_outcomes() {
+        let completion = TurnCompletion {
+            ticket: crate::acp_turn::TurnTicket::new(uuid::Uuid::from_u128(2), 7),
+            execution: crate::acp_turn::ExecutionOutcome::OutcomeUnknown {
+                reason: crate::acp_turn::UnknownReason::AgentExited,
+                observed_tool_calls: Vec::new(),
+            },
+            output: None,
+            delivery: crate::acp_turn::DeliveryOutcome::Failed {
+                error: "typed delivery failure".to_string(),
+                partially_delivered: false,
+            },
+            legacy_dispatch: crate::acp_turn::LegacyDispatchDisposition::Succeeded,
+        };
+
+        let outer: Result<TurnCompletion> = Ok(completion);
+        let legacy = outer.and_then(|completion| completion.legacy_dispatch.into_result());
+
+        assert!(legacy.is_ok());
     }
 
     /// Mock `ChatAdapter` — every method is a no-op success. The dispatch loop

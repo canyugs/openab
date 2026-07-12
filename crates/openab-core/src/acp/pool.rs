@@ -537,6 +537,23 @@ impl SessionPool {
         f(&mut conn).await
     }
 
+    /// Clone the exact connection handle for a started, detached turn driver.
+    ///
+    /// The caller still locks the per-connection mutex before using ACP. Keeping
+    /// the handle owned by the detached task means dropping a dispatch consumer
+    /// cannot drop the prompt future halfway through lifecycle cleanup.
+    pub(crate) async fn connection_handle(
+        &self,
+        thread_id: &str,
+    ) -> Result<Arc<Mutex<AcpConnection>>> {
+        let state = self.state.read().await;
+        state
+            .active
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no connection for thread {thread_id}"))
+    }
+
     /// Get cached configOptions for a session (e.g. available models).
     pub async fn get_config_options(&self, thread_id: &str) -> Vec<ConfigOption> {
         let state = self.state.read().await;

@@ -204,7 +204,7 @@ pub fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
 
 /// Parsed fields from the `session/prompt` final response `result` object.
 /// All fields are optional — agents may omit `usage` entirely.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TurnResult {
     pub stop_reason: Option<String>,
     pub input_tokens: Option<u64>,
@@ -230,9 +230,15 @@ pub fn parse_turn_result(result: &Value) -> TurnResult {
         .and_then(|v| v.as_str())
         .map(String::from);
     let usage = result.get("usage");
-    let input_tokens = usage.and_then(|u| u.get("inputTokens")).and_then(|v| v.as_u64());
-    let output_tokens = usage.and_then(|u| u.get("outputTokens")).and_then(|v| v.as_u64());
-    let total_tokens = usage.and_then(|u| u.get("totalTokens")).and_then(|v| v.as_u64());
+    let input_tokens = usage
+        .and_then(|u| u.get("inputTokens"))
+        .and_then(|v| v.as_u64());
+    let output_tokens = usage
+        .and_then(|u| u.get("outputTokens"))
+        .and_then(|v| v.as_u64());
+    let total_tokens = usage
+        .and_then(|u| u.get("totalTokens"))
+        .and_then(|v| v.as_u64());
     TurnResult {
         stop_reason,
         input_tokens,
