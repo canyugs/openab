@@ -1,6 +1,6 @@
 # ADR: Discord Voice Intent Delegation
 
-- **Status:** Accepted — Slice 1 implemented; local end-to-end validation pending
+- **Status:** Accepted — Slice 1 implemented and local startup-validated; live voice flow pending
 - **Date:** 2026-07-12
 - **Implementation:** Voice receive foundation and opt-in text-confirmed intent broker implemented
 - **Implementation branch:** `feat/discord-voice-receive`
@@ -159,7 +159,7 @@ without helping the initial intent-confirmation loop.
 | Explicit ACP transcript summary | **Implemented** | `/voice summary` uses the current normal ACP path. This remains separate from intent delegation. |
 | Intent proposal/parser | **Implemented for the Slice 1 simple grammar** | Resolves one configured target in command-shaped speech. Target-head coordination grammar and typed clarification remain pending. |
 | Pending intent state machine | **Implemented and unit-tested** | Session/operator binding, posting/waiting/dispatching phases, correction, timeout generations, replay protection, and stale-session cleanup exist. |
-| Text confirmation and voice-specific mention dispatch | **Implemented; live flow pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch are wired. Local Discord end-to-end validation is still required. |
+| Text confirmation and voice-specific mention dispatch | **Implemented; local startup passed, live flow pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch are wired. The Slice 1 image starts cleanly in local Kubernetes; a real spoken proposal and target-agent handoff still require operator validation. |
 | Spoken yes/no/correction | **Not started** | Captured transcript is not interpreted as confirmation state. |
 | TTS and Songbird playback | **Not started** | There is no TTS provider or playback consumer. |
 | Realtime / GPT-Live proposal backend | **Not started** | No Realtime session or tool/event integration exists. |
@@ -168,17 +168,22 @@ without helping the initial intent-confirmation loop.
 
 ### 4.2 Local Kubernetes status
 
-The current `docker-desktop/openab-local` deployment is healthy:
+The current Slice 1 deployment in `docker-desktop/openab-local` is healthy:
 
 - deployment `openab-voice-voice`: `1/1` ready;
 - pod restarts: `0`;
-- image: `localhost:5555/openab:claude-voice-zh-stt`; and
+- Helm release `openab-voice`: revision `7`, status `deployed`;
+- image:
+  `localhost:5555/openab:claude-voice-intent-s1-8acd16522718`; and
 - image digest:
-  `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88`.
+  `sha256:3369087b88df1c6b29458d0b61e628d31098b8cc21bb59b9acc0afacd2286d66`.
 
-This image validates only the existing Discord receive, STT, and Claude ACP
-configuration. It predates the intent-broker work and must not be cited as
-evidence that delegation, TTS, or Realtime works.
+Startup logs confirm `voice_intent_enabled=true`, Groq STT configuration,
+Aragorn's Discord connection, and global slash-command registration. This is
+configuration and runtime-startup evidence, not yet proof of a spoken proposal,
+text confirmation, Sam/Frodo handoff, TTS, or Realtime. The previous
+`claude-voice-zh-stt` image predates Slice 1 and is no longer the active local
+artifact.
 
 ### 4.3 Daily-UX readiness
 
@@ -454,7 +459,8 @@ all state-machine logic directly to the Songbird callback/runtime file.
 
 ### Slice 1 — Intent broker without TTS
 
-**State: implemented in code and automated tests; local Discord end-to-end validation pending.**
+**State: implemented in code, automated tests, and local Kubernetes startup;
+real Discord Voice proposal/confirmation/handoff validation pending.**
 
 - add target/task proposal types;
 - implement one-pending-intent state per guild/voice session;
