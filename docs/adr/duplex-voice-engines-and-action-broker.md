@@ -1,6 +1,6 @@
 # ADR: Discord Voice Intent Routing and Execution
 
-- **Status:** Accepted — hybrid Slice 1 implemented; local rollout and live voice flow pending
+- **Status:** Accepted — hybrid Slice 1 implemented and local startup-validated; live voice flow pending
 - **Date:** 2026-07-13
 - **Implementation:** Voice receive plus opt-in text-confirmed local execution and bot delegation
 - **Implementation branch:** `feat/discord-voice-receive`
@@ -184,8 +184,8 @@ without helping the initial intent-confirmation loop.
 | Explicit ACP transcript summary | **Implemented** | `/voice summary` uses the current normal ACP path. This remains separate from intent delegation. |
 | Intent proposal/parser | **Hybrid Slice 1 implemented** | With `default_to_local = true`, command-shaped speech without a named target resolves to local execution. An explicit configured target still resolves to delegation. Multiple configured targets remain rejected rather than guessed. |
 | Pending intent state machine | **Implemented and unit-tested** | Session/operator binding, posting/waiting/dispatching phases, correction, timeout generations, replay protection, and stale-session cleanup exist. |
-| Text-confirmed local ACP execution | **Implemented in code; rollout pending** | A confirmed local request creates a stable-nonce audit root, creates a task thread for a normal text/news control channel, and submits through the existing Dispatcher/ACP path. Existing threads and Voice Channel text chat execute in that shared channel because Discord cannot nest a thread there. |
-| Text-confirmed target delegation | **Implemented; prior local startup passed, live flow pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch remain wired. A real spoken target-agent handoff still requires operator validation. |
+| Text-confirmed local ACP execution | **Implemented; local startup passed, live task pending** | A confirmed local request creates a stable-nonce audit root, creates a task thread for a normal text/news control channel, and submits through the existing Dispatcher/ACP path. Existing threads and Voice Channel text chat execute in that shared channel because Discord cannot nest a thread there. |
+| Text-confirmed target delegation | **Implemented; local sender/receiver startup passed, live handoff pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch remain wired. The receiver now reuses Voice Channel text chat instead of trying to create an unsupported thread. A real spoken target-agent handoff still requires operator validation. |
 | Spoken yes/no/correction | **Not started** | Captured transcript is not interpreted as confirmation state. |
 | TTS and Songbird playback | **Not started** | There is no TTS provider or playback consumer. |
 | Realtime / GPT-Live proposal backend | **Not started** | No Realtime session or tool/event integration exists. |
@@ -194,20 +194,30 @@ without helping the initial intent-confirmation loop.
 
 ### 4.2 Local Kubernetes status
 
-The current Slice 1 deployment in `docker-desktop/openab-local` is healthy:
+The current hybrid Slice 1 deployment in `docker-desktop/openab-local` is healthy:
 
 - deployment `openab-voice-voice`: `1/1` ready;
 - pod restarts: `0`;
-- Helm release `openab-voice`: revision `7`, status `deployed`;
+- Helm release `openab-voice`: revision `8`, status `deployed`;
 - image:
-  `localhost:5555/openab:claude-voice-intent-s1-8acd16522718`; and
+  `localhost:5555/openab:claude-voice-hybrid-66d8363`; and
 - image digest:
-  `sha256:3369087b88df1c6b29458d0b61e628d31098b8cc21bb59b9acc0afacd2286d66`.
+  `sha256:944e281b673afe8ab69fdd7eebac2a91943f80ff226f4b9447cf175b9dcc4c94`.
+
+The local delegated receiver is also healthy:
+
+- deployment `openab-sam-codex`: `1/1` ready with zero restarts;
+- Helm release `openab-sam`: revision `2`, status `deployed`;
+- image `localhost:5555/openab:codex-voice-hybrid-66d8363` at digest
+  `sha256:0089129035331d41e8de99553b1c78c448843be265ca63bc40f4260071ca8232`;
+  and
+- Sam allows both the pinned text channel and the Voice Channel text chat, and
+  trusts Aragorn's Discord bot identity.
 
 Startup logs confirm `voice_intent_enabled=true`, Groq STT configuration,
 Aragorn's Discord connection, and global slash-command registration. This is
 configuration and runtime-startup evidence, not yet proof of a spoken proposal,
-text confirmation, Sam/Frodo handoff, TTS, or Realtime. The previous
+text confirmation, local ACP task, Sam/Frodo handoff, TTS, or Realtime. The previous
 `claude-voice-zh-stt` image predates Slice 1 and is no longer the active local
 artifact.
 
