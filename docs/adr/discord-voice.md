@@ -3,7 +3,7 @@
 - **Status:** Proposed — one-speaker live receive passed; accuracy and soak validation pending
 - **Date:** 2026-07-12
 - **Implementation branch:** `feat/discord-voice-receive`
-- **Related:** [Discord guide](../discord.md), [STT guide](../stt.md), [Discord Voice Channel guide](../discord-voice.md), [Proposed duplex/action ADR](duplex-voice-engines-and-action-broker.md)
+- **Related:** [Discord guide](../discord.md), [STT guide](../stt.md), [Discord Voice Channel guide](../discord-voice.md), [Hands-free device voice delegation ADR](duplex-voice-engines-and-action-broker.md)
 
 ---
 
@@ -45,11 +45,10 @@ The branch now implements those code paths, but the baseline distinction remains
 voice-message STT and Voice Channel capture are separate features. Enabling STT
 does not silently enable live capture.
 
-This ADR remains authoritative for the current receive-only implementation. The
-[duplex voice and mediated actions ADR](duplex-voice-engines-and-action-broker.md)
-is a proposed follow-on for opt-in playback, pluggable voice engines, and ACP
-actions; it does not change current behavior until its phases are implemented
-and accepted.
+This ADR remains authoritative for Discord Voice Channel receive and meeting
+transcription. The [hands-free device voice delegation ADR](duplex-voice-engines-and-action-broker.md)
+describes a separate phone-to-Discord broker for daily agent operation. It does
+not depend on Discord Voice Channel capture and does not change this subsystem.
 
 ## 2. Context and Purpose
 
