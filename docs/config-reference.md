@@ -112,16 +112,18 @@ and the current validation status.
 
 ### `[discord.voice.intent]` (experimental)
 
-Opt-in intent delegation for an active Discord Voice session. Final STT text can
-propose a task for a configured target; OpenAB then asks the session operator to
-confirm the interpreted target and task in the pinned text channel before posting
-one real Discord mention. Omitting this table, or leaving `enabled = false`, keeps
-the existing receive, transcript, and summary behavior unchanged.
+Opt-in hybrid intent routing for an active Discord Voice session. Final STT text
+can propose either a task for this OpenAB bot or a delegation to a configured
+target. OpenAB asks the session operator to confirm the interpreted intent in the
+pinned text destination before executing either route. Omitting this table, or
+leaving `enabled = false`, keeps the existing receive, transcript, and summary
+behavior unchanged.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable the experimental Slice 1 intent broker. `[discord.voice].enabled` and `[stt].enabled` must also be `true`. |
 | `confirmation_timeout_seconds` | u64 | `30` | Time allowed for the operator's text yes, no, or correction. Expiration abandons the pending intent and never dispatches it automatically. |
+| `default_to_local` | bool | `false` | When `true`, an unaddressed, command-shaped utterance is proposed for this bot to execute through its existing Dispatcher/ACP path. The default preserves the original explicit-target-only behavior. |
 
 Targets form a registry keyed by a stable canonical name:
 
@@ -129,6 +131,7 @@ Targets form a registry keyed by a stable canonical name:
 [discord.voice.intent]
 enabled = true
 confirmation_timeout_seconds = 30
+default_to_local = true
 
 [discord.voice.intent.targets.sam]
 discord_user_id = "<SAM_DISCORD_BOT_USER_ID>"
@@ -142,10 +145,18 @@ Each `[discord.voice.intent.targets.<name>]` table supports:
 | `discord_user_id` | string | *required* | Real Discord user ID of the target bot. OpenAB constructs the final `<@USER_ID>` mention from this value; a display name is not sufficient. |
 | `aliases` | string[] | `[]` | Additional spoken names that resolve to this target. The canonical `<name>` is already a recognized alias, so aliases must not duplicate it after trimming and case normalization. Normalized aliases must also be unique across targets. |
 
-When intent delegation is enabled, configure at least one target. Unknown or
-ambiguous target names do not dispatch. Slice 1 accepts confirmation in Discord
-text; spoken confirmation, Voice Channel TTS, and task-result observation are
-later slices.
+At least one route must be configured: set `default_to_local = true`, register at
+least one target, or do both. A local-only setup therefore needs no `targets`
+tables. With both routes enabled, an explicitly named configured target still
+uses nonce-enforced Discord delegation; an utterance containing two configured
+targets is rejected and never falls back to local execution. An unaddressed,
+command-shaped utterance uses this bot's existing Dispatcher/ACP path only when
+`default_to_local = true`.
+
+Both routes require one Discord text confirmation. For local execution, a normal
+text control channel gets a dedicated task thread; an existing thread or a Voice
+Channel's text chat is used directly. Slice 1 does not yet accept spoken
+confirmation, play Voice Channel TTS, or observe a delegated target's result.
 
 Each receiving target bot keeps its normal OpenAB Discord/ACP flow. Allow the
 pinned dispatch channel and trust the voice-dispatching bot's **Discord user ID**:

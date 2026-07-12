@@ -1,11 +1,13 @@
 # Discord Voice Channels
 
-> **Experimental status snapshot (2026-07-12):** The implementation on
+> **Experimental status snapshot (2026-07-13):** The implementation on
 > `feat/discord-voice-receive` can register and run the `/voice` lifecycle, join
 > through Songbird 0.6, segment per-user decoded PCM, transcribe it, and explicitly
 > send a retained transcript to ACP for summary. The opt-in Slice 1 intent broker
-> adds configured target resolution, text confirmation in the pinned control
-> channel, and deterministic Discord mention dispatch. Real Discord/DAVE, two-speaker,
+> now supports hybrid routing after text confirmation in the pinned control
+> destination: unaddressed commands can run through Aragorn's existing ACP path,
+> while commands naming configured targets use deterministic Discord delegation.
+> Real Discord/DAVE, two-speaker,
 > DAVE-specific behavior, two-speaker attribution, reconnect, and long-running
 > validation have not passed yet. A live local deployment
 > now connects Discord, receives and attributes decoded audio, transcribes with Groq,
@@ -26,7 +28,8 @@ The feature lets an OpenAB bot join the Voice Channel that a user is currently i
 transcribe participants as separate Discord speakers, and post an ACP-generated
 summary to the text channel or thread that started the session. An additional
 opt-in intent broker can turn an operator's attributed speech into a proposed task,
-confirm the interpreted intent once in text, and delegate it to another OpenAB bot.
+confirm the interpreted intent once in text, and either execute it through this
+OpenAB bot's existing ACP path or delegate it to another OpenAB bot.
 
 ```text
 Discord Voice Channel
@@ -42,10 +45,10 @@ Discord Voice Channel
 
 ```text
 operator speech
-  → STT target/task proposal
+  → STT intent proposal
   → text paraphrase and confirmation
-  → real Discord mention in the pinned control channel
-  → target bot's existing Discord and ACP flow
+  → unaddressed command: this bot's existing Dispatcher/ACP flow
+  → named target: nonce-enforced Discord mention and target bot's ACP flow
 ```
 
 Slice 1 listens, confirms, and dispatches in text. It does not speak into the
@@ -56,7 +59,7 @@ Voice Channel and is not yet the final no-screen experience.
 This table records code state separately from runtime evidence. A compiling receive
 path is not proof that Discord is delivering complete, correctly attributed audio.
 
-| Area | State on 2026-07-12 |
+| Area | State on 2026-07-13 |
 |---|---|
 | Uploaded Discord voice messages | **Implemented and available** through the existing [STT feature](stt.md). |
 | Opt-in startup | **Implemented on branch.** `enabled = false` is the default. When enabled, OpenAB requires STT, registers Songbird with receive decoding, and adds `GUILD_VOICE_STATES`; disabled deployments retain the prior intent/runtime behavior. |
@@ -65,7 +68,7 @@ path is not proof that Discord is delivering complete, correctly attributed audi
 | STT pipeline | **Implemented on branch.** A bounded queue feeds workers that encode WAV in memory and call the existing STT client. No temporary audio files are written. Queue loss and STT failures are counted. |
 | Transcript | **Implemented on branch.** Text is retained in bounded process memory with user ID and timing metadata; evictions and rejected entries are counted. |
 | ACP summary | **Implemented with a security limitation.** Only explicit `/voice summary` submits the transcript. It uses the normal tool-capable ACP path; instructions in the prompt say the transcript is untrusted, but tools are not technically disabled. |
-| Intent delegation Slice 1 | **Experimental and opt-in on branch.** A configured target/task request creates one pending intent, posts a semantic paraphrase in the pinned text channel, accepts the session operator's text yes/no/correction, and dispatches one real Discord mention after confirmation. It is disabled by default. |
+| Hybrid intent Slice 1 | **Experimental and opt-in on branch.** A recognized command creates one pending intent and accepts the session operator's text yes/no/correction. With `default_to_local = true`, an unaddressed command is queued through this bot's existing Dispatcher/ACP path; a named configured target still receives one nonce-enforced real Discord mention. Both `enabled` and `default_to_local` default to `false`. |
 | Spoken confirmation, TTS, and result observation | **Later slices.** Slice 1 does not interpret a spoken yes/no, play confirmation audio, or poll the target bot's task thread for progress and completion. |
 | Automated branch verification | **Partial pass.** `cargo clippy --all-targets --features discord -- -D warnings`, 78 voice/config/runtime tests, and the 16 binary tests pass. The core library run reaches 729/730 with one pre-existing macOS `/bin/false` assertion failure. Repository-wide fmt still reports pre-existing drift; Windows and complete live Discord validation remain pending. |
 | Local Kubernetes runtime smoke | **Slice 1 startup passed.** Helm revision 7 runs `localhost:5555/openab:claude-voice-intent-s1-8acd16522718` at digest `sha256:3369087b88df1c6b29458d0b61e628d31098b8cc21bb59b9acc0afacd2286d66`, `1/1` ready with zero restarts. Logs show `voice_intent_enabled=true`. Real spoken proposal/confirmation/handoff validation remains pending. |
@@ -203,13 +206,15 @@ max_pending_segments = 8
 max_transcript_bytes = 80000
 ```
 
-Intent delegation is independently opt-in. Register each target bot under a
-stable name and list the names that the operator may say:
+Hybrid intent routing is independently opt-in. Enable local fallback when
+unaddressed commands should run through this bot, and optionally register target
+bots under stable spoken names:
 
 ```toml
 [discord.voice.intent]
 enabled = true
 confirmation_timeout_seconds = 30
+default_to_local = true
 
 [discord.voice.intent.targets.sam]
 discord_user_id = "<SAM_DISCORD_BOT_USER_ID>"
@@ -221,12 +226,15 @@ The default is `false`. Omitting `[discord.voice]` must preserve all existing Di
 `[discord.voice.intent].enabled` also defaults to `false`. Omitting it preserves
 the existing Voice receive, transcript, and explicit summary behavior. Enabling
 it requires Voice Channel receive, STT, a positive confirmation timeout, and at
-least one target. The target table name is its canonical name and is recognized
-alongside its `aliases`; `discord_user_id` must be the target bot's real Discord
-user ID so OpenAB can emit a valid mention token. Because the canonical table name
-is already an alias, do not repeat it in `aliases`, including variants that differ
-only by surrounding whitespace or letter case. Normalized aliases must be unique
-across all targets.
+least one available route. `default_to_local` also defaults to `false`; set it to
+`true` to route unaddressed, command-shaped speech through this bot's existing
+Dispatcher/ACP path. A local-only configuration may omit all target tables. If
+targets are present, the target table name is its canonical spoken name and is
+recognized alongside its `aliases`; `discord_user_id` must be the target bot's
+real Discord user ID so OpenAB can emit a valid mention token. Because the
+canonical table name is already an alias, do not repeat it in `aliases`, including
+variants that differ only by surrounding whitespace or letter case. Normalized
+aliases must be unique across all targets.
 
 `allowed_channels` under `[discord.voice]` restricts which **Voice Channels** may
 be joined. `[discord].allowed_channels` independently gates the text channel or
@@ -263,7 +271,7 @@ The text channel or thread that runs `/voice join` is also the initial intent
 confirmation and dispatch destination. The user who starts that session is the
 operator allowed to resolve its pending intent.
 
-A typical Slice 1 interaction is:
+A named-target interaction delegates to the configured bot:
 
 ```text
 Can, in the Voice Channel:
@@ -286,22 +294,62 @@ the final Discord message. The broker owns the destination, mention token, and
 dispatch idempotency; a parser, LLM, or future Realtime/Live backend may only
 propose the intent.
 
+With `default_to_local = true`, an unaddressed command instead runs through the
+same OpenAB bot (Aragorn in this example):
+
+```text
+Can, in the Voice Channel:
+  "請先查看 Open App取得issue 1368整理目前行作方向"
+
+Aragorn, in the pinned text destination:
+  "我理解為：由我直接處理『先查看 Open App取得issue 1368整理目前行作方向』，對嗎？
+   請回覆「對」、「不是」，或用「更正：...」修正。"
+
+Can, in text:
+  "對"
+
+Aragorn:
+  "已確認語音意圖；即將由我直接處理：
+   先查看 Open App取得issue 1368整理目前行作方向"
+
+Aragorn:
+  → queues the task through the existing Dispatcher and ACP agent
+```
+
+When the pinned destination is an ordinary text/news channel, the audit message
+anchors a dedicated task thread and ACP replies there. If `/voice join` was run
+from an existing thread or from a Voice Channel's text chat, Aragorn uses that
+destination directly because Discord cannot create a nested or Voice-channel
+thread.
+
 Slice 1 rules:
 
 1. One guild and active Voice-session generation can have only one pending intent.
-2. A text yes dispatches it at most once; repeated confirmation cannot duplicate the task.
+2. A text yes selects the proposed route. Local work is queued through the existing Dispatcher/ACP path; named-target work uses one nonce-enforced Discord mention.
 3. A text no cancels it without dispatch.
-4. A text correction replaces the pending target/task and asks for confirmation again.
+4. A text correction replaces the pending destination/task and asks for confirmation again; an explicit target or explicit self-directed phrase can switch routes.
 5. Timeout, `/voice stop`, or replacing the Voice session abandons the pending intent.
-6. Unknown or ambiguous configured targets do not dispatch.
+6. Explicitly naming one configured target always selects delegation. Naming two configured targets is ambiguous and never falls back to local execution.
+7. If local thread creation or Dispatcher submission definitely fails, the broker reopens confirmation instead of silently losing the task.
 
-The initial deterministic parser deliberately recognizes only a simple,
-single-target command shape such as `叫 Sam review openab issue 20`. If another
-configured target alias appears later in the task, the whole utterance is
-rejected rather than guessing the addressee. Unknown, ambiguous, or incomplete
-commands are currently silent no-ops; typed clarification and target-head
-coordination grammar remain follow-up work. During validation, use
-`/voice transcript` to distinguish an STT mismatch from a parser rejection.
+The initial deterministic parser recognizes a simple single-target command such
+as `叫 Sam review openab issue 20`. With `default_to_local = true`, it also
+recognizes unaddressed commands that have a request prefix or begin with a known
+action. These two real STT outputs are regression examples and resolve to local
+execution in opt-in mode:
+
+```text
+先查看 OpenAPI 171368整理目前施作方向
+請先查看 Open App取得issue 1368整理目前行作方向
+```
+
+Ordinary narration remains a no-op. If another configured target alias appears
+later in a targeted task, the whole utterance is rejected rather than guessing
+the addressee or treating it as local. A name absent from the target registry can
+never create a Discord delegation; the utterance is local only if it independently
+matches the local command shape. Ambiguous configured targets and incomplete
+commands are silent no-ops. During validation, use `/voice transcript` to
+distinguish an STT mismatch from a parser rejection.
 
 The receiving target does not need new Rust code. It handles the broker's message
 through the existing bot-to-bot Discord and ACP path. On every target bot, allow
@@ -381,8 +429,11 @@ For the optional Slice 1 intent broker, also verify:
 
 - [ ] A configured spoken target produces one paraphrased confirmation in the pinned text channel.
 - [ ] Text yes sends exactly one real target-bot mention; duplicate yes does not send twice.
+- [ ] With `default_to_local = true`, each documented real STT example produces a local paraphrase and queues the confirmed task through this bot's Dispatcher/ACP path.
+- [ ] A local task creates one task thread from a normal text control channel, while an existing thread or Voice Channel text chat is used directly.
+- [ ] With `default_to_local = false`, the same unaddressed speech remains a no-op and existing explicit-target behavior is unchanged.
 - [ ] Text no, correction, timeout, `/voice stop`, and session replacement follow the documented pending-intent rules.
-- [ ] An unknown or ambiguous target never dispatches.
+- [ ] An unknown name never produces a Discord target mention; two configured target names never dispatch or fall back to local execution.
 - [ ] The receiving bot admits the trusted voice bot's mention and starts its normal Discord/ACP flow.
 
 Keep the feature marked experimental until these checks pass on the same build artifact intended for deployment.

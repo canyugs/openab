@@ -539,6 +539,11 @@ pub struct DiscordVoiceIntentConfig {
     /// Time allowed for the operator to confirm or correct a proposed intent.
     #[serde(default = "default_voice_intent_confirmation_timeout_seconds")]
     pub confirmation_timeout_seconds: u64,
+    /// Treat an unaddressed, command-shaped operator utterance as a request for
+    /// this OpenAB instance to execute locally. Disabled by default so enabling
+    /// the intent broker preserves the original explicit-target-only behavior.
+    #[serde(default)]
+    pub default_to_local: bool,
     /// Canonical target name to Discord bot identity and optional spoken aliases.
     #[serde(default)]
     pub targets: BTreeMap<String, DiscordVoiceIntentTargetConfig>,
@@ -549,6 +554,7 @@ impl Default for DiscordVoiceIntentConfig {
         Self {
             enabled: false,
             confirmation_timeout_seconds: default_voice_intent_confirmation_timeout_seconds(),
+            default_to_local: false,
             targets: BTreeMap::new(),
         }
     }
@@ -573,8 +579,8 @@ impl DiscordVoiceIntentConfig {
             "discord.voice.intent.confirmation_timeout_seconds must be > 0"
         );
         anyhow::ensure!(
-            !self.targets.is_empty(),
-            "discord.voice.intent.targets must contain at least one target"
+            self.default_to_local || !self.targets.is_empty(),
+            "discord.voice.intent requires default_to_local = true or at least one target"
         );
 
         let mut aliases = HashMap::<String, String>::new();
@@ -2402,6 +2408,7 @@ enabled = true
 [discord.voice.intent]
 enabled = true
 confirmation_timeout_seconds = 45
+default_to_local = true
 
 [discord.voice.intent.targets.sam]
 discord_user_id = "123456789012345678"
@@ -2414,6 +2421,7 @@ command = "echo"
         let intent = cfg.discord.unwrap().voice.intent;
         assert!(intent.enabled);
         assert_eq!(intent.confirmation_timeout_seconds, 45);
+        assert!(intent.default_to_local);
         let sam = intent.targets.get("sam").unwrap();
         assert_eq!(sam.discord_user_id, "123456789012345678");
         assert_eq!(sam.aliases, ["Samuel", "山姆"]);
@@ -2423,6 +2431,7 @@ command = "echo"
         DiscordVoiceIntentConfig {
             enabled: true,
             confirmation_timeout_seconds: 30,
+            default_to_local: false,
             targets: BTreeMap::from([(
                 "sam".to_string(),
                 DiscordVoiceIntentTargetConfig {
@@ -2477,7 +2486,17 @@ command = "echo"
         let mut intent = valid_voice_intent_config();
         intent.targets.clear();
         let err = intent.validate(true).unwrap_err();
-        assert!(err.to_string().contains("must contain at least one target"));
+        assert!(err
+            .to_string()
+            .contains("default_to_local = true or at least one target"));
+    }
+
+    #[test]
+    fn discord_voice_intent_local_only_mode_does_not_require_targets() {
+        let mut intent = valid_voice_intent_config();
+        intent.default_to_local = true;
+        intent.targets.clear();
+        assert!(intent.validate(true).is_ok());
     }
 
     #[test]
@@ -2531,6 +2550,7 @@ command = "echo"
         let intent = DiscordVoiceIntentConfig {
             enabled: false,
             confirmation_timeout_seconds: 0,
+            default_to_local: false,
             targets: BTreeMap::new(),
         };
         assert!(intent.validate(false).is_ok());

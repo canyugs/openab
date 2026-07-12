@@ -1181,6 +1181,7 @@ mod tests {
         let intent = DiscordVoiceIntentConfig {
             enabled: true,
             confirmation_timeout_seconds: 30,
+            default_to_local: false,
             targets: BTreeMap::from([(
                 "B0".to_string(),
                 DiscordVoiceIntentTargetConfig {
@@ -1306,6 +1307,7 @@ mod tests {
         let intent = DiscordVoiceIntentConfig {
             enabled: true,
             confirmation_timeout_seconds: 30,
+            default_to_local: false,
             targets: BTreeMap::from([(
                 "B0".to_string(),
                 DiscordVoiceIntentTargetConfig {

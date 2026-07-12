@@ -1,8 +1,8 @@
-# ADR: Discord Voice Intent Delegation
+# ADR: Discord Voice Intent Routing and Execution
 
-- **Status:** Accepted — Slice 1 implemented and local startup-validated; live voice flow pending
-- **Date:** 2026-07-12
-- **Implementation:** Voice receive foundation and opt-in text-confirmed intent broker implemented
+- **Status:** Accepted — hybrid Slice 1 implemented; local rollout and live voice flow pending
+- **Date:** 2026-07-13
+- **Implementation:** Voice receive plus opt-in text-confirmed local execution and bot delegation
 - **Implementation branch:** `feat/discord-voice-receive`
 - **Direction update:** [canyugs/openab#20 comment 4951151976](https://github.com/canyugs/openab/issues/20#issuecomment-4951151976)
 - **Related:** [Discord Voice receive ADR](discord-voice.md), [Discord multi-agent guide](../multi-agent.md), [Issue #1364](https://github.com/openabdev/openab/issues/1364), [Issue #1368](https://github.com/openabdev/openab/issues/1368)
@@ -11,8 +11,9 @@
 
 ## 1. Decision
 
-The first daily voice-delegation path will build on OpenAB's existing Discord
-Voice receive implementation.
+The first daily voice-action path builds on OpenAB's existing Discord Voice
+receive implementation and supports two destinations behind the same semantic
+confirmation:
 
 ```text
 Discord Voice Channel
@@ -20,14 +21,18 @@ Discord Voice Channel
   → STT or a future Realtime/Live engine
   → semantic intent proposal
   → one semantic confirmation
-  → deterministic Discord text mention
-  → existing OpenAB bot-to-bot and ACP flow
+  → deterministic destination router
+      ├─ no named target → audit root/task thread → this OpenAB instance's ACP
+      └─ named target    → Discord mention → existing bot-to-bot and ACP flow
 ```
 
 The voice-dispatching OpenAB instance will gain a small deterministic intent
 broker inside or immediately beside its Discord Voice subsystem. It receives an
-intent proposal, asks the operator to confirm what it understood, and dispatches
-the confirmed task exactly once as a Discord message to an existing OAB agent.
+intent proposal, asks the operator to confirm what it understood, and routes the
+confirmed task once. An unaddressed command-shaped utterance may execute through
+the same instance's existing `Dispatcher` and ACP session path when explicitly
+enabled. A request naming Sam, Frodo, or another registered target is dispatched
+as a Discord message to that existing OAB agent.
 
 The receiving B0-B15 agents continue using their existing Discord and ACP code.
 They do not receive a new voice protocol or a new ACP executor.
@@ -36,9 +41,10 @@ The following are explicit decisions:
 
 - use the current Discord Voice receive branch as the foundation;
 - modify the voice-dispatching OpenAB instance;
+- allow both local ACP execution and delegation to a named OAB agent;
 - keep target OAB agents unchanged except for Discord configuration;
 - keep Discord text as the dispatch and audit surface;
-- confirm semantic intent once before dispatch;
+- confirm semantic intent and destination once before execution or dispatch;
 - let parser, LLM, Realtime, or GPT-Live implementations only propose intents;
 - let deterministic OpenAB state, not the model, perform final dispatch;
 - do not involve OCP in the first path; and
@@ -46,17 +52,34 @@ The following are explicit decisions:
 
 ## 2. Product Goal
 
-The product goal is a daily voice interface for delegating real work to the
-existing OpenAB agent fleet.
+The product goal is a daily voice interface for asking the current OpenAB agent
+to do real work, with explicit delegation only when the operator names another
+agent.
 
 The target interaction is:
 
 ```text
 Can, in Discord Voice:
+  "先查看 openab issue 1368，整理目前施作方向"
+
+OpenAB drafts:
+  destination = local (Aragorn)
+  task = inspect openab#1368 and summarize the implementation direction
+
+OpenAB asks:
+  "由我直接處理『查看 openab issue 1368，整理目前施作方向』，對嗎？"
+
+Can:
+  "對"
+
+OpenAB posts an audit root, creates a task thread, and queues the task into its
+existing ACP path.
+
+When Can instead says:
   "叫 Sam 看 canyugs/openab issue 20"
 
 OpenAB drafts:
-  target = Sam
+  destination = delegate(Sam)
   task = inspect canyugs/openab#20
 
 OpenAB asks:
@@ -73,9 +96,9 @@ OpenAB says:
   "已送出。"
 ```
 
-The confirmation checks the target and intended task. It is not a review of the
-exact generated Discord prose and it does not require another approval after a
-clear spoken yes.
+The confirmation checks the destination and intended task. It is not a review
+of the exact generated Discord prose and it does not require another approval
+after a clear yes.
 
 The final daily-use experience should not require looking at the phone. The
 implementation is deliberately sliced, however, so the first engineering slice
@@ -88,9 +111,11 @@ uses text confirmation before spoken confirmation and TTS are added.
 The voice-dispatching instance adds:
 
 - an intent proposal contract;
-- target alias resolution;
+- local-versus-target destination resolution;
+- target alias resolution for delegated requests;
 - one pending-intent state machine per guild/voice session;
 - yes/no/correction/timeout handling;
+- local audit-root and task-thread creation through the existing dispatcher;
 - exactly-once Discord mention dispatch;
 - later, spoken confirmation input;
 - later, Songbird TTS playback; and
@@ -98,7 +123,7 @@ The voice-dispatching instance adds:
 
 ### 3.2 What stays unchanged
 
-Receiving OAB agents retain the current flow:
+For a named target, receiving OAB agents retain the current flow:
 
 ```text
 Discord bot message
@@ -147,7 +172,7 @@ without helping the initial intent-confirmation loop.
 
 ## 4. Current Status
 
-### 4.1 Capability status on 2026-07-12
+### 4.1 Capability status on 2026-07-13
 
 | Capability | State | Evidence / next gap |
 |---|---|---|
@@ -157,9 +182,10 @@ without helping the initial intent-confirmation loop.
 | PCM segmentation and bounded STT queue | **Implemented** | Per-user 48 kHz stereo segmentation, in-memory WAV encoding, bounded workers, and drop accounting exist. |
 | STT and retained transcript | **Implemented; accuracy retry pending** | Groq `whisper-large-v3` with `language = "zh"` is deployed. The first sample was not reliable enough. |
 | Explicit ACP transcript summary | **Implemented** | `/voice summary` uses the current normal ACP path. This remains separate from intent delegation. |
-| Intent proposal/parser | **Implemented for the Slice 1 simple grammar** | Resolves one configured target in command-shaped speech. Target-head coordination grammar and typed clarification remain pending. |
+| Intent proposal/parser | **Hybrid Slice 1 implemented** | With `default_to_local = true`, command-shaped speech without a named target resolves to local execution. An explicit configured target still resolves to delegation. Multiple configured targets remain rejected rather than guessed. |
 | Pending intent state machine | **Implemented and unit-tested** | Session/operator binding, posting/waiting/dispatching phases, correction, timeout generations, replay protection, and stale-session cleanup exist. |
-| Text confirmation and voice-specific mention dispatch | **Implemented; local startup passed, live flow pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch are wired. The Slice 1 image starts cleanly in local Kubernetes; a real spoken proposal and target-agent handoff still require operator validation. |
+| Text-confirmed local ACP execution | **Implemented in code; rollout pending** | A confirmed local request creates a stable-nonce audit root, creates a task thread for a normal text/news control channel, and submits through the existing Dispatcher/ACP path. Existing threads and Voice Channel text chat execute in that shared channel because Discord cannot nest a thread there. |
+| Text-confirmed target delegation | **Implemented; prior local startup passed, live flow pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch remain wired. A real spoken target-agent handoff still requires operator validation. |
 | Spoken yes/no/correction | **Not started** | Captured transcript is not interpreted as confirmation state. |
 | TTS and Songbird playback | **Not started** | There is no TTS provider or playback consumer. |
 | Realtime / GPT-Live proposal backend | **Not started** | No Realtime session or tool/event integration exists. |
@@ -219,8 +245,8 @@ WaitingConfirmation
   ├─ correction ──────────────► DraftingIntent
   └─ explicit yes ────────────► Dispatching
                                     │
-                                    ├─ post failed ─► Abandoned / retryable
-                                    └─ post once ───► Dispatched ─► Idle
+                                    ├─ enqueue/post failed ─► WaitingConfirmation / retryable
+                                    └─ route accepted once ─► Dispatched ─► Idle
 ```
 
 Rules:
@@ -231,8 +257,11 @@ Rules:
 4. A timeout abandons the intent; it never dispatches automatically.
 5. Stopping or replacing the voice session abandons its pending intent.
 6. A proposal engine cannot transition directly to `Dispatching`.
-7. Dispatch is idempotent and occurs at most once for an intent ID.
-8. After a successful post, repeated STT or provider events cannot post it again.
+7. Routing is idempotent within the process and occurs at most once for an
+   intent ID/revision. Discord roots and delegated messages also use stable,
+   enforced nonces for retry recovery.
+8. After queue acceptance or a successful post, repeated STT or provider events
+   cannot route it again.
 9. A new task starts only after the previous pending confirmation is resolved.
 
 These are interaction semantics, not model prompt conventions. They must be
@@ -244,9 +273,14 @@ All proposal engines emit the same semantic contract:
 
 ```rust
 struct IntentProposal {
-    target: String,
+    destination: IntentDestination,
     task: String,
     context_refs: Vec<ContextRef>,
+}
+
+enum IntentDestination {
+    Local,
+    Delegate { target: String },
 }
 
 enum ContextRef {
@@ -261,8 +295,8 @@ Equivalent provider output:
 
 ```json
 {
-  "type": "propose_delegation",
-  "target": "sam",
+  "type": "propose_intent",
+  "destination": { "delegate": "sam" },
   "task": "看 canyugs/openab issue 20",
   "context_refs": ["github:issue/canyugs/openab#20"]
 }
@@ -276,7 +310,7 @@ struct PendingIntent {
     voice_session: VoiceSessionToken,
     guild_id: GuildId,
     speaker_id: UserId,
-    target: ResolvedTarget,
+    destination: ResolvedDestination,
     task: String,
     context_refs: Vec<ContextRef>,
     paraphrase: String,
@@ -304,21 +338,38 @@ Voice aliases resolve through configuration owned by the voice-dispatching bot:
 [discord.voice.intent]
 enabled = false
 confirmation_timeout_seconds = 30
+default_to_local = false
 
 [discord.voice.intent.targets.sam]
 discord_user_id = "<SAM_DISCORD_BOT_USER_ID>"
 aliases = ["sam", "山姆"]
 ```
 
-The exact configuration shape may change during implementation. Required
-properties are:
+`default_to_local` is backward-compatible and defaults to `false`. When it is
+`true`, an unaddressed command-shaped utterance resolves to this bot; when it is
+`false`, such speech remains ignored. A local-only setup may omit `targets`.
+Delegated destinations require:
 
 - a stable canonical target name;
 - the real Discord bot user ID;
 - spoken aliases; and
 - deterministic rejection of unknown or ambiguous targets.
 
-### 7.2 Dispatch message
+### 7.2 Local execution
+
+After confirmation, OpenAB posts a stable-nonce audit root under its own Discord
+identity. In a normal text/news control channel it creates a dedicated task
+thread, then submits the canonical task through the existing `Dispatcher`,
+`AdapterRouter`, and ACP turn driver. This is the same program-execution path as
+a normal human Discord task; the bot does not mention itself and does not create
+a second executor.
+
+If the pinned control destination is already a thread or is a Voice Channel's
+text chat, OpenAB submits directly there because Discord cannot create a nested
+thread. Those destinations therefore share the ACP session for that channel;
+a normal text control channel is preferred for isolated daily tasks.
+
+### 7.3 Delegation message
 
 After confirmation, OpenAB constructs the Discord message itself:
 
@@ -334,7 +385,7 @@ The voice session's pinned control channel is the initial dispatch destination.
 The existing target OpenAB instance then creates or joins its normal task thread
 and executes through ACP.
 
-### 7.3 Receiving bot configuration
+### 7.4 Receiving bot configuration
 
 The receiving target must include the voice bot in `trusted_bot_ids`. A trusted
 bot's explicit mention already passes the current Discord admission path even
@@ -371,10 +422,11 @@ and asks again.
 TTS speaks only bounded broker messages:
 
 ```text
-intent drafted → "要請 Sam 看 canyugs/openab#20 嗎？"
-dispatched     → "已送出。"
+local drafted  → "由我直接處理 openab#1368，對嗎？"
+delegated      → "要請 Sam 看 canyugs/openab#20 嗎？"
+routed         → "已開始處理。" / "已送出。"
 abandoned      → "已取消。"
-error          → "沒有送出，請稍後再試。"
+error          → "尚未開始，請再試一次。"
 ```
 
 V1 playback is half-duplex. While the bot is speaking, its own playback is
@@ -385,10 +437,10 @@ barge-in, wake words, and application-level echo cancellation are later work.
 
 Realtime or GPT-Live sits behind the same `IntentProposal` contract.
 
-The only delegation-related model tool/event is equivalent to:
+The only action-proposal model tool/event is equivalent to:
 
 ```text
-propose_delegation(target, task, context_refs)
+propose_intent(destination, task, context_refs)
 ```
 
 It is not given `send_discord_message`, raw Discord REST access, or direct ACP
@@ -396,11 +448,11 @@ execution.
 
 When a proposal event arrives:
 
-1. OpenAB resolves the target;
+1. OpenAB resolves local execution or one configured target;
 2. OpenAB stores a pending intent;
 3. OpenAB renders and speaks the semantic paraphrase;
 4. the same deterministic confirmation state handles yes/no/correction; and
-5. OpenAB performs the final Discord dispatch.
+5. OpenAB performs the final local ACP enqueue or Discord delegation.
 
 This lets the first slice use existing STT plus a simple parser and later swap
 in Realtime/Live without rewriting dispatch behavior.
@@ -434,8 +486,9 @@ signal, but the first intent broker does not depend on it.
 |---|---|---|
 | `crates/openab-core/src/discord_voice.rs` | PCM segmentation and retained transcript primitives | Add transport-neutral intent/confirmation state types or keep them in a new sibling module. |
 | `crates/openab-core/src/discord_voice_runtime.rs` | Songbird receive, STT workers, session generation | Feed final attributed transcript events to the intent broker; later own playback suppression. |
-| `crates/openab-core/src/discord.rs` | `/voice` commands and pinned control channel | Add intent lifecycle command/status output and deterministic mention dispatch. |
-| `crates/openab-core/src/config.rs` | Discord Voice and STT configuration | Add opt-in intent targets, timeout, parser, TTS, and later Realtime settings. Defaults remain disabled. |
+| `crates/openab-core/src/discord.rs` | `/voice` commands, pinned control channel, and normal Dispatcher ingress | Route confirmed local tasks through the existing ACP path and retain deterministic target mention dispatch. |
+| `crates/openab-core/src/discord_voice_intent.rs` | Intent parsing and pending-confirmation state | Resolve typed `Local`/`Delegate` destinations and hand local execution to the adapter only after confirmation. |
+| `crates/openab-core/src/config.rs` | Discord Voice and STT configuration | Add opt-in local default, targets, timeout, parser, TTS, and later Realtime settings. Defaults remain disabled. |
 | `crates/openab-core/src/stt.rs` | OpenAI-compatible transcription | Reuse unchanged for the first parser backend. |
 | `crates/openab-core/src/acp_turn.rs` | Typed ACP result boundary | Optional later observation input; not required for initial dispatch. |
 | `src/main.rs` | Adapter and voice manager construction | Construct the intent broker and optional TTS/proposal backend. |
@@ -462,24 +515,27 @@ all state-machine logic directly to the Songbird callback/runtime file.
 **State: implemented in code, automated tests, and local Kubernetes startup;
 real Discord Voice proposal/confirmation/handoff validation pending.**
 
-- add target/task proposal types;
+- add destination/task proposal types;
 - implement one-pending-intent state per guild/voice session;
-- start with a small target/task grammar;
+- start with a small command grammar plus explicit target aliases;
 - post the confirmation question in the pinned text channel;
 - accept text yes/no/correction;
 - implement timeout and session replacement;
-- dispatch one real Discord mention exactly once;
+- route unaddressed confirmed tasks into this instance's existing ACP path;
+- dispatch an explicitly addressed task as one real Discord mention;
 - add unit tests for every state transition; and
 - validate in `docker-desktop/openab-local`.
 
-The first deterministic parser intentionally has two documented limitations:
+The first deterministic parser intentionally has these documented limitations:
 
-- it supports command-shaped speech with one configured target, such as
+- with `default_to_local = true`, unaddressed speech must still be
+  command-shaped, such as `先查看 openab issue 1368 整理目前施作方向`;
+- it supports explicit delegation with one configured target, such as
   `叫 Sam review openab issue 20`; if another configured target alias appears
   later in the task text, the utterance is rejected rather than guessing which
   bot is the addressee; and
-- unknown, ambiguous, or missing-target requests are currently ignored instead
-  of producing the clarification required by acceptance scenario 2. Use
+- unknown or ambiguous-target requests are currently ignored instead of
+  producing the clarification required by acceptance scenario 3. Use
   `/voice transcript` while validating STT/parser mismatches. Typed resolution
   reasons and spoken/text clarification are follow-up work.
 
@@ -508,7 +564,7 @@ The first deterministic parser intentionally has two documented limitations:
 
 **State: not started.**
 
-- add a backend that emits `propose_delegation`;
+- add a backend that emits `propose_intent`;
 - preserve deterministic OpenAB confirmation and dispatch;
 - compare latency and intent quality against STT + parser; and
 - keep provider selection configurable.
@@ -527,40 +583,44 @@ The first deterministic parser intentionally has two documented limitations:
 
 ### Intent broker
 
-1. "叫 Sam 看 canyugs/openab issue 20" produces one normalized proposal.
-2. Unknown or ambiguous target produces clarification, not dispatch.
-3. Explicit yes dispatches one real mention exactly once.
-4. Explicit no abandons without dispatch.
-5. A correction replaces the proposal and asks again.
-6. Timeout, `/voice stop`, or session replacement abandons the pending intent.
-7. Duplicate STT/provider events cannot post the task twice.
-8. A model proposal alone cannot dispatch.
+1. "先查看 openab issue 1368 整理目前施作方向" produces one normalized
+   local proposal when `default_to_local = true`.
+2. "叫 Sam 看 canyugs/openab issue 20" produces one normalized delegated
+   proposal even when local-default mode is enabled.
+3. Unknown or ambiguous target produces clarification, not dispatch.
+4. Explicit yes queues one local task or posts one real mention exactly once.
+5. Explicit no abandons without execution or dispatch.
+6. A correction replaces the task and may explicitly switch destinations.
+7. Timeout, `/voice stop`, or session replacement abandons the pending intent.
+8. Duplicate STT/provider events cannot route the task twice.
+9. A model proposal alone cannot execute or dispatch.
 
 ### Discord integration
 
-9. The message is posted in the pinned text channel under the voice bot's own
-   Discord identity.
-10. The target receives a real `<@...>` mention and enters its unchanged normal
+10. A local task gets an auditable root and enters this bot's normal
+    Dispatcher/ACP path without a self-authored mention.
+11. The target receives a real `<@...>` mention and enters its unchanged normal
     bot-to-bot/ACP path.
-11. `trusted_bot_ids` admits the voice-dispatching bot without enabling all bot
+12. `trusted_bot_ids` admits the voice-dispatching bot without enabling all bot
     chatter.
-12. A dispatch failure is reported as not sent and remains safe to retry.
+13. A pre-enqueue or dispatch failure is reported as not started/sent and
+    remains safe to retry.
 
 ### Daily voice UX
 
-13. The operator hears the semantic paraphrase and can answer without looking
+14. The operator hears the semantic paraphrase and can answer without looking
     at Discord after Slice 3.
-14. "對", "不是", and a corrected task are distinguished consistently.
-15. The bot does not hear its own TTS as an affirmative confirmation.
-16. Confirmation, sent, cancelled, and error speech is short and bounded;
+15. "對", "不是", and a corrected task are distinguished consistently.
+16. The bot does not hear its own TTS as an affirmative confirmation.
+17. Confirmation, sent, cancelled, and error speech is short and bounded;
     `/voice stop` terminates playback cleanly while conversational barge-in is
     deferred.
 
 ### Optional observation
 
-17. After Slice 5, OpenAB can say that the target started only after observing
+18. After Slice 5, OpenAB can say that the local or target agent started only after observing
     corresponding Discord evidence.
-18. A final result is associated with the correct dispatched intent and is not
+19. A final result is associated with the correct routed intent and is not
     spoken into a replacement voice session accidentally.
 
 ## 14. Alternatives Considered
@@ -585,7 +645,7 @@ Rejected. The desired unit is a confirmed semantic intent, not a raw transcript.
 ### Let Realtime call Discord directly
 
 Rejected. Realtime proposes an intent; deterministic application state performs
-the dispatch after confirmation.
+local execution or target dispatch after confirmation.
 
 ### Build TTS/full duplex before the intent state machine
 
@@ -597,7 +657,7 @@ added after those semantics exist, and full duplex can wait.
 ### Positive
 
 - Reuses the branch's working Discord Voice receive and STT code.
-- Keeps real program execution in existing ACP agents.
+- Keeps real program execution in the existing local or target ACP agent.
 - Adds one small state machine instead of another execution runtime.
 - Preserves Discord bot identity and the existing multi-agent audit trail.
 - Allows a simple parser first and Realtime/Live later.
@@ -607,6 +667,11 @@ added after those semantics exist, and full duplex can wait.
 ### Trade-offs
 
 - The voice-dispatching OpenAB instance now owns additional conversation state.
+- Local queue acceptance and replay protection are process-local, not a durable
+  outbox; a process crash after confirmation can still lose queued work.
+- Dispatcher backpressure keeps the intent in `Dispatching` until capacity is
+  available, so later hardening should add a runtime-owned watchdog without
+  introducing ambiguous duplicate enqueue.
 - Slice 1 is not yet the intended no-screen UX.
 - TTS requires Discord playback and half-duplex handling.
 - V1 allows only one pending confirmation per guild/session.

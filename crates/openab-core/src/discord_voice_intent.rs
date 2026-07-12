@@ -2,9 +2,9 @@
 //!
 //! This module deliberately does not execute ACP actions. It turns a finalized
 //! transcript from the operator bound to a voice session into a proposed
-//! Discord-bot delegation, waits for one text confirmation, and then posts a
-//! deterministic bot mention into the session's control channel. Discord I/O is
-//! kept behind [`VoiceIntentMessenger`] so the state machine can make its
+//! Discord-bot delegation or a request for the voice agent itself, waits for one
+//! text confirmation, and then emits the selected action. Discord I/O is kept
+//! behind [`VoiceIntentMessenger`] so delegate dispatch can make its
 //! exactly-once transition before any network request is awaited.
 
 use crate::config::DiscordVoiceIntentConfig;
@@ -64,7 +64,7 @@ pub trait VoiceIntentMessenger: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceIntentTranscriptOutcome {
     /// The event was disabled, stale, from another speaker/channel, or was not
-    /// an unambiguous command for one configured target.
+    /// an unambiguous command for a supported destination.
     Ignored,
     /// This exact session already has an intent waiting for text confirmation.
     AwaitingConfirmation,
@@ -72,7 +72,23 @@ pub enum VoiceIntentTranscriptOutcome {
     Proposed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Confirmed work that should execute through the voice agent's own ACP path.
+///
+/// The broker keeps the intent in `Dispatching` until the caller completes the
+/// handoff. A definitely-not-enqueued failure may reopen confirmation; any
+/// repeated handoff keeps the same `intent_id` and `revision` for deduplication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalIntentExecution {
+    pub intent_id: Uuid,
+    pub revision: u64,
+    pub session: VoiceSessionToken,
+    pub control_channel_id: u64,
+    pub operator_user_id: u64,
+    pub operator_display_name: String,
+    pub task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceIntentTextOutcome {
     /// This text is unrelated to a pending confirmation and should continue
     /// through the ordinary Discord message pipeline.
@@ -83,6 +99,8 @@ pub enum VoiceIntentTextOutcome {
     /// its enforced nonce after an ambiguous transport result.
     Dispatching,
     Dispatched,
+    /// Execute this confirmed task through the voice agent's own ACP runtime.
+    ExecuteLocal(LocalIntentExecution),
     Cancelled,
     Corrected,
     /// The message used correction syntax but did not contain a usable task.
@@ -91,7 +109,7 @@ pub enum VoiceIntentTextOutcome {
 
 impl VoiceIntentTextOutcome {
     /// Whether the Discord handler must stop normal message processing.
-    pub fn consumed(self) -> bool {
+    pub fn consumed(&self) -> bool {
         !matches!(self, Self::NotApplicable)
     }
 }
@@ -105,8 +123,25 @@ struct IntentTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IntentProposal {
-    target_index: usize,
+    destination: IntentDestination,
     task: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentDestination {
+    Local,
+    Delegate { target_index: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetMatch {
+    None,
+    Delegate {
+        target_index: usize,
+        start: usize,
+        end: usize,
+    },
+    Ambiguous,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +182,7 @@ struct BrokerState {
 /// Per-process broker for the opt-in Discord voice intent flow.
 pub struct DiscordVoiceIntentBroker {
     enabled: bool,
+    default_to_local: bool,
     confirmation_timeout: Duration,
     targets: Vec<IntentTarget>,
     messenger: Arc<dyn VoiceIntentMessenger>,
@@ -161,6 +197,7 @@ impl DiscordVoiceIntentBroker {
         // The parent voice configuration is validated by the caller. Passing
         // `true` here still gives this standalone subsystem strict validation.
         config.validate(true)?;
+        let default_to_local = config.default_to_local;
 
         let mut targets = Vec::with_capacity(config.targets.len());
         for (canonical, configured) in config.targets {
@@ -190,6 +227,7 @@ impl DiscordVoiceIntentBroker {
 
         Ok(Arc::new(Self {
             enabled: config.enabled,
+            default_to_local,
             confirmation_timeout: Duration::from_secs(config.confirmation_timeout_seconds.max(1)),
             targets,
             messenger,
@@ -199,6 +237,50 @@ impl DiscordVoiceIntentBroker {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Mark a local ACP handoff as accepted by the in-process execution queue.
+    pub fn complete_local_execution(&self, request: &LocalIntentExecution) -> bool {
+        self.remove_pending_if_current(
+            request.session,
+            request.intent_id,
+            request.revision,
+            PendingPhase::Dispatching,
+        )
+    }
+
+    /// Re-arm text confirmation after a local handoff definitely was not
+    /// enqueued. Ambiguous submit results must not call this method.
+    pub fn reopen_local_execution(self: &Arc<Self>, request: &LocalIntentExecution) -> bool {
+        let waiting_epoch = {
+            let mut state = self.lock_state();
+            let Some(bound) = state.sessions.get_mut(&request.session.guild_id()) else {
+                return false;
+            };
+            if bound.token != request.session
+                || !bound.pending.as_ref().is_some_and(|pending| {
+                    pending.id == request.intent_id
+                        && pending.revision == request.revision
+                        && pending.phase == PendingPhase::Dispatching
+                        && pending.proposal.destination == IntentDestination::Local
+                })
+            {
+                return false;
+            }
+            let waiting_epoch = bound.next_waiting_epoch;
+            bound.next_waiting_epoch = bound.next_waiting_epoch.saturating_add(1);
+            let pending = bound.pending.as_mut().expect("pending was checked above");
+            pending.phase = PendingPhase::WaitingConfirmation;
+            pending.waiting_epoch = waiting_epoch;
+            waiting_epoch
+        };
+        self.schedule_timeout(
+            request.session,
+            request.intent_id,
+            request.revision,
+            waiting_epoch,
+        );
+        true
     }
 
     /// Bind the operator and Discord control channel to one exact voice session.
@@ -361,14 +443,27 @@ impl DiscordVoiceIntentBroker {
             }
 
             match confirmation {
-                Confirmation::Affirmative => {
-                    let updated = {
-                        let pending = bound.pending.as_mut().expect("pending was checked above");
-                        pending.phase = PendingPhase::Dispatching;
-                        pending.clone()
-                    };
-                    TextEffect::Dispatch(PendingMessage::from_bound(bound, updated))
-                }
+                Confirmation::Affirmative => match current.proposal.destination {
+                    IntentDestination::Delegate { .. } => {
+                        let updated = {
+                            let pending =
+                                bound.pending.as_mut().expect("pending was checked above");
+                            pending.phase = PendingPhase::Dispatching;
+                            pending.clone()
+                        };
+                        TextEffect::Dispatch(PendingMessage::from_bound(bound, updated))
+                    }
+                    IntentDestination::Local => {
+                        let updated = {
+                            let pending =
+                                bound.pending.as_mut().expect("pending was checked above");
+                            pending.phase = PendingPhase::Dispatching;
+                            pending.clone()
+                        };
+                        let message = PendingMessage::from_bound(bound, updated);
+                        TextEffect::ExecuteLocal(LocalIntentExecution::from_pending(&message))
+                    }
+                },
                 Confirmation::Negative => {
                     bound.pending = None;
                     TextEffect::Cancel(PendingMessage::from_bound(bound, current))
@@ -407,7 +502,12 @@ impl DiscordVoiceIntentBroker {
     ) -> Result<VoiceIntentTextOutcome> {
         match effect {
             TextEffect::Dispatch(message) => {
-                let target = &self.targets[message.intent.proposal.target_index];
+                let IntentDestination::Delegate { target_index } =
+                    message.intent.proposal.destination
+                else {
+                    unreachable!("only delegate intents enter Discord dispatch")
+                };
+                let target = &self.targets[target_index];
                 let content = dispatch_message(
                     target.discord_user_id,
                     message.operator_user_id,
@@ -436,9 +536,10 @@ impl DiscordVoiceIntentBroker {
                 );
                 Ok(VoiceIntentTextOutcome::Dispatched)
             }
+            TextEffect::ExecuteLocal(request) => Ok(VoiceIntentTextOutcome::ExecuteLocal(request)),
             TextEffect::Cancel(message) => {
                 let content = bounded_discord_message(format!(
-                    "<@{}> 已取消這次語音委派。",
+                    "<@{}> 已取消這次語音任務。",
                     message.operator_user_id
                 ));
                 self.messenger
@@ -453,7 +554,7 @@ impl DiscordVoiceIntentBroker {
             }
             TextEffect::RejectCorrection(message) => {
                 let content = bounded_discord_message(format!(
-                    "<@{}> 我沒有理解這個修正；請用「更正：請 B0 review PR #123」這類格式再試一次。",
+                    "<@{}> 我沒有理解這個修正；請用「更正：請 Sam review PR #123」委派，或用「更正：幫我 review PR #123」改由我處理。",
                     message.operator_user_id
                 ));
                 self.messenger
@@ -467,13 +568,48 @@ impl DiscordVoiceIntentBroker {
 
     fn resolve_proposal(&self, text: &str) -> Option<IntentProposal> {
         let normalized = NormalizedText::new(text);
+        match self.find_target_match(&normalized.value) {
+            TargetMatch::Delegate {
+                target_index,
+                start,
+                end,
+            } => {
+                if !command_prefix_allowed(&normalized.value[..start]) {
+                    return if self.default_to_local {
+                        resolve_local_task(text).map(|task| IntentProposal {
+                            destination: IntentDestination::Local,
+                            task,
+                        })
+                    } else {
+                        None
+                    };
+                }
+                let original_end = normalized.original_index(end)?;
+                let task = clean_task(&text[original_end..])?;
+                Some(IntentProposal {
+                    destination: IntentDestination::Delegate { target_index },
+                    task,
+                })
+            }
+            TargetMatch::Ambiguous => None,
+            TargetMatch::None if self.default_to_local => {
+                resolve_local_task(text).map(|task| IntentProposal {
+                    destination: IntentDestination::Local,
+                    task,
+                })
+            }
+            TargetMatch::None => None,
+        }
+    }
+
+    fn find_target_match(&self, normalized: &str) -> TargetMatch {
         let mut distinct_target: Option<usize> = None;
         let mut selected_match: Option<(usize, usize, usize)> = None;
 
         for (target_index, target) in self.targets.iter().enumerate() {
             let mut target_match: Option<(usize, usize)> = None;
             for alias in &target.aliases {
-                for (start, end) in alias_matches(&normalized.value, alias) {
+                for (start, end) in alias_matches(normalized, alias) {
                     if target_match.is_none_or(|(best_start, best_end)| {
                         start < best_start
                             || (start == best_start && end - start > best_end - best_start)
@@ -485,7 +621,7 @@ impl DiscordVoiceIntentBroker {
 
             if let Some((start, end)) = target_match {
                 if distinct_target.is_some_and(|existing| existing != target_index) {
-                    return None;
+                    return TargetMatch::Ambiguous;
                 }
                 distinct_target = Some(target_index);
                 if selected_match.is_none_or(|(_, best_start, best_end)| {
@@ -497,13 +633,15 @@ impl DiscordVoiceIntentBroker {
             }
         }
 
-        let (target_index, start, end) = selected_match?;
-        if !command_prefix_allowed(&normalized.value[..start]) {
-            return None;
+        if let Some((target_index, start, end)) = selected_match {
+            TargetMatch::Delegate {
+                target_index,
+                start,
+                end,
+            }
+        } else {
+            TargetMatch::None
         }
-        let original_end = normalized.original_index(end)?;
-        let task = clean_task(&text[original_end..])?;
-        Some(IntentProposal { target_index, task })
     }
 
     fn resolve_correction(
@@ -512,7 +650,15 @@ impl DiscordVoiceIntentBroker {
         correction: &str,
     ) -> Option<IntentProposal> {
         if let Some(proposal) = self.resolve_proposal(correction) {
-            return Some(proposal);
+            return Some(match proposal.destination {
+                IntentDestination::Local if !has_explicit_local_prefix(correction) => {
+                    IntentProposal {
+                        destination: current.destination,
+                        task: proposal.task,
+                    }
+                }
+                _ => proposal,
+            });
         }
         if self.text_mentions_any_target(correction) {
             // A target was named but the command was ambiguous or malformed;
@@ -520,7 +666,7 @@ impl DiscordVoiceIntentBroker {
             return None;
         }
         clean_task(correction).map(|task| IntentProposal {
-            target_index: current.target_index,
+            destination: current.destination,
             task,
         })
     }
@@ -540,19 +686,24 @@ impl DiscordVoiceIntentBroker {
         bound: &BoundSession,
         mut proposal: IntentProposal,
     ) -> Option<IntentProposal> {
-        let target = self.targets.get(proposal.target_index)?;
-        let confirmation_overhead =
-            confirmation_message(bound.operator_user_id, &target.canonical, "")
+        let confirmation_overhead = self
+            .confirmation_message_for(bound.operator_user_id, &proposal, "")?
+            .chars()
+            .count();
+        let dispatch_overhead = match proposal.destination {
+            IntentDestination::Delegate { target_index } => {
+                let target = self.targets.get(target_index)?;
+                dispatch_message(
+                    target.discord_user_id,
+                    bound.operator_user_id,
+                    &bound.operator_display_name,
+                    "",
+                )
                 .chars()
-                .count();
-        let dispatch_overhead = dispatch_message(
-            target.discord_user_id,
-            bound.operator_user_id,
-            &bound.operator_display_name,
-            "",
-        )
-        .chars()
-        .count();
+                .count()
+            }
+            IntentDestination::Local => 0,
+        };
         let maximum_task_chars =
             DISCORD_MESSAGE_LIMIT.saturating_sub(confirmation_overhead.max(dispatch_overhead));
         // A pathological configured name must not turn the task into only an
@@ -564,13 +715,43 @@ impl DiscordVoiceIntentBroker {
         Some(proposal)
     }
 
+    fn confirmation_message_for(
+        &self,
+        operator_user_id: u64,
+        proposal: &IntentProposal,
+        task: &str,
+    ) -> Option<String> {
+        match proposal.destination {
+            IntentDestination::Delegate { target_index } => {
+                let target = self.targets.get(target_index)?;
+                Some(delegate_confirmation_message(
+                    operator_user_id,
+                    &target.canonical,
+                    task,
+                ))
+            }
+            IntentDestination::Local => Some(local_confirmation_message(operator_user_id, task)),
+        }
+    }
+
     async fn post_confirmation_or_schedule_retry(self: &Arc<Self>, message: PendingMessage) {
-        let target = &self.targets[message.intent.proposal.target_index];
-        let content = confirmation_message(
+        let Some(content) = self.confirmation_message_for(
             message.operator_user_id,
-            &target.canonical,
+            &message.intent.proposal,
             &message.intent.proposal.task,
-        );
+        ) else {
+            warn!(
+                intent_id = %message.intent.id,
+                "Discord voice intent target disappeared before confirmation"
+            );
+            self.remove_pending_if_current(
+                message.token,
+                message.intent.id,
+                message.intent.revision,
+                PendingPhase::PostingConfirmation,
+            );
+            return;
+        };
         let nonce = confirmation_nonce(message.intent.id);
         match self
             .messenger
@@ -832,7 +1013,7 @@ impl DiscordVoiceIntentBroker {
         };
 
         let content = bounded_discord_message(format!(
-            "<@{}> 語音委派確認已逾時，未送出任何指令。",
+            "<@{}> 語音任務確認已逾時，未送出或執行任何指令。",
             expired.operator_user_id
         ));
         if let Err(error) = self
@@ -980,9 +1161,24 @@ impl PendingMessage {
     }
 }
 
+impl LocalIntentExecution {
+    fn from_pending(message: &PendingMessage) -> Self {
+        Self {
+            intent_id: message.intent.id,
+            revision: message.intent.revision,
+            session: message.token,
+            control_channel_id: message.control_channel_id,
+            operator_user_id: message.operator_user_id,
+            operator_display_name: message.operator_display_name.clone(),
+            task: message.intent.proposal.task.clone(),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum TextEffect {
     Dispatch(PendingMessage),
+    ExecuteLocal(LocalIntentExecution),
     Cancel(PendingMessage),
     Correct(PendingMessage),
     RejectCorrection(PendingMessage),
@@ -1173,6 +1369,125 @@ fn command_prefix_allowed(prefix: &str) -> bool {
     })
 }
 
+const LOCAL_REQUEST_PREFIXES: &[&str] = &[
+    "麻煩你幫我",
+    "麻烦你帮我",
+    "可以請你幫我",
+    "可以请你帮我",
+    "請你幫我",
+    "请你帮我",
+    "麻煩幫我",
+    "麻烦帮我",
+    "可以幫我",
+    "可以帮我",
+    "請幫我",
+    "请帮我",
+    "你幫我",
+    "你帮我",
+    "幫我",
+    "帮我",
+    "could you",
+    "can you",
+    "please",
+    "請",
+    "请",
+];
+
+fn resolve_local_task(text: &str) -> Option<String> {
+    let trimmed = text
+        .trim_matches(|character: char| {
+            character.is_whitespace() || is_command_separator(character)
+        })
+        .trim();
+    if let Some(remainder) = strip_local_request_prefix(trimmed) {
+        return clean_task(remainder);
+    }
+    starts_with_local_action(trimmed)
+        .then(|| clean_task(trimmed))
+        .flatten()
+}
+
+fn has_explicit_local_prefix(text: &str) -> bool {
+    let trimmed = text
+        .trim_matches(|character: char| {
+            character.is_whitespace() || is_command_separator(character)
+        })
+        .trim();
+    strip_local_request_prefix(trimmed).is_some()
+}
+
+fn strip_local_request_prefix(text: &str) -> Option<&str> {
+    let lowered = text.to_ascii_lowercase();
+    LOCAL_REQUEST_PREFIXES.iter().find_map(|prefix| {
+        if !lowered.starts_with(prefix) {
+            return None;
+        }
+        let remainder = &text[prefix.len()..];
+        if matches!(*prefix, "請" | "请")
+            && !starts_with_local_action(
+                remainder
+                    .trim_start_matches(|character: char| {
+                        character.is_whitespace() || is_command_separator(character)
+                    })
+                    .trim(),
+            )
+        {
+            return None;
+        }
+        if prefix
+            .chars()
+            .all(|character| character.is_ascii_alphabetic() || character.is_whitespace())
+            && remainder.chars().next().is_some_and(is_ascii_word)
+        {
+            None
+        } else {
+            Some(remainder)
+        }
+    })
+}
+
+fn starts_with_local_action(text: &str) -> bool {
+    const ACTIONS: &[&str] = &[
+        "檢查",
+        "检查",
+        "執行",
+        "执行",
+        "修復",
+        "修复",
+        "整理",
+        "總結",
+        "总结",
+        "調查",
+        "调查",
+        "查看",
+        "review",
+        "check",
+        "inspect",
+        "run",
+        "fix",
+        "summarize",
+        "analyse",
+        "analyze",
+    ];
+    let lowered = text.to_ascii_lowercase();
+    let lowered = lowered
+        .strip_prefix('先')
+        .map(str::trim_start)
+        .unwrap_or(&lowered);
+    ACTIONS.iter().any(|action| {
+        let Some(remainder) = lowered.strip_prefix(action) else {
+            return false;
+        };
+        !action
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+            || remainder
+                .chars()
+                .next()
+                .is_none_or(|next| !is_ascii_word(next))
+    })
+}
+
 fn clean_task(text: &str) -> Option<String> {
     let mut task = text
         .trim_matches(|character: char| {
@@ -1240,9 +1555,15 @@ fn strip_task_connector<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-fn confirmation_message(operator_user_id: u64, target: &str, task: &str) -> String {
+fn delegate_confirmation_message(operator_user_id: u64, target: &str, task: &str) -> String {
     bounded_discord_message(format!(
         "<@{operator_user_id}> 我理解為：要請 {target} {task}，對嗎？請回覆「對」、「不是」，或用「更正：...」修正。"
+    ))
+}
+
+fn local_confirmation_message(operator_user_id: u64, task: &str) -> String {
+    bounded_discord_message(format!(
+        "<@{operator_user_id}> 我理解為：由我直接處理「{task}」，對嗎？請回覆「對」、「不是」，或用「更正：...」修正。"
     ))
 }
 
@@ -1457,6 +1778,7 @@ mod tests {
         DiscordVoiceIntentConfig {
             enabled: true,
             confirmation_timeout_seconds: timeout_seconds,
+            default_to_local: false,
             targets: BTreeMap::from([
                 (
                     "B0".to_string(),
@@ -1488,6 +1810,15 @@ mod tests {
         (broker, messenger)
     }
 
+    fn local_broker(timeout_seconds: u64) -> (Arc<DiscordVoiceIntentBroker>, Arc<FakeMessenger>) {
+        let messenger = Arc::new(FakeMessenger::default());
+        let mut config = intent_config(timeout_seconds);
+        config.default_to_local = true;
+        let broker = DiscordVoiceIntentBroker::new(config, messenger.clone())
+            .expect("valid local-first test broker");
+        (broker, messenger)
+    }
+
     async fn propose(broker: &Arc<DiscordVoiceIntentBroker>, token: VoiceSessionToken) {
         assert_eq!(
             broker
@@ -1500,6 +1831,25 @@ mod tests {
                         end_frame: 200,
                     },
                     text: "幫我叫 B0 group review PR #123".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Proposed
+        );
+    }
+
+    async fn propose_local(broker: &Arc<DiscordVoiceIntentBroker>, token: VoiceSessionToken) {
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 100,
+                        end_frame: 200,
+                    },
+                    text: "請幫我 review PR #123".to_string(),
                 })
                 .await
                 .unwrap(),
@@ -1520,7 +1870,7 @@ mod tests {
             assert_eq!(
                 broker.resolve_proposal(command),
                 Some(IntentProposal {
-                    target_index: 0,
+                    destination: IntentDestination::Delegate { target_index: 0 },
                     task: "group review PR #123".to_string(),
                 }),
                 "command should resolve: {command}"
@@ -1534,6 +1884,61 @@ mod tests {
             .is_none());
         assert!(broker.resolve_proposal("請 B0").is_none());
         assert!(broker.resolve_proposal("請 B01 review").is_none());
+        assert!(broker.resolve_proposal("請幫我 review PR #123").is_none());
+    }
+
+    #[test]
+    fn local_mode_only_falls_back_for_command_shaped_unaddressed_tasks() {
+        let (broker, _) = local_broker(30);
+        assert_eq!(
+            broker.resolve_proposal("請幫我 review PR #123"),
+            Some(IntentProposal {
+                destination: IntentDestination::Local,
+                task: "review PR #123".to_string(),
+            })
+        );
+        assert_eq!(
+            broker.resolve_proposal("run CI"),
+            Some(IntentProposal {
+                destination: IntentDestination::Local,
+                task: "run CI".to_string(),
+            })
+        );
+        for command in [
+            "先查看 OpenAPI 171368整理目前施作方向",
+            "請先查看 Open App取得issue 1368整理目前行作方向",
+        ] {
+            assert_eq!(
+                broker
+                    .resolve_proposal(command)
+                    .map(|proposal| proposal.destination),
+                Some(IntentDestination::Local),
+                "real STT command should resolve locally: {command}"
+            );
+        }
+        assert_eq!(
+            broker.resolve_proposal("請幫我叫 Sam group review PR #123"),
+            Some(IntentProposal {
+                destination: IntentDestination::Delegate { target_index: 0 },
+                task: "group review PR #123".to_string(),
+            })
+        );
+        assert!(broker
+            .resolve_proposal("請 B0 跟 B1 一起 review PR #123")
+            .is_none());
+        assert!(broker.resolve_proposal("我昨天 review PR #123").is_none());
+    }
+
+    #[test]
+    fn target_name_inside_a_local_task_does_not_force_delegation() {
+        let (broker, _) = local_broker(30);
+        assert_eq!(
+            broker.resolve_proposal("先查看 Sam 的 PR 狀態"),
+            Some(IntentProposal {
+                destination: IntentDestination::Local,
+                task: "先查看 Sam 的 PR 狀態".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -1628,6 +2033,207 @@ mod tests {
             .nonce
             .as_deref()
             .is_some_and(|nonce| nonce.starts_with("oabp1") && nonce.len() == 25));
+    }
+
+    #[tokio::test]
+    async fn unaddressed_commands_remain_ignored_when_local_mode_is_disabled() {
+        let (broker, messenger) = broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 100,
+                        end_frame: 200,
+                    },
+                    text: "請幫我 review PR #123".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Ignored
+        );
+        assert!(messenger.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn affirmative_emits_one_local_execution_without_a_delegate_message() {
+        let (broker, messenger) = local_broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+        propose_local(&broker, current).await;
+
+        let prompt = messenger.messages().pop().unwrap();
+        assert!(prompt
+            .content
+            .contains("由我直接處理「review PR #123」"));
+        let outcome = broker
+            .handle_text_message(100, 200, 300, "對")
+            .await
+            .unwrap();
+        let VoiceIntentTextOutcome::ExecuteLocal(request) = outcome else {
+            panic!("expected local execution handoff")
+        };
+        assert_ne!(request.intent_id, Uuid::nil());
+        assert_eq!(request.revision, 1);
+        assert_eq!(request.session, current);
+        assert_eq!(request.control_channel_id, 200);
+        assert_eq!(request.operator_user_id, 300);
+        assert_eq!(request.operator_display_name, "Can");
+        assert_eq!(request.task, "review PR #123");
+
+        assert_eq!(messenger.messages().len(), 1);
+        assert!(messenger.messages().iter().all(|message| !message
+            .nonce
+            .as_deref()
+            .is_some_and(|nonce| nonce.starts_with("oabv1"))));
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "對")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::AlreadyProcessing
+        );
+        assert!(broker.reopen_local_execution(&request));
+        assert!(!broker.reopen_local_execution(&request));
+        let VoiceIntentTextOutcome::ExecuteLocal(retried) = broker
+            .handle_text_message(100, 200, 300, "對")
+            .await
+            .unwrap()
+        else {
+            panic!("expected reopened local execution handoff")
+        };
+        assert_eq!(retried, request);
+        assert!(broker.complete_local_execution(&retried));
+        assert!(!broker.complete_local_execution(&retried));
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "對")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::NotApplicable
+        );
+    }
+
+    #[tokio::test]
+    async fn local_mode_preserves_explicit_target_delegation() {
+        let (broker, messenger) = local_broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+        propose(&broker, current).await;
+
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "對")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::Dispatched
+        );
+        assert_eq!(
+            messenger
+                .messages()
+                .iter()
+                .filter(|message| message.content.starts_with("<@9000>"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn local_intent_can_be_cancelled_without_execution() {
+        let (broker, messenger) = local_broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+        propose_local(&broker, current).await;
+
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "不是")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::Cancelled
+        );
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "對")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::NotApplicable
+        );
+        assert!(messenger.messages().iter().all(|message| !message
+            .nonce
+            .as_deref()
+            .is_some_and(|nonce| nonce.starts_with("oabv1"))));
+    }
+
+    #[tokio::test]
+    async fn correction_switches_modes_only_when_the_new_destination_is_explicit() {
+        let (broker, messenger) = local_broker(30);
+        let first = token(100, 1);
+        broker.bind_session(first, 200, 300, "Can");
+        propose_local(&broker, first).await;
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "更正：請 B1 run CI")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::Corrected
+        );
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "對")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::Dispatched
+        );
+        assert!(messenger
+            .messages()
+            .last()
+            .unwrap()
+            .content
+            .starts_with("<@9001>"));
+
+        let second = token(100, 2);
+        broker.bind_session(second, 200, 300, "Can");
+        propose(&broker, second).await;
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "更正：review only")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::Corrected
+        );
+        assert!(messenger
+            .messages()
+            .last()
+            .unwrap()
+            .content
+            .contains("B0 review only"));
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "更正：你幫我 run CI")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::Corrected
+        );
+        assert!(messenger
+            .messages()
+            .last()
+            .unwrap()
+            .content
+            .contains("由我直接處理「run CI」"));
+        let VoiceIntentTextOutcome::ExecuteLocal(request) = broker
+            .handle_text_message(100, 200, 300, "對")
+            .await
+            .unwrap()
+        else {
+            panic!("expected correction to switch to local execution")
+        };
+        assert_eq!(request.task, "run CI");
     }
 
     #[tokio::test]

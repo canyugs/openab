@@ -3,7 +3,7 @@
 - **Status:** Proposed — one-speaker live receive passed; accuracy and soak validation pending
 - **Date:** 2026-07-12
 - **Implementation branch:** `feat/discord-voice-receive`
-- **Related:** [Discord guide](../discord.md), [STT guide](../stt.md), [Discord Voice Channel guide](../discord-voice.md), [Discord Voice intent delegation ADR](duplex-voice-engines-and-action-broker.md)
+- **Related:** [Discord guide](../discord.md), [STT guide](../stt.md), [Discord Voice Channel guide](../discord-voice.md), [Discord Voice intent routing ADR](duplex-voice-engines-and-action-broker.md)
 
 ---
 
@@ -25,7 +25,7 @@ This table records implementation state separately from runtime validation. Upda
 | Local Discord/Groq/Claude readiness | **Passed; Slice 1 startup passed** | Helm revision 7 runs `localhost:5555/openab:claude-voice-intent-s1-8acd16522718` at digest `sha256:3369087b88df1c6b29458d0b61e628d31098b8cc21bb59b9acc0afacd2286d66`, `1/1` ready with zero restarts. Logs confirm `voice_intent_enabled=true`, Groq STT, Aragorn connected, and slash commands registered. A real spoken proposal and target-agent handoff remain pending. |
 | Real Discord receive | **Passed for one speaker** | The first Songbird join exposed a Rustls 0.23 provider ambiguity in unified builds. Commit `7b8f90f` explicitly selects AWS-LC when AgentCore features are present and ring for Discord-only builds. After that fix, join, decoded receive, attribution, timestamps, and raw transcript download passed. The rollout ended the session; explicit stop and DAVE remain separate checks. |
 | STT accuracy sample | **Failed; controlled retry pending** | The first four-segment raw transcript preserved one-speaker attribution and timing, but contained an ellipsis-only segment, an incorrect-language hallucination, and unreliable Chinese text. Image `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88` is deployed with `whisper-large-v3` plus `language = "zh"` for the next A/B sample. |
-| Voice intent broker | **Slice 1 implemented; live validation pending** | Attributed operator transcript can resolve a simple one-target command, ask for text confirmation, and dispatch a nonce-enforced real Discord mention exactly once. Target-head coordination grammar and typed clarification remain follow-up work. |
+| Voice intent broker | **Hybrid Slice 1 implemented; rollout/live validation pending** | With explicit opt-in, an unaddressed command-shaped transcript asks for text confirmation and then enters Aragorn's existing Dispatcher/ACP path; a request naming one configured target still dispatches a nonce-enforced real Discord mention. Target-head coordination grammar and typed clarification remain follow-up work. |
 | Spoken confirmation and TTS | **Not started** | Text confirmation is the first engineering slice. Spoken yes/no plus Songbird TTS is the first hands-free daily milestone. |
 | Realtime/Live and result observation | **Not started; optional later slices** | Realtime/Live must emit the same proposal contract. Thread observation must not block the initial confirmed-dispatch loop. |
 | Two-speaker and reconnect soak test | **Pending real-world validation** | Attribution, reconnect health beyond a unit state transition, and a 30-minute minimum soak remain unverified. |
@@ -49,10 +49,10 @@ voice-message STT and Voice Channel capture are separate features. Enabling STT
 does not silently enable live capture.
 
 This ADR remains authoritative for Discord Voice Channel receive and transcript
-retention. The [Discord Voice intent delegation ADR](duplex-voice-engines-and-action-broker.md)
+retention. The [Discord Voice intent routing ADR](duplex-voice-engines-and-action-broker.md)
 builds directly on this subsystem: attributed transcript becomes a pending
-semantic intent, receives one confirmation, and is dispatched through the
-existing Discord bot-to-bot path.
+semantic intent, receives one confirmation, and is routed either through this
+instance's existing ACP path or the existing Discord bot-to-bot path.
 
 ## 2. Context and Purpose
 
