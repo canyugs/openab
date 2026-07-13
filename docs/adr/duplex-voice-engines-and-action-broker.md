@@ -1,8 +1,8 @@
 # ADR: Discord Voice Intent Routing and Execution
 
-- **Status:** Accepted — hybrid Slice 1 implemented and local startup-validated; live voice flow pending
+- **Status:** Accepted — hybrid Slices 1-3 implemented; live spoken/TTS validation pending
 - **Date:** 2026-07-13
-- **Implementation:** Voice receive plus opt-in text-confirmed local execution and bot delegation
+- **Implementation:** Voice receive plus opt-in spoken/text-confirmed local execution and bot delegation with half-duplex TTS
 - **Implementation branch:** `feat/discord-voice-receive`
 - **Direction update:** [canyugs/openab#20 comment 4951151976](https://github.com/canyugs/openab/issues/20#issuecomment-4951151976)
 - **Related:** [Discord Voice receive ADR](discord-voice.md), [Discord multi-agent guide](../multi-agent.md), [Issue #1364](https://github.com/openabdev/openab/issues/1364), [Issue #1368](https://github.com/openabdev/openab/issues/1368)
@@ -20,7 +20,8 @@ Discord Voice Channel
   → OpenAB Songbird receive
   → STT or a future Realtime/Live engine
   → semantic intent proposal
-  → one semantic confirmation
+  → bounded spoken paraphrase (with text fallback)
+  → one spoken or text semantic confirmation
   → deterministic destination router
       ├─ no named target → audit root/task thread → this OpenAB instance's ACP
       └─ named target    → Discord mention → existing bot-to-bot and ACP flow
@@ -100,9 +101,11 @@ The confirmation checks the destination and intended task. It is not a review
 of the exact generated Discord prose and it does not require another approval
 after a clear yes.
 
-The final daily-use experience should not require looking at the phone. The
-implementation is deliberately sliced, however, so the first engineering slice
-uses text confirmation before spoken confirmation and TTS are added.
+The daily-use experience does not require looking at the phone when TTS is
+configured: the bot speaks the paraphrase, accepts the operator's spoken
+yes/no/correction, and speaks a short local/delegated acknowledgement. The pinned
+text prompt and confirmation path remain available as an audit and operational
+fallback.
 
 ## 3. Revised Boundary
 
@@ -117,8 +120,8 @@ The voice-dispatching instance adds:
 - yes/no/correction/timeout handling;
 - local audit-root and task-thread creation through the existing dispatcher;
 - exactly-once Discord mention dispatch;
-- later, spoken confirmation input;
-- later, Songbird TTS playback; and
+- spoken confirmation input;
+- OpenAI-compatible TTS and half-duplex Songbird playback; and
 - optionally, thread/result observation.
 
 ### 3.2 What stays unchanged
@@ -186,8 +189,8 @@ without helping the initial intent-confirmation loop.
 | Pending intent state machine | **Implemented and unit-tested** | Session/operator binding, posting/waiting/dispatching phases, correction, timeout generations, replay protection, and stale-session cleanup exist. |
 | Text-confirmed local ACP execution | **Implemented; local startup passed, live task pending** | A confirmed local request creates a stable-nonce audit root, creates a task thread for a normal text/news control channel, and submits through the existing Dispatcher/ACP path. Existing threads and Voice Channel text chat execute in that shared channel because Discord cannot nest a thread there. |
 | Text-confirmed target delegation | **Implemented; local sender/receiver startup passed, live handoff pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch remain wired. The receiver now reuses Voice Channel text chat instead of trying to create an unsupported thread. A real spoken target-agent handoff still requires operator validation. |
-| Spoken yes/no/correction | **Not started** | Captured transcript is not interpreted as confirmation state. |
-| TTS and Songbird playback | **Not started** | There is no TTS provider or playback consumer. |
+| Spoken yes/no/correction | **Implemented and unit-tested; live validation pending** | Final STT from the bound operator resolves the same pending state as text. Explicit yes/no/correction is accepted, unrelated speech leaves the intent pending, and replayed segments are ignored. |
+| TTS and Songbird playback | **Implemented; live provider/Voice validation pending** | Opt-in `[tts]` uses an OpenAI-compatible `/audio/speech` endpoint, requests bounded WAV audio, and plays bounded proposal/acknowledgement feedback through Songbird. Capture is suppressed and partial buffers are cleared during half-duplex playback; text remains the fallback. |
 | Realtime / GPT-Live proposal backend | **Not started** | No Realtime session or tool/event integration exists. |
 | Thread/result observation | **Not started** | Existing Discord seams are available, but no voice job observer is wired. |
 | Typed ACP completion seam | **Implemented and unit-tested; orthogonal** | Useful later for structured observation, but not a v1 dispatch blocker. |
@@ -215,9 +218,10 @@ The local delegated receiver is also healthy:
   trusts Aragorn's Discord bot identity.
 
 Startup logs confirm `voice_intent_enabled=true`, Groq STT configuration,
-Aragorn's Discord connection, and global slash-command registration. This is
-configuration and runtime-startup evidence, not yet proof of a spoken proposal,
-text confirmation, local ACP task, Sam/Frodo handoff, TTS, or Realtime. The previous
+Aragorn's Discord connection, and global slash-command registration. This
+recorded deployment still predates the Slice 2+3 code and is therefore not proof
+of a spoken proposal, spoken confirmation, local ACP task, Sam/Frodo handoff,
+TTS playback, or Realtime. The previous
 `claude-voice-zh-stt` image predates Slice 1 and is no longer the active local
 artifact.
 
@@ -227,13 +231,13 @@ artifact.
 |---|---|---|
 | Existing receive/STT | Meeting-style capture, transcript, explicit summary | No |
 | Slice 1: text confirmation | Validates intent broker and dispatch, but requires looking at Discord | No |
-| Slice 2: spoken confirmation | The operator can answer by voice, but the prompt is still text-only | Not fully |
-| Slice 3: TTS playback | Confirmation, sent, cancelled, and error prompts are audible | **First hands-free daily milestone** |
+| Slice 2: spoken confirmation | Implemented; the operator can answer by voice while text remains a fallback | Code complete; live validation pending |
+| Slice 3: TTS playback | Implemented; confirmation, sent, cancelled, and error prompts are audible | **First hands-free daily milestone; live validation pending** |
 | Slice 4: Realtime/Live | Improves conversational parsing and response latency | Enhancement |
 | Slice 5: observation | Enables "I will keep tracking and report back" | Full daily-assistant loop |
 
-Text-first confirmation is implementation scaffolding, not the final product
-experience.
+Text confirmation remains a fallback and audit surface, not a requirement for the
+hands-free path.
 
 ## 5. V1 Intent State Machine
 
@@ -407,9 +411,10 @@ No target-agent Rust change is required.
 
 ### 8.1 Slice 1: text scaffold
 
-The first implementation posts the paraphrase in the pinned text channel and
-accepts an explicit text yes/no/correction. This validates parsing, state,
-timeout, and exactly-once dispatch.
+The implementation posts the paraphrase in the pinned text channel and accepts
+an explicit text yes/no/correction. This validates parsing, state, timeout, and
+exactly-once dispatch, and remains the fallback when TTS is disabled or playback
+fails.
 
 It is not described as hands-free or daily-ready because the operator must look
 at Discord.
@@ -425,7 +430,8 @@ generation are interpreted as:
 - unrelated speech.
 
 Unrelated speech leaves the intent pending. A correction replaces the intent
-and asks again.
+and asks again. This path is implemented through the same deterministic state
+transition as text confirmation; live Discord Voice validation is still pending.
 
 ### 8.3 Slice 3: TTS prompt and feedback
 
@@ -440,8 +446,16 @@ error          → "尚未開始，請再試一次。"
 ```
 
 V1 playback is half-duplex. While the bot is speaking, its own playback is
-suppressed or ignored by the capture/confirmation pipeline. Full duplex,
+suppressed by the capture/confirmation pipeline and partial capture buffers are
+discarded before and after playback. Track end/error events and a duration
+watchdog release suppression for the exact session/playback generation. Full duplex,
 barge-in, wake words, and application-level echo cancellation are later work.
+
+TTS is configured independently under `[tts]` and defaults to disabled. The
+provider contract is OpenAI-compatible `/audio/speech`; `gpt-4o-mini-tts` and
+`marin` are defaults only, not required provider choices. The client explicitly
+requests WAV and bounds each response. If TTS is unavailable, the text prompt and
+text confirmation path remain usable.
 
 ## 9. Realtime and GPT-Live Backends
 
@@ -495,11 +509,13 @@ signal, but the first intent broker does not depend on it.
 | File | Existing responsibility | Intent-delegation change |
 |---|---|---|
 | `crates/openab-core/src/discord_voice.rs` | PCM segmentation and retained transcript primitives | Add transport-neutral intent/confirmation state types or keep them in a new sibling module. |
-| `crates/openab-core/src/discord_voice_runtime.rs` | Songbird receive, STT workers, session generation | Feed final attributed transcript events to the intent broker; later own playback suppression. |
+| `crates/openab-core/src/discord_voice_runtime.rs` | Songbird receive, STT workers, session generation | Feed final attributed transcript events to the intent broker, synthesize bounded feedback, and own session/epoch-bound playback suppression. |
 | `crates/openab-core/src/discord.rs` | `/voice` commands, pinned control channel, and normal Dispatcher ingress | Route confirmed local tasks through the existing ACP path and retain deterministic target mention dispatch. |
-| `crates/openab-core/src/discord_voice_intent.rs` | Intent parsing and pending-confirmation state | Resolve typed `Local`/`Delegate` destinations and hand local execution to the adapter only after confirmation. |
-| `crates/openab-core/src/config.rs` | Discord Voice and STT configuration | Add opt-in local default, targets, timeout, parser, TTS, and later Realtime settings. Defaults remain disabled. |
+| `crates/openab-core/src/discord_voice_intent.rs` | Intent parsing and pending-confirmation state | Resolve typed `Local`/`Delegate` destinations, handle spoken and text confirmation, and hand local execution to the adapter only after confirmation. |
+| `crates/openab-core/src/config.rs` | Discord Voice, STT, and TTS configuration | Provide opt-in local default, targets, timeout, parser, and OpenAI-compatible TTS settings; later add Realtime settings. Defaults remain disabled. |
 | `crates/openab-core/src/stt.rs` | OpenAI-compatible transcription | Reuse unchanged for the first parser backend. |
+| `crates/openab-core/src/tts.rs` | OpenAI-compatible speech synthesis | Request bounded WAV speech from the configured provider. |
+| `crates/openab-core/src/discord_voice_speech.rs` | TTS WAV decoding and playback conversion | Validate/decode provider WAV and build Songbird PCM input. |
 | `crates/openab-core/src/acp_turn.rs` | Typed ACP result boundary | Optional later observation input; not required for initial dispatch. |
 | `src/main.rs` | Adapter and voice manager construction | Construct the intent broker and optional TTS/proposal backend. |
 
@@ -551,7 +567,7 @@ The first deterministic parser intentionally has these documented limitations:
 
 ### Slice 2 — Spoken confirmation
 
-**State: not started.**
+**State: implemented and unit-tested; live spoken confirmation validation pending.**
 
 - route final STT segments to confirmation matching while an intent is pending;
 - accept spoken yes/no/correction from the same session;
@@ -561,7 +577,8 @@ The first deterministic parser intentionally has these documented limitations:
 
 ### Slice 3 — Songbird TTS playback
 
-**State: not started. This is the first hands-free daily milestone.**
+**State: implemented in code; live provider and Discord playback validation
+pending. This is the first hands-free daily milestone.**
 
 - add a TTS provider contract;
 - add Songbird playback;
@@ -682,8 +699,10 @@ added after those semantics exist, and full duplex can wait.
 - Dispatcher backpressure keeps the intent in `Dispatching` until capacity is
   available, so later hardening should add a runtime-owned watchdog without
   introducing ambiguous duplicate enqueue.
-- Slice 1 is not yet the intended no-screen UX.
-- TTS requires Discord playback and half-duplex handling.
+- The no-screen path still depends on a configured TTS provider and has not yet
+  passed live Discord Voice playback validation.
+- V1 TTS is half-duplex: operator capture is intentionally unavailable while the
+  bot is speaking.
 - V1 allows only one pending confirmation per guild/session.
 - Background progress/reporting arrives after the core dispatch loop.
 - Full duplex, barge-in, wake words, and echo cancellation remain later work.

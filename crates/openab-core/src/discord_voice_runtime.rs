@@ -4,12 +4,17 @@
 //! enqueue completed PCM segments. WAV encoding and STT run in a bounded worker
 //! so a slow transcription provider cannot stall Discord's 20 ms receive loop.
 
-use crate::config::{DiscordVoiceConfig, SttConfig};
+use crate::config::{DiscordVoiceConfig, SttConfig, TtsConfig};
+use crate::discord::{DiscordVoiceIntentActionExecutor, DiscordVoiceIntentActionOutcome};
 use crate::discord_voice::{
     PcmCaptureConfig, PcmSegment, SpeakerPcmBuffer, TranscriptEntry, TranscriptStore,
     VoiceDropCounters, VoiceDropSnapshot,
 };
-use crate::discord_voice_intent::{DiscordVoiceIntentBroker, FinalTranscriptEvent, TranscriptKey};
+use crate::discord_voice_intent::{
+    DiscordVoiceIntentBroker, FinalTranscriptEvent, TranscriptKey, VoiceIntentTextOutcome,
+    VoiceIntentTranscriptOutcome,
+};
+use crate::discord_voice_speech::DiscordVoiceSpeechAudio;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use songbird::model::payload::{ClientDisconnect, Speaking};
@@ -27,6 +32,8 @@ const DEFAULT_SILENCE_THRESHOLD: u16 = 500;
 const MAX_TRANSCRIPT_ENTRIES: usize = 10_000;
 const MAX_TRACKED_SPEAKERS: usize = 25;
 const STT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const TTS_POST_ROLL: Duration = Duration::from_millis(300);
+const TTS_WATCHDOG_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceConnectionState {
@@ -128,22 +135,35 @@ struct VoiceSession {
     stt_failures: Arc<AtomicU64>,
     drops: Arc<VoiceDropCounters>,
     ignored_speakers: u64,
+    capture_suppressed: bool,
+    playback_epoch: u64,
 }
 
 /// Owns at most one voice session per Discord guild.
 pub struct DiscordVoiceManager {
     config: DiscordVoiceConfig,
     stt_config: SttConfig,
+    tts_config: TtsConfig,
+    tts_client: reqwest::Client,
     capture_config: PcmCaptureConfig,
     allowed_voice_channels: HashSet<u64>,
     sessions: Mutex<HashMap<u64, VoiceSession>>,
     songbird: OnceLock<Arc<songbird::Songbird>>,
     intent_broker: OnceLock<Arc<DiscordVoiceIntentBroker>>,
+    intent_action_executor: OnceLock<Arc<DiscordVoiceIntentActionExecutor>>,
     next_session_id: AtomicU64,
 }
 
 impl DiscordVoiceManager {
     pub fn new(config: DiscordVoiceConfig, stt_config: SttConfig) -> Result<Arc<Self>> {
+        Self::new_with_tts(config, stt_config, TtsConfig::default())
+    }
+
+    pub fn new_with_tts(
+        config: DiscordVoiceConfig,
+        stt_config: SttConfig,
+        tts_config: TtsConfig,
+    ) -> Result<Arc<Self>> {
         if config.max_pending_segments == 0 {
             return Err(anyhow!(
                 "discord.voice.max_pending_segments must be greater than zero"
@@ -189,11 +209,14 @@ impl DiscordVoiceManager {
         Ok(Arc::new(Self {
             config,
             stt_config,
+            tts_config,
+            tts_client: reqwest::Client::new(),
             capture_config,
             allowed_voice_channels,
             sessions: Mutex::new(HashMap::new()),
             songbird: OnceLock::new(),
             intent_broker: OnceLock::new(),
+            intent_action_executor: OnceLock::new(),
             next_session_id: AtomicU64::new(1),
         }))
     }
@@ -204,6 +227,10 @@ impl DiscordVoiceManager {
 
     pub fn stt_ready(&self) -> bool {
         self.stt_config.enabled && !self.stt_config.api_key.is_empty()
+    }
+
+    pub fn tts_ready(&self) -> bool {
+        self.tts_config.enabled && !self.tts_config.api_key.trim().is_empty()
     }
 
     pub fn voice_channel_allowed(&self, channel_id: u64) -> bool {
@@ -219,6 +246,11 @@ impl DiscordVoiceManager {
     /// behavior.
     pub fn attach_intent_broker(&self, broker: Arc<DiscordVoiceIntentBroker>) {
         let _ = self.intent_broker.set(broker);
+    }
+
+    /// Attaches the reusable local ACP handoff used by spoken confirmations.
+    pub fn attach_intent_action_executor(&self, executor: Arc<DiscordVoiceIntentActionExecutor>) {
+        let _ = self.intent_action_executor.set(executor);
     }
 
     fn abandon_intent_session(&self, token: VoiceSessionToken) {
@@ -279,6 +311,8 @@ impl DiscordVoiceManager {
             stt_failures: stt_failures.clone(),
             drops: drops.clone(),
             ignored_speakers: 0,
+            capture_suppressed: false,
+            playback_epoch: 0,
         };
 
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -313,7 +347,7 @@ impl DiscordVoiceManager {
 
         let intent = self.intent_broker.get().cloned().map(|broker| {
             let (tx, rx) = mpsc::channel(self.config.max_pending_segments);
-            drop(spawn_intent_worker(rx, broker));
+            drop(spawn_intent_worker(rx, broker, Arc::downgrade(self)));
             IntentWorkerContext {
                 tx,
                 token,
@@ -618,6 +652,111 @@ impl DiscordVoiceManager {
         }
     }
 
+    async fn speak(self: &Arc<Self>, token: VoiceSessionToken, text: &str) -> Result<bool> {
+        if !self.tts_config.enabled || self.tts_config.api_key.trim().is_empty() {
+            return Ok(false);
+        }
+        if self
+            .status_for(token)
+            .is_none_or(|status| !status.is_active())
+        {
+            return Ok(false);
+        }
+
+        let wav = crate::tts::synthesize_wav(&self.tts_client, &self.tts_config, text).await?;
+        let audio = DiscordVoiceSpeechAudio::from_wav(&wav)?;
+        let duration = audio.duration();
+        let Some(epoch) = self.begin_playback(token) else {
+            return Ok(false);
+        };
+        let Some(songbird) = self.songbird.get() else {
+            self.finish_playback(token, epoch);
+            return Err(anyhow!(
+                "Songbird is not attached to the Discord voice manager"
+            ));
+        };
+        let guild_id = serenity::model::id::GuildId::new(token.guild_id);
+        let Some(call) = songbird.get(guild_id) else {
+            self.finish_playback(token, epoch);
+            return Ok(false);
+        };
+
+        let track = {
+            let mut call = call.lock().await;
+            call.play_only_input(audio.into_songbird_input())
+        };
+        let release = VoicePlaybackFinished {
+            manager: Arc::downgrade(self),
+            token,
+            epoch,
+        };
+        if let Err(err) = track.add_event(
+            Event::Track(songbird::events::TrackEvent::End),
+            release.clone(),
+        ) {
+            self.finish_playback(token, epoch);
+            return Err(anyhow!("failed to watch Discord TTS playback end: {err}"));
+        }
+        if let Err(err) =
+            track.add_event(Event::Track(songbird::events::TrackEvent::Error), release)
+        {
+            self.finish_playback(token, epoch);
+            return Err(anyhow!(
+                "failed to watch Discord TTS playback errors: {err}"
+            ));
+        }
+
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(duration + TTS_WATCHDOG_GRACE + TTS_POST_ROLL).await;
+            if let Some(manager) = manager.upgrade() {
+                manager.finish_playback(token, epoch);
+            }
+        });
+        info!(
+            guild_id = token.guild_id,
+            playback_epoch = epoch,
+            duration_ms = duration.as_millis(),
+            "started Discord voice TTS playback"
+        );
+        Ok(true)
+    }
+
+    fn begin_playback(&self, token: VoiceSessionToken) -> Option<u64> {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let session = sessions.get_mut(&token.guild_id)?;
+        if session.id != token.session_id || session.state != VoiceConnectionState::Listening {
+            return None;
+        }
+        session.playback_epoch = session.playback_epoch.saturating_add(1);
+        session.capture_suppressed = true;
+        // Discard partial capture instead of enqueuing it: it may contain the
+        // start of the bot's own playback through an operator's speakers.
+        session.captures.clear();
+        Some(session.playback_epoch)
+    }
+
+    fn finish_playback(&self, token: VoiceSessionToken, epoch: u64) -> bool {
+        let finished = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(session) = sessions.get_mut(&token.guild_id) else {
+                return false;
+            };
+            if session.id != token.session_id || session.playback_epoch != epoch {
+                return false;
+            }
+            session.capture_suppressed = false;
+            session.captures.clear();
+            true
+        };
+        if finished {
+            if let Some(broker) = self.intent_broker.get() {
+                broker.refresh_confirmation_timeout(token);
+            }
+        }
+        finished
+    }
+
     async fn expire_session(&self, token: VoiceSessionToken) {
         let should_remove = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -747,6 +886,10 @@ impl DiscordVoiceManager {
             session.session_frames = session
                 .session_frames
                 .saturating_add(u64::try_from(VOICE_TICK_FRAMES).unwrap_or(u64::MAX));
+            if session.capture_suppressed {
+                session.captures.clear();
+                return;
+            }
 
             for (ssrc, voice) in &tick.speaking {
                 let Some(user_id) = session.ssrc_to_user.get(ssrc).copied() else {
@@ -979,22 +1122,97 @@ fn complete_segment_job(
 fn spawn_intent_worker(
     mut rx: mpsc::Receiver<FinalTranscriptEvent>,
     broker: Arc<DiscordVoiceIntentBroker>,
+    manager: std::sync::Weak<DiscordVoiceManager>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             let guild_id = event.token.guild_id;
             let speaker_id = event.key.speaker_id;
-            if let Err(err) = broker.handle_final_transcript(event).await {
-                warn!(
-                    guild_id,
-                    speaker_id,
-                    error = %err,
-                    "Discord voice intent broker failed to handle a final transcript event"
-                );
+            let token = event.token;
+            match broker.handle_final_transcript(event).await {
+                Ok(outcome) => {
+                    let Some(manager) = manager.upgrade() else {
+                        break;
+                    };
+                    handle_voice_intent_outcome(&manager, &broker, token, outcome).await;
+                }
+                Err(err) => {
+                    warn!(
+                        guild_id,
+                        speaker_id,
+                        error = %err,
+                        "Discord voice intent broker failed to handle a final transcript event"
+                    );
+                }
             }
         }
         debug!("Discord voice intent worker stopped");
     })
+}
+
+async fn handle_voice_intent_outcome(
+    manager: &Arc<DiscordVoiceManager>,
+    broker: &Arc<DiscordVoiceIntentBroker>,
+    token: VoiceSessionToken,
+    outcome: VoiceIntentTranscriptOutcome,
+) {
+    let feedback = match outcome {
+        VoiceIntentTranscriptOutcome::Proposed { speech_prompt } => Some(speech_prompt),
+        VoiceIntentTranscriptOutcome::Confirmation(confirmation) => {
+            let mut feedback = confirmation.speech_feedback;
+            if let VoiceIntentTextOutcome::ExecuteLocal(request) = confirmation.outcome {
+                feedback = match manager.intent_action_executor.get() {
+                    Some(executor) => match executor.execute(&request).await {
+                        DiscordVoiceIntentActionOutcome::Queued { .. } => feedback,
+                        DiscordVoiceIntentActionOutcome::Failed {
+                            confirmation_reopened,
+                            ..
+                        } => Some(if confirmation_reopened {
+                            "沒有成功開始。你可以再說一次對，或更正指令。".to_string()
+                        } else {
+                            "沒有成功開始。請重新說出指令。".to_string()
+                        }),
+                    },
+                    None => {
+                        let reopened = broker.reopen_local_execution(&request);
+                        warn!(
+                            intent_id = %request.intent_id,
+                            revision = request.revision,
+                            reopened,
+                            "spoken local voice intent has no action executor"
+                        );
+                        Some(if reopened {
+                            "目前無法開始。你可以再說一次對，或更正指令。".to_string()
+                        } else {
+                            "目前無法開始。請重新說出指令。".to_string()
+                        })
+                    }
+                };
+            }
+            feedback
+        }
+        VoiceIntentTranscriptOutcome::Ignored
+        | VoiceIntentTranscriptOutcome::AwaitingConfirmation => None,
+    };
+
+    if let Some(feedback) = feedback {
+        match manager.speak(token, &feedback).await {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(
+                    guild_id = token.guild_id,
+                    "Discord voice TTS feedback was skipped; text fallback remains available"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    guild_id = token.guild_id,
+                    error = %err,
+                    "failed to synthesize or play Discord voice intent feedback"
+                );
+            }
+        }
+    }
 }
 
 fn status_snapshot(guild_id: u64, session: &VoiceSession) -> VoiceSessionStatus {
@@ -1027,6 +1245,30 @@ fn format_timestamp(milliseconds: u64) -> String {
     let seconds = total_seconds % 60;
     let millis = milliseconds % 1_000;
     format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+}
+
+/// Releases half-duplex capture suppression for one exact playback generation.
+#[derive(Clone)]
+struct VoicePlaybackFinished {
+    manager: std::sync::Weak<DiscordVoiceManager>,
+    token: VoiceSessionToken,
+    epoch: u64,
+}
+
+#[async_trait]
+impl VoiceEventHandler for VoicePlaybackFinished {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        let manager = self.manager.clone();
+        let token = self.token;
+        let epoch = self.epoch;
+        tokio::spawn(async move {
+            tokio::time::sleep(TTS_POST_ROLL).await;
+            if let Some(manager) = manager.upgrade() {
+                manager.finish_playback(token, epoch);
+            }
+        });
+        None
+    }
 }
 
 /// Songbird global event handler for one exact voice session. The session token
@@ -1201,7 +1443,64 @@ mod tests {
             DiscordVoiceManager::new(DiscordVoiceConfig::default(), SttConfig::default()).unwrap();
         assert!(!manager.enabled());
         assert!(!manager.stt_ready());
+        assert!(!manager.tts_ready());
         assert!(manager.voice_channel_allowed(123));
+    }
+
+    #[test]
+    fn tts_readiness_requires_opt_in_and_a_key() {
+        let tts = TtsConfig {
+            enabled: true,
+            api_key: "test".into(),
+            ..TtsConfig::default()
+        };
+        let manager = DiscordVoiceManager::new_with_tts(
+            DiscordVoiceConfig::default(),
+            SttConfig::default(),
+            tts,
+        )
+        .unwrap();
+        assert!(manager.tts_ready());
+    }
+
+    #[tokio::test]
+    async fn playback_suppression_is_session_and_epoch_bound() {
+        let voice = DiscordVoiceConfig {
+            enabled: true,
+            ..DiscordVoiceConfig::default()
+        };
+        let stt = SttConfig {
+            enabled: true,
+            api_key: "test".into(),
+            ..SttConfig::default()
+        };
+        let manager = DiscordVoiceManager::new(voice, stt).unwrap();
+        let token = manager.begin_session(1, 2, 3).unwrap();
+        assert!(manager.mark_listening(token));
+        manager.note_speaking(token, 10, 100);
+
+        let first = manager.begin_playback(token).unwrap();
+        let second = manager.begin_playback(token).unwrap();
+        assert!(!manager.finish_playback(token, first));
+        {
+            let sessions = manager.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let session = sessions.get(&1).unwrap();
+            assert!(session.capture_suppressed);
+            assert!(session.captures.is_empty());
+        }
+        assert!(manager.finish_playback(token, second));
+        assert!(
+            !manager
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&1)
+                .unwrap()
+                .capture_suppressed
+        );
+
+        let replacement = VoiceSessionToken::for_test(1, token.session_id.saturating_add(1));
+        assert!(!manager.finish_playback(replacement, second));
     }
 
     #[test]
@@ -1321,7 +1620,9 @@ mod tests {
         assert!(broker.bind_session(token, 3, 4, "Can"));
 
         let (tx, rx) = mpsc::channel(1);
-        let worker = spawn_intent_worker(rx, broker);
+        let manager =
+            DiscordVoiceManager::new(DiscordVoiceConfig::default(), SttConfig::default()).unwrap();
+        let worker = spawn_intent_worker(rx, broker, Arc::downgrade(&manager));
         tx.try_send(FinalTranscriptEvent {
             token,
             control_channel_id: 3,

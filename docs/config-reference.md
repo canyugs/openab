@@ -540,6 +540,35 @@ experimental Discord Voice Channel subsystem. Uses an OpenAI-compatible
 
 ---
 
+## `[tts]`
+
+Text-to-speech synthesis through an OpenAI-compatible `/audio/speech` endpoint.
+The client requests WAV explicitly and rejects responses larger than 10 MiB.
+TTS is disabled by default, so existing deployments make no additional requests.
+
+```toml
+[tts]
+enabled = true
+api_key = "${OPENAI_API_KEY}"
+model = "gpt-4o-mini-tts"
+voice = "marin"
+base_url = "https://api.openai.com/v1"
+instructions = "Speak briefly in Traditional Chinese."
+request_timeout_seconds = 30
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable TTS for subsystems that support synthesized audio playback. |
+| `api_key` | string | `""` | API key sent as a Bearer token to the TTS provider. |
+| `model` | string | `"gpt-4o-mini-tts"` | Provider model name. |
+| `voice` | string | `"marin"` | Provider voice name. |
+| `base_url` | string | `"https://api.openai.com/v1"` | Base URL of an OpenAI-compatible API. `/audio/speech` is appended automatically. |
+| `instructions` | string \| omit | omitted | Optional provider-specific speaking instructions. Blank values are omitted from the request. |
+| `request_timeout_seconds` | integer | `30` | Per-request HTTP timeout. Must be greater than zero. |
+
+---
+
 ## `[workspace]`
 
 Workspace aliases for [Control Directives](adr/control-directives.md). Users specify `[[ws:@alias]]` in their first message to set the session's working directory.

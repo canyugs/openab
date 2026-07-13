@@ -110,6 +110,297 @@ impl VoiceIntentMessenger for DiscordVoiceIntentMessenger {
     }
 }
 
+/// Optional message metadata for a confirmed local voice action.
+///
+/// Text confirmation supplies the Discord username and message timestamp so
+/// the ACP sender context remains identical to the ordinary Discord path.
+/// Spoken confirmation has no Discord [`Message`], so it uses the operator
+/// display name captured when `/voice join` bound the session and the audit
+/// message timestamp produced below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordVoiceIntentActionContext {
+    pub sender_name: String,
+    pub timestamp: Option<String>,
+}
+
+impl DiscordVoiceIntentActionContext {
+    pub fn from_request(request: &LocalIntentExecution) -> Self {
+        Self {
+            sender_name: request.operator_display_name.clone(),
+            timestamp: None,
+        }
+    }
+}
+
+/// Result of handing one confirmed local voice action to the ACP dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscordVoiceIntentActionOutcome {
+    /// The dispatcher accepted the action. `broker_state_completed` is false
+    /// only when the broker state changed after the handoff started.
+    Queued { broker_state_completed: bool },
+    /// The dispatcher definitely did not accept the action. When
+    /// `confirmation_reopened` is true, the same intent may be confirmed again.
+    Failed {
+        error: String,
+        confirmation_reopened: bool,
+    },
+}
+
+/// Reusable bridge from a confirmed voice intent into this bot's normal ACP
+/// dispatcher.
+///
+/// The component owns every dependency needed by both Discord text and spoken
+/// confirmation paths. It also owns the broker completion/reopen transition so
+/// callers cannot accidentally acknowledge an intent twice or forget to
+/// re-arm a definitely-failed handoff.
+pub struct DiscordVoiceIntentActionExecutor {
+    http: Arc<Http>,
+    dispatcher: Arc<crate::dispatch::Dispatcher>,
+    adapter: Arc<dyn ChatAdapter>,
+    broker: Arc<DiscordVoiceIntentBroker>,
+}
+
+impl DiscordVoiceIntentActionExecutor {
+    pub fn new(
+        http: Arc<Http>,
+        dispatcher: Arc<crate::dispatch::Dispatcher>,
+        broker: Arc<DiscordVoiceIntentBroker>,
+    ) -> Self {
+        let adapter = Arc::new(DiscordAdapter::new(http.clone())) as Arc<dyn ChatAdapter>;
+        Self {
+            http,
+            dispatcher,
+            adapter,
+            broker,
+        }
+    }
+
+    /// Execute a spoken confirmation, which does not have a Discord message
+    /// carrying sender metadata.
+    pub async fn execute(
+        &self,
+        request: &LocalIntentExecution,
+    ) -> DiscordVoiceIntentActionOutcome {
+        let context = DiscordVoiceIntentActionContext::from_request(request);
+        self.execute_with_context(request, &context).await
+    }
+
+    /// Execute a confirmation with explicit sender metadata. The text path
+    /// uses this to preserve its existing ACP `SenderContext` fields.
+    pub async fn execute_with_context(
+        &self,
+        request: &LocalIntentExecution,
+        context: &DiscordVoiceIntentActionContext,
+    ) -> DiscordVoiceIntentActionOutcome {
+        match self.enqueue(request, context).await {
+            Ok(()) => {
+                let broker_state_completed = self.broker.complete_local_execution(request);
+                if !broker_state_completed {
+                    warn!(
+                        intent_id = %request.intent_id,
+                        revision = request.revision,
+                        "local Discord voice intent was queued after its broker state changed"
+                    );
+                }
+                DiscordVoiceIntentActionOutcome::Queued {
+                    broker_state_completed,
+                }
+            }
+            Err(error) => {
+                let confirmation_reopened = self.broker.reopen_local_execution(request);
+                warn!(
+                    intent_id = %request.intent_id,
+                    revision = request.revision,
+                    reopened = confirmation_reopened,
+                    error = %error,
+                    "failed to enqueue local Discord voice intent"
+                );
+                self.report_failure(request, &error, confirmation_reopened)
+                    .await;
+                DiscordVoiceIntentActionOutcome::Failed {
+                    error: error.to_string(),
+                    confirmation_reopened,
+                }
+            }
+        }
+    }
+
+    /// Route one confirmed, unaddressed voice command into this bot's normal
+    /// Discord ACP pipeline without relying on a self-authored Discord mention.
+    ///
+    /// A stable-nonce audit root gives the action a visible origin and a
+    /// recoverable thread anchor. Text channels get a dedicated task thread;
+    /// an existing thread or Voice Channel text chat is used directly because
+    /// Discord cannot create a nested/Voice-channel thread.
+    async fn enqueue(
+        &self,
+        request: &LocalIntentExecution,
+        context: &DiscordVoiceIntentActionContext,
+    ) -> anyhow::Result<()> {
+        let control_channel_id = ChannelId::new(request.control_channel_id);
+        let channel = control_channel_id.to_channel(&self.http).await?;
+        let (control_channel, create_task_thread) = match channel {
+            serenity::model::channel::Channel::Guild(channel)
+                if channel.thread_metadata.is_some() =>
+            {
+                (
+                    ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: request.control_channel_id.to_string(),
+                        thread_id: None,
+                        parent_id: channel.parent_id.map(|id| id.to_string()),
+                        origin_event_id: None,
+                    },
+                    false,
+                )
+            }
+            serenity::model::channel::Channel::Guild(channel)
+                if matches!(channel.kind, ChannelType::Text | ChannelType::News) =>
+            {
+                (
+                    ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: request.control_channel_id.to_string(),
+                        thread_id: None,
+                        parent_id: None,
+                        origin_event_id: None,
+                    },
+                    true,
+                )
+            }
+            serenity::model::channel::Channel::Guild(channel)
+                if channel.kind == ChannelType::Voice =>
+            {
+                (
+                    ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: request.control_channel_id.to_string(),
+                        thread_id: None,
+                        parent_id: None,
+                        origin_event_id: None,
+                    },
+                    false,
+                )
+            }
+            serenity::model::channel::Channel::Guild(channel) => {
+                anyhow::bail!(
+                    "Discord channel type {:?} cannot host a local voice task",
+                    channel.kind
+                )
+            }
+            _ => anyhow::bail!("the pinned voice control destination is not a guild channel"),
+        };
+
+        let audit_content = local_voice_audit_message(request);
+        let nonce = local_voice_audit_nonce(request.intent_id);
+        let audit = control_channel_id
+            .send_message(
+                &self.http,
+                serenity::builder::CreateMessage::new()
+                    .content(audit_content)
+                    .nonce(Nonce::String(nonce))
+                    .enforce_nonce(true),
+            )
+            .await?;
+        let audit_ref = MessageRef {
+            channel: control_channel.clone(),
+            message_id: audit.id.to_string(),
+        };
+
+        let thread_channel = if create_task_thread {
+            get_or_create_thread_from_ref(
+                &self.http,
+                &self.adapter,
+                &control_channel,
+                &audit_ref,
+                &request.task,
+            )
+            .await?
+        } else {
+            control_channel
+        };
+
+        let timestamp = context
+            .timestamp
+            .clone()
+            .unwrap_or_else(|| audit.timestamp.to_rfc3339().unwrap_or_default());
+        let sender = build_sender_context(
+            &request.operator_user_id.to_string(),
+            &context.sender_name,
+            &request.operator_display_name,
+            &thread_channel.channel_id,
+            thread_channel.parent_id.as_deref(),
+            false,
+            &timestamp,
+            &audit_ref.message_id,
+            &audit.author.id.to_string(),
+        );
+        let sender_id = sender.sender_id.clone();
+        let sender_name = sender.sender_name.clone();
+        let sender_json = serde_json::to_string(&sender)?;
+        let thread_key = self
+            .dispatcher
+            .key("discord", &thread_channel.channel_id, &sender_id);
+        let estimated_tokens = crate::dispatch::estimate_tokens(&request.task, &[]);
+        let message = crate::dispatch::BufferedMessage {
+            sender_json,
+            sender_name,
+            prompt: request.task.clone(),
+            extra_blocks: Vec::new(),
+            trigger_msg: audit_ref,
+            arrived_at: std::time::Instant::now(),
+            estimated_tokens,
+            other_bot_present: false,
+            recipient: None,
+        };
+        self.dispatcher
+            .submit(
+                thread_key,
+                thread_channel.clone(),
+                self.adapter.clone(),
+                message,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        info!(
+            intent_id = %request.intent_id,
+            revision = request.revision,
+            channel_id = %thread_channel.channel_id,
+            "queued confirmed local Discord voice intent"
+        );
+        Ok(())
+    }
+
+    async fn report_failure(
+        &self,
+        request: &LocalIntentExecution,
+        error: &anyhow::Error,
+        reopened: bool,
+    ) {
+        let next_step = if reopened {
+            "尚未開始；請再次回覆「對」重試，或用「更正：...」修改。"
+        } else {
+            "尚未開始，而且原確認狀態已改變；請重新說出指令。"
+        };
+        let content = format!(
+            "<@{}> {}\n⚠️ {}",
+            request.operator_user_id,
+            next_step,
+            crate::error_display::format_user_error(&error.to_string())
+        );
+        if let Err(report_error) = ChannelId::new(request.control_channel_id)
+            .say(&self.http, content)
+            .await
+        {
+            warn!(
+                intent_id = %request.intent_id,
+                error = %report_error,
+                "failed to report local Discord voice intent failure"
+            );
+        }
+    }
+}
+
 #[async_trait]
 impl ChatAdapter for DiscordAdapter {
     fn platform(&self) -> &'static str {
@@ -520,31 +811,20 @@ impl EventHandler for Handler {
                     .await
                 {
                     Ok(VoiceIntentTextOutcome::ExecuteLocal(request)) => {
-                        match self.execute_local_voice_intent(&ctx, &msg, &request).await {
-                            Ok(()) => {
-                                if !broker.complete_local_execution(&request) {
-                                    warn!(
-                                        intent_id = %request.intent_id,
-                                        revision = request.revision,
-                                        "local Discord voice intent was queued after its broker state changed"
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                let reopened = broker.reopen_local_execution(&request);
-                                warn!(
-                                    intent_id = %request.intent_id,
-                                    revision = request.revision,
-                                    reopened,
-                                    error = %err,
-                                    "failed to enqueue local Discord voice intent"
-                                );
-                                self.report_local_voice_intent_failure(
-                                    &ctx, &request, &err, reopened,
-                                )
-                                .await;
-                            }
-                        }
+                        let executor = DiscordVoiceIntentActionExecutor::new(
+                            ctx.http.clone(),
+                            self.dispatcher.clone(),
+                            broker,
+                        );
+                        let action_context = DiscordVoiceIntentActionContext {
+                            sender_name: msg.author.name.clone(),
+                            timestamp: Some(
+                                msg.timestamp.to_rfc3339().unwrap_or_default(),
+                            ),
+                        };
+                        executor
+                            .execute_with_context(&request, &action_context)
+                            .await;
                         return;
                     }
                     Ok(outcome) if outcome.consumed() => return,
@@ -1655,178 +1935,6 @@ impl EventHandler for Handler {
 // --- Slash command & interaction handlers ---
 
 impl Handler {
-    /// Route one confirmed, unaddressed voice command into this bot's normal
-    /// Discord ACP pipeline without relying on a self-authored Discord mention.
-    ///
-    /// A stable-nonce audit root gives the action a visible origin and a
-    /// recoverable thread anchor. Text channels get a dedicated task thread;
-    /// an existing thread or Voice Channel text chat is used directly because
-    /// Discord cannot create a nested/Voice-channel thread.
-    async fn execute_local_voice_intent(
-        &self,
-        ctx: &Context,
-        confirmation: &Message,
-        request: &LocalIntentExecution,
-    ) -> anyhow::Result<()> {
-        let control_channel_id = ChannelId::new(request.control_channel_id);
-        let channel = control_channel_id.to_channel(&ctx.http).await?;
-        let (control_channel, create_task_thread) = match channel {
-            serenity::model::channel::Channel::Guild(channel)
-                if channel.thread_metadata.is_some() =>
-            {
-                (
-                    ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: request.control_channel_id.to_string(),
-                        thread_id: None,
-                        parent_id: channel.parent_id.map(|id| id.to_string()),
-                        origin_event_id: None,
-                    },
-                    false,
-                )
-            }
-            serenity::model::channel::Channel::Guild(channel)
-                if matches!(channel.kind, ChannelType::Text | ChannelType::News) =>
-            {
-                (
-                    ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: request.control_channel_id.to_string(),
-                        thread_id: None,
-                        parent_id: None,
-                        origin_event_id: None,
-                    },
-                    true,
-                )
-            }
-            serenity::model::channel::Channel::Guild(channel)
-                if channel.kind == ChannelType::Voice =>
-            {
-                (
-                    ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: request.control_channel_id.to_string(),
-                        thread_id: None,
-                        parent_id: None,
-                        origin_event_id: None,
-                    },
-                    false,
-                )
-            }
-            serenity::model::channel::Channel::Guild(channel) => {
-                anyhow::bail!(
-                    "Discord channel type {:?} cannot host a local voice task",
-                    channel.kind
-                )
-            }
-            _ => anyhow::bail!("the pinned voice control destination is not a guild channel"),
-        };
-
-        let audit_content = local_voice_audit_message(request);
-        let nonce = local_voice_audit_nonce(request.intent_id);
-        let audit = control_channel_id
-            .send_message(
-                &ctx.http,
-                serenity::builder::CreateMessage::new()
-                    .content(audit_content)
-                    .nonce(Nonce::String(nonce))
-                    .enforce_nonce(true),
-            )
-            .await?;
-        let audit_ref = MessageRef {
-            channel: control_channel.clone(),
-            message_id: audit.id.to_string(),
-        };
-
-        let adapter = self
-            .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
-            .clone();
-        let thread_channel = if create_task_thread {
-            get_or_create_thread_from_ref(
-                &ctx.http,
-                &adapter,
-                &control_channel,
-                &audit_ref,
-                &request.task,
-            )
-            .await?
-        } else {
-            control_channel
-        };
-
-        let sender = build_sender_context(
-            &request.operator_user_id.to_string(),
-            &confirmation.author.name,
-            &request.operator_display_name,
-            &thread_channel.channel_id,
-            thread_channel.parent_id.as_deref(),
-            false,
-            &confirmation.timestamp.to_rfc3339().unwrap_or_default(),
-            &audit_ref.message_id,
-            &ctx.cache.current_user().id.to_string(),
-        );
-        let sender_id = sender.sender_id.clone();
-        let sender_name = sender.sender_name.clone();
-        let sender_json = serde_json::to_string(&sender)?;
-        let thread_key = self
-            .dispatcher
-            .key("discord", &thread_channel.channel_id, &sender_id);
-        let estimated_tokens = crate::dispatch::estimate_tokens(&request.task, &[]);
-        let message = crate::dispatch::BufferedMessage {
-            sender_json,
-            sender_name,
-            prompt: request.task.clone(),
-            extra_blocks: Vec::new(),
-            trigger_msg: audit_ref,
-            arrived_at: std::time::Instant::now(),
-            estimated_tokens,
-            other_bot_present: false,
-            recipient: None,
-        };
-        self.dispatcher
-            .submit(thread_key, thread_channel.clone(), adapter, message)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        info!(
-            intent_id = %request.intent_id,
-            revision = request.revision,
-            channel_id = %thread_channel.channel_id,
-            "queued confirmed local Discord voice intent"
-        );
-        Ok(())
-    }
-
-    async fn report_local_voice_intent_failure(
-        &self,
-        ctx: &Context,
-        request: &LocalIntentExecution,
-        error: &anyhow::Error,
-        reopened: bool,
-    ) {
-        let next_step = if reopened {
-            "尚未開始；請再次回覆「對」重試，或用「更正：...」修改。"
-        } else {
-            "尚未開始，而且原確認狀態已改變；請重新說出指令。"
-        };
-        let content = format!(
-            "<@{}> {}\n⚠️ {}",
-            request.operator_user_id,
-            next_step,
-            crate::error_display::format_user_error(&error.to_string())
-        );
-        if let Err(report_error) = ChannelId::new(request.control_channel_id)
-            .say(&ctx.http, content)
-            .await
-        {
-            warn!(
-                intent_id = %request.intent_id,
-                error = %report_error,
-                "failed to report local Discord voice intent failure"
-            );
-        }
-    }
-
     async fn handle_voice_command(
         &self,
         ctx: &Context,
@@ -1976,8 +2084,13 @@ impl Handler {
                                     }
                                     match voice.join(guild_id, voice_channel_id).await {
                                         Ok(_) => {
+                                            let tts_notice = if manager.tts_ready() {
+                                                " Intent confirmations and acknowledgements may be spoken as AI-generated audio."
+                                            } else {
+                                                ""
+                                            };
                                             let public_notice = format!(
-                                                "🔴 **Voice transcription started** in <#{}> by <@{}>. Audio is segmented in memory and sent to the configured STT provider. Run `/voice stop` to end capture.",
+                                                "🔴 **Voice transcription started** in <#{}> by <@{}>. Audio is segmented in memory and sent to the configured STT provider.{tts_notice} Run `/voice stop` to end capture.",
                                                 voice_channel_id.get(),
                                                 cmd.user.id.get()
                                             );
@@ -4224,6 +4337,14 @@ mod tests {
         assert_eq!(
             local_voice_audit_message(&request),
             "<@40> 已確認語音意圖；即將由我直接處理：\n查看 openab issue 1368"
+        );
+
+        assert_eq!(
+            DiscordVoiceIntentActionContext::from_request(&request),
+            DiscordVoiceIntentActionContext {
+                sender_name: "Can".into(),
+                timestamp: None,
+            }
         );
     }
 

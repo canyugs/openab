@@ -25,6 +25,7 @@ pub mod secrets;
 pub mod setup;
 pub mod stt;
 pub mod timestamp;
+pub mod tts;
 pub mod trust;
 
 #[cfg(feature = "discord")]
@@ -35,6 +36,8 @@ pub mod discord_voice;
 pub mod discord_voice_intent;
 #[cfg(feature = "discord")]
 pub mod discord_voice_runtime;
+#[cfg(feature = "discord")]
+pub mod discord_voice_speech;
 #[cfg(feature = "discord")]
 pub mod ambient;
 #[cfg(feature = "slack")]

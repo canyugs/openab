@@ -991,9 +991,10 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         let voice_manager = if discord_cfg.voice.enabled {
-            Some(DiscordVoiceManager::new(
+            Some(DiscordVoiceManager::new_with_tts(
                 discord_cfg.voice.clone(),
                 cfg.stt.clone(),
+                cfg.tts.clone(),
             )?)
         } else {
             None
@@ -1026,6 +1027,9 @@ async fn main() -> anyhow::Result<()> {
             allow_dm = discord_cfg.allow_dm,
             voice_enabled = voice_manager.is_some(),
             voice_intent_enabled = voice_intent_broker.is_some(),
+            voice_tts_ready = voice_manager
+                .as_ref()
+                .is_some_and(|manager| manager.tts_ready()),
             "starting discord adapter"
         );
 
@@ -1041,6 +1045,14 @@ async fn main() -> anyhow::Result<()> {
             discord_idle,
         ));
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
+        if let (Some(manager), Some(broker)) = (&voice_manager, &voice_intent_broker) {
+            let executor = Arc::new(discord::DiscordVoiceIntentActionExecutor::new(
+                Arc::new(serenity::http::Http::new(&discord_cfg.bot_token)),
+                discord_dispatcher.clone(),
+                broker.clone(),
+            ));
+            manager.attach_intent_action_executor(executor);
+        }
 
         // Initialize reminder store
         let reminder_path = std::env::var("HOME")

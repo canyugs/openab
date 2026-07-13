@@ -3,10 +3,14 @@
 > **Experimental status snapshot (2026-07-13):** The implementation on
 > `feat/discord-voice-receive` can register and run the `/voice` lifecycle, join
 > through Songbird 0.6, segment per-user decoded PCM, transcribe it, and explicitly
-> send a retained transcript to ACP for summary. The opt-in Slice 1 intent broker
-> now supports hybrid routing after text confirmation in the pinned control
-> destination: unaddressed commands can run through Aragorn's existing ACP path,
-> while commands naming configured targets use deterministic Discord delegation.
+> send a retained transcript to ACP for summary. The opt-in intent broker now
+> implements hybrid routing with spoken or text confirmation: unaddressed commands
+> can run through Aragorn's existing ACP path, while commands naming configured
+> targets use deterministic Discord delegation. Optional OpenAI-compatible TTS
+> plays the paraphrase and short local/delegated acknowledgements through Songbird
+> with half-duplex capture suppression. The new spoken/TTS path is implemented but
+> has not yet been deployed and validated in a live Voice Channel; text remains the
+> fallback.
 > Real Discord/DAVE, two-speaker,
 > DAVE-specific behavior, two-speaker attribution, reconnect, and long-running
 > validation have not passed yet. A live local deployment
@@ -28,8 +32,8 @@ The feature lets an OpenAB bot join the Voice Channel that a user is currently i
 transcribe participants as separate Discord speakers, and post an ACP-generated
 summary to the text channel or thread that started the session. An additional
 opt-in intent broker can turn an operator's attributed speech into a proposed task,
-confirm the interpreted intent once in text, and either execute it through this
-OpenAB bot's existing ACP path or delegate it to another OpenAB bot.
+confirm the interpreted intent once by voice or text, and either execute it through
+this OpenAB bot's existing ACP path or delegate it to another OpenAB bot.
 
 ```text
 Discord Voice Channel
@@ -46,13 +50,16 @@ Discord Voice Channel
 ```text
 operator speech
   → STT intent proposal
-  → text paraphrase and confirmation
+  → text paraphrase + optional spoken paraphrase
+  → spoken or text yes/no/correction
   → unaddressed command: this bot's existing Dispatcher/ACP flow
   → named target: nonce-enforced Discord mention and target bot's ACP flow
+  → optional spoken local/delegated acknowledgement
 ```
 
-Slice 1 listens, confirms, and dispatches in text. It does not speak into the
-Voice Channel and is not yet the final no-screen experience.
+Slices 2 and 3 add the no-screen path on top of the Slice 1 text scaffold. TTS is
+independently opt-in, and the existing pinned text prompt remains available when
+TTS is disabled or playback fails.
 
 ## Current State
 
@@ -68,8 +75,8 @@ path is not proof that Discord is delivering complete, correctly attributed audi
 | STT pipeline | **Implemented on branch.** A bounded queue feeds workers that encode WAV in memory and call the existing STT client. No temporary audio files are written. Queue loss and STT failures are counted. |
 | Transcript | **Implemented on branch.** Text is retained in bounded process memory with user ID and timing metadata; evictions and rejected entries are counted. |
 | ACP summary | **Implemented with a security limitation.** Only explicit `/voice summary` submits the transcript. It uses the normal tool-capable ACP path; instructions in the prompt say the transcript is untrusted, but tools are not technically disabled. |
-| Hybrid intent Slice 1 | **Experimental and opt-in on branch.** A recognized command creates one pending intent and accepts the session operator's text yes/no/correction. With `default_to_local = true`, an unaddressed command is queued through this bot's existing Dispatcher/ACP path; a named configured target still receives one nonce-enforced real Discord mention. Both `enabled` and `default_to_local` default to `false`. |
-| Spoken confirmation, TTS, and result observation | **Later slices.** Slice 1 does not interpret a spoken yes/no, play confirmation audio, or poll the target bot's task thread for progress and completion. |
+| Hybrid intent Slices 1-3 | **Experimental and opt-in on branch; live spoken/TTS validation pending.** A recognized command creates one pending intent and accepts the session operator's spoken or text yes/no/correction. With `default_to_local = true`, an unaddressed command is queued through this bot's existing Dispatcher/ACP path; a named configured target receives one nonce-enforced real Discord mention. Optional TTS plays bounded proposal and acknowledgement audio through Songbird while capture is suppressed. Intent routing and TTS default to disabled. |
+| Result observation | **Later slice.** The broker does not yet poll the local or target bot's task thread for progress and completion. Initial local/delegated acknowledgements mean accepted or sent, not observed completion. |
 | Automated branch verification | **Partial pass.** `cargo clippy -p openab-core --lib -- -D warnings`, 46 focused hybrid intent/runtime tests, and the 16 binary tests pass. The core library run reaches 740/741 with one pre-existing macOS `/bin/false` assertion failure. Repository-wide fmt still reports pre-existing drift; Windows and complete live Discord validation remain pending. |
 | Local Kubernetes runtime smoke | **Hybrid Slice 1 startup passed.** Helm revision 8 runs `localhost:5555/openab:claude-voice-hybrid-66d8363` at digest `sha256:944e281b673afe8ab69fdd7eebac2a91943f80ff226f4b9447cf175b9dcc4c94`, `1/1` ready with zero restarts and `default_to_local = true`. Local Sam revision 2 runs `localhost:5555/openab:codex-voice-hybrid-66d8363`, is ready with zero restarts, and accepts the Voice text destination. Real spoken proposal/confirmation/handoff validation remains pending. |
 | Discord, Groq, and Claude readiness | **Passed locally.** The bot connects, global commands register, Groq accepts the configured STT model, Claude OAuth persists on PVC, and a Discord-to-Claude ACP turn completes without an authentication error. |
@@ -77,8 +84,9 @@ path is not proof that Discord is delivering complete, correctly attributed audi
 | First STT accuracy sample | **Failed the reliability bar.** Four segments retained the correct single-speaker identity and plausible timestamps, but one result was only `...` and another hallucinated a different language. The two Chinese results were also not reliable enough to treat as a meeting record. A controlled model/language A/B retry is pending. |
 | Attribution, reconnect, and soak evidence | **Not verified.** Two-speaker attribution, reconnect health beyond a unit state transition, and a 30-minute soak remain required. |
 
-The implementation is intentionally receive-only. It does not play ACP responses or
-other audio into the Voice Channel.
+Playback is intentionally narrow: it speaks only bounded intent proposals and
+broker acknowledgements. It does not synthesize arbitrary ACP responses or observe
+and narrate task completion.
 
 ## Local Kubernetes Smoke and Live Test Record
 
@@ -170,7 +178,9 @@ The bot needs these permissions in the test channels:
 - Send Messages in Threads, if a thread is used for control/output
 - Read Message History
 
-`Speak` is not required for the receive-only design. Existing Discord text operation may require additional permissions described in the [Discord guide](discord.md).
+`Speak` is required when TTS playback is enabled; receive/transcription alone does
+not need it. Existing Discord text operation may require additional permissions
+described in the [Discord guide](discord.md).
 
 ## Configuration
 
@@ -219,6 +229,15 @@ default_to_local = true
 [discord.voice.intent.targets.sam]
 discord_user_id = "<SAM_DISCORD_BOT_USER_ID>"
 aliases = ["Samuel", "山姆"]
+
+[tts]
+enabled = true
+api_key = "${TTS_API_KEY}"
+model = "gpt-4o-mini-tts"
+voice = "marin"
+base_url = "https://api.openai.com/v1"
+instructions = "Speak briefly in Traditional Chinese."
+request_timeout_seconds = 30
 ```
 
 The default is `false`. Omitting `[discord.voice]` must preserve all existing Discord behavior and must not cause the bot to join or listen to a Voice Channel.
@@ -235,6 +254,13 @@ real Discord user ID so OpenAB can emit a valid mention token. Because the
 canonical table name is already an alias, do not repeat it in `aliases`, including
 variants that differ only by surrounding whitespace or letter case. Normalized
 aliases must be unique across all targets.
+
+`[tts]` is independently opt-in and defaults to `enabled = false`. It calls an
+OpenAI-compatible `/audio/speech` endpoint and explicitly requests WAV. The model
+and voice shown above are defaults, not provider requirements; replace the base
+URL, model, and voice together when using another compatible provider. The client
+bounds each response to 10 MiB. If TTS is disabled, lacks a key, or fails during a
+session, the pinned text prompt and text confirmation path remain available.
 
 `allowed_channels` under `[discord.voice]` restricts which **Voice Channels** may
 be joined. `[discord].allowed_channels` independently gates the text channel or
@@ -265,11 +291,11 @@ After `/voice stop`, STT work that did not drain within 30 seconds may continue.
 The transcript remains in process memory for later explicit summary/status use until
 a new session for that guild replaces it or the OpenAB process exits.
 
-## Intent Delegation (Slice 1)
+## Hybrid Intent Routing (Slices 1-3)
 
-The text channel or thread that runs `/voice join` is also the initial intent
-confirmation and dispatch destination. The user who starts that session is the
-operator allowed to resolve its pending intent.
+The text channel or thread that runs `/voice join` remains the intent prompt,
+audit, and dispatch destination. The user who starts that session is the operator
+allowed to resolve its pending intent in speech or text.
 
 A named-target interaction delegates to the configured bot:
 
@@ -277,16 +303,19 @@ A named-target interaction delegates to the configured bot:
 Can, in the Voice Channel:
   "叫 Sam 看 canyugs/openab issue 20"
 
-OpenAB, in the pinned text channel:
+OpenAB, in the pinned text channel and, when TTS is enabled, in Voice:
   "我理解為：要請 Sam 看 canyugs/openab#20 嗎？
    請回覆「對」、「不是」，或用「更正：...」修正。"
 
-Can, in text:
+Can, in Voice or text:
   "對"
 
 OpenAB:
   <@SAM_DISCORD_BOT_USER_ID> Can asked via voice:
   請看 canyugs/openab#20
+
+OpenAB, in Voice when TTS is enabled:
+  "已送出。"
 ```
 
 The confirmation approves the semantic target and task, not the exact wording of
@@ -301,11 +330,11 @@ same OpenAB bot (Aragorn in this example):
 Can, in the Voice Channel:
   "請先查看 Open App取得issue 1368整理目前行作方向"
 
-Aragorn, in the pinned text destination:
+Aragorn, in the pinned text destination and, when TTS is enabled, in Voice:
   "我理解為：由我直接處理『先查看 Open App取得issue 1368整理目前行作方向』，對嗎？
    請回覆「對」、「不是」，或用「更正：...」修正。"
 
-Can, in text:
+Can, in Voice or text:
   "對"
 
 Aragorn:
@@ -314,6 +343,9 @@ Aragorn:
 
 Aragorn:
   → queues the task through the existing Dispatcher and ACP agent
+
+Aragorn, in Voice when TTS is enabled:
+  "好的，我開始處理。"
 ```
 
 When the pinned destination is an ordinary text/news channel, the audit message
@@ -322,15 +354,17 @@ from an existing thread or from a Voice Channel's text chat, Aragorn uses that
 destination directly because Discord cannot create a nested or Voice-channel
 thread.
 
-Slice 1 rules:
+Intent rules:
 
 1. One guild and active Voice-session generation can have only one pending intent.
-2. A text yes selects the proposed route. Local work is queued through the existing Dispatcher/ACP path; named-target work uses one nonce-enforced Discord mention.
-3. A text no cancels it without dispatch.
-4. A text correction replaces the pending destination/task and asks for confirmation again; an explicit target or explicit self-directed phrase can switch routes.
+2. A spoken or text yes selects the proposed route. Local work is queued through the existing Dispatcher/ACP path; named-target work uses one nonce-enforced Discord mention.
+3. A spoken or text no cancels it without dispatch.
+4. A spoken or text correction replaces the pending destination/task and asks for confirmation again; an explicit target or explicit self-directed phrase can switch routes.
 5. Timeout, `/voice stop`, or replacing the Voice session abandons the pending intent.
 6. Explicitly naming one configured target always selects delegation. Naming two configured targets is ambiguous and never falls back to local execution.
 7. If local thread creation or Dispatcher submission definitely fails, the broker reopens confirmation instead of silently losing the task.
+8. Only finalized STT from the session operator can resolve a spoken confirmation. Unrelated, duplicate, wrong-speaker, and stale-session segments cannot dispatch.
+9. TTS is half-duplex. Capture is suppressed and partial buffers are discarded while the bot speaks so playback cannot become its own affirmative confirmation.
 
 The initial deterministic parser recognizes a simple single-target command such
 as `叫 Sam review openab issue 20`. With `default_to_local = true`, it also
@@ -366,12 +400,11 @@ The final dispatch contains a real `<@TARGET_BOT_USER_ID>` mention, so the exist
 trusted-bot mention admission works without changing `allow_bot_messages` to
 `"all"`.
 
-This first slice is an engineering scaffold, not the final daily hands-free UX:
-
-- Slice 2 accepts spoken yes/no/correction from the same Voice session.
-- Slice 3 adds Songbird TTS for confirmation, sent, cancelled, and error prompts.
-- A later observation slice follows the target thread and reports meaningful
-  progress and the final result.
+The pinned text flow remains an operational fallback. With TTS configured, the
+implemented Slice 2+3 path speaks the proposal and bounded sent/cancelled/error
+feedback, accepts spoken yes/no/correction, and resumes capture after playback.
+A later observation slice will follow the task thread and report meaningful
+progress and the final result.
 
 Intended flow:
 
@@ -425,16 +458,19 @@ Code compiling is not sufficient. Before reporting the feature as usable, record
 - [ ] Consent/start/stop notices are visible in the control channel.
 - [ ] Session timeout causes a leave and an observable log; the lack of a public timeout notice is recorded as a known limitation.
 
-For the optional Slice 1 intent broker, also verify:
+For the optional intent broker, also verify:
 
-- [ ] A configured spoken target produces one paraphrased confirmation in the pinned text channel.
-- [ ] Text yes sends exactly one real target-bot mention; duplicate yes does not send twice.
+- [ ] A configured spoken target produces one paraphrased confirmation in the pinned text channel and, with TTS enabled, one audible paraphrase.
+- [ ] Spoken or text yes sends exactly one real target-bot mention; duplicate confirmation does not send twice.
 - [ ] With `default_to_local = true`, each documented real STT example produces a local paraphrase and queues the confirmed task through this bot's Dispatcher/ACP path.
 - [ ] A local task creates one task thread from a normal text control channel, while an existing thread or Voice Channel text chat is used directly.
 - [ ] With `default_to_local = false`, the same unaddressed speech remains a no-op and existing explicit-target behavior is unchanged.
-- [ ] Text no, correction, timeout, `/voice stop`, and session replacement follow the documented pending-intent rules.
+- [ ] Spoken and text no/correction, timeout, `/voice stop`, and session replacement follow the documented pending-intent rules.
 - [ ] An unknown name never produces a Discord target mention; two configured target names never dispatch or fall back to local execution.
 - [ ] The receiving bot admits the trusted voice bot's mention and starts its normal Discord/ACP flow.
+- [ ] A local acceptance speaks the local acknowledgement; delegation speaks the sent acknowledgement; cancelled and failed routes speak their bounded feedback.
+- [ ] The bot does not transcribe its own playback into a confirmation, and capture resumes after track end, playback error, and watchdog release.
+- [ ] Disabling TTS preserves the pinned text prompt/confirmation path and makes no TTS provider request.
 
 Keep the feature marked experimental until these checks pass on the same build artifact intended for deployment.
 
@@ -445,7 +481,7 @@ Starting a Voice session affects everyone audible in the channel, not only the o
 Before `/voice join`:
 
 - tell every participant that a bot will receive and transcribe their audio;
-- state whether STT is local or sent to a cloud provider;
+- state whether STT and optional TTS are local or sent to cloud providers;
 - state where the transcript/summary will be posted;
 - define the raw-audio and transcript retention policy; and
 - provide an easy way to decline or stop capture.
@@ -457,9 +493,16 @@ store until the guild starts another session or the process exits. An explicit
 `/voice summary` sends retained text to the ACP/model provider, where it may become
 part of agent session history.
 
+When TTS is enabled, OpenAB sends only the bounded intent-broker prompt or
+acknowledgement text to the configured TTS provider and keeps the returned WAV in
+bounded process memory for playback. Check that provider's retention policy just
+as you would for STT.
+
 DAVE protects Discord voice transport. Because the bot is a participant, it decrypts audio locally before STT. DAVE does not prevent OpenAB or the configured STT provider from accessing that audio.
 
-Do not place `DISCORD_BOT_TOKEN` or STT keys in `[agent].env`. OpenAB's child-process environment isolation must continue to keep platform credentials out of the ACP agent process.
+Do not place `DISCORD_BOT_TOKEN`, STT keys, or TTS keys in `[agent].env`.
+OpenAB's child-process environment isolation must continue to keep platform
+credentials out of the ACP agent process.
 
 ## ACP Summary and Prompt-Injection Risk
 
@@ -511,6 +554,18 @@ prompt.
 - Verify generated WAV sample rate/channel metadata and actual duration.
 - Compare a local and cloud OpenAI-compatible provider with the same scripted audio.
 - Confirm `/voice status` does not show growing pending work, STT failures, or dropped segments while STT is slow.
+
+### The text prompt appears but the bot does not speak
+
+- Confirm `[tts].enabled = true` and the TTS API key is present in the OpenAB
+  process environment/configuration.
+- Confirm the provider exposes an OpenAI-compatible `/audio/speech` endpoint and
+  that the configured model and voice are valid for that provider.
+- Confirm the bot has Discord `Speak` permission in the joined Voice Channel.
+- Check logs for TTS HTTP, WAV validation, decoding, Songbird playback, or track
+  errors. The text prompt remains the fallback when speech fails.
+- Do not treat code completion as live playback evidence until the operator has
+  heard a proposal and local/delegated acknowledgement from the deployed artifact.
 
 ### The bot left without a public stop message
 

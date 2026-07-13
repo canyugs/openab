@@ -1,6 +1,6 @@
 # ADR: Discord Voice Channel Receive and Transcription
 
-- **Status:** Proposed — one-speaker live receive passed; accuracy and soak validation pending
+- **Status:** Proposed — one-speaker receive passed; spoken confirmation/TTS implemented with live validation pending
 - **Date:** 2026-07-12
 - **Implementation branch:** `feat/discord-voice-receive`
 - **Related:** [Discord guide](../discord.md), [STT guide](../stt.md), [Discord Voice Channel guide](../discord-voice.md), [Discord Voice intent routing ADR](duplex-voice-engines-and-action-broker.md)
@@ -11,7 +11,7 @@
 
 This table records implementation state separately from runtime validation. Update it as the branch advances; do not infer production readiness from code completion alone.
 
-| Capability | State on 2026-07-12 | Notes |
+| Capability | State on 2026-07-13 | Notes |
 |---|---|---|
 | Discord voice-message attachment STT | **Implemented (existing baseline)** | OpenAB downloads an attached audio file and sends its bytes to the configured OpenAI-compatible STT endpoint. |
 | Songbird 0.6 receive integration | **Implemented on branch** | When voice is enabled, Serenity registers Songbird in receive `Decode` mode and adds `GUILD_VOICE_STATES`. Receive handlers are installed before join. |
@@ -25,8 +25,8 @@ This table records implementation state separately from runtime validation. Upda
 | Local Discord/Groq/Claude readiness | **Passed; hybrid Slice 1 startup passed** | Helm revision 8 runs `localhost:5555/openab:claude-voice-hybrid-66d8363` at digest `sha256:944e281b673afe8ab69fdd7eebac2a91943f80ff226f4b9447cf175b9dcc4c94`, `1/1` ready with zero restarts. Logs confirm `voice_intent_enabled=true`, Groq STT, Aragorn connected, and slash commands registered. Local Sam revision 2 is also ready on the matching Codex image. A real spoken proposal, local ACP task, and target-agent handoff remain pending. |
 | Real Discord receive | **Passed for one speaker** | The first Songbird join exposed a Rustls 0.23 provider ambiguity in unified builds. Commit `7b8f90f` explicitly selects AWS-LC when AgentCore features are present and ring for Discord-only builds. After that fix, join, decoded receive, attribution, timestamps, and raw transcript download passed. The rollout ended the session; explicit stop and DAVE remain separate checks. |
 | STT accuracy sample | **Failed; controlled retry pending** | The first four-segment raw transcript preserved one-speaker attribution and timing, but contained an ellipsis-only segment, an incorrect-language hallucination, and unreliable Chinese text. Image `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88` is deployed with `whisper-large-v3` plus `language = "zh"` for the next A/B sample. |
-| Voice intent broker | **Hybrid Slice 1 implemented; rollout/live validation pending** | With explicit opt-in, an unaddressed command-shaped transcript asks for text confirmation and then enters Aragorn's existing Dispatcher/ACP path; a request naming one configured target still dispatches a nonce-enforced real Discord mention. Target-head coordination grammar and typed clarification remain follow-up work. |
-| Spoken confirmation and TTS | **Not started** | Text confirmation is the first engineering slice. Spoken yes/no plus Songbird TTS is the first hands-free daily milestone. |
+| Voice intent broker | **Hybrid Slices 1-3 implemented; rollout/live validation pending** | With explicit opt-in, an unaddressed command-shaped transcript enters Aragorn's existing Dispatcher/ACP path after spoken or text confirmation; a request naming one configured target still dispatches a nonce-enforced real Discord mention. Target-head coordination grammar and typed clarification remain follow-up work. |
+| Spoken confirmation and TTS | **Implemented; live provider/Voice validation pending** | Final STT from the bound operator handles yes/no/correction through the same pending state as text. Opt-in OpenAI-compatible TTS plays bounded proposal and local/delegated acknowledgement prompts through Songbird while capture is suppressed; text fallback remains available. |
 | Realtime/Live and result observation | **Not started; optional later slices** | Realtime/Live must emit the same proposal contract. Thread observation must not block the initial confirmed-dispatch loop. |
 | Two-speaker and reconnect soak test | **Pending real-world validation** | Attribution, reconnect health beyond a unit state transition, and a 30-minute minimum soak remain unverified. |
 | Production readiness | **Not established** | Requires the acceptance checks in section 12. |
@@ -72,7 +72,9 @@ OpenAB will add an **opt-in Discord Voice subsystem** with these boundaries:
 4. A Voice session stores ordered transcript segments with Discord user identity and timestamps.
 5. Slash commands control the session. The text channel or thread where `/voice join` is invoked becomes the control and output channel; the bot joins the caller's current Voice Channel.
 6. Only explicit `/voice summary` sends the accumulated transcript through the normal ACP/session path and posts text output to the pinned control channel. `/voice stop` never submits it automatically.
-7. The first version is receive-only. The bot does not synthesize or play speech.
+7. The receive/transcript feature remains useful by itself. Independently opt-in
+   TTS can synthesize bounded intent prompts and acknowledgements and play them
+   through Songbird using half-duplex capture suppression.
 
 The branch configuration surface is:
 
@@ -104,7 +106,8 @@ max_transcript_bytes = 80000
 
 ## 5. Non-Goals for the First Version
 
-- Text-to-speech or playing ACP responses into the Voice Channel.
+- General text-to-speech for arbitrary ACP responses. Playback is limited to
+  bounded intent-broker prompts and acknowledgements.
 - Wake words, full-duplex realtime conversation, barge-in, or echo cancellation.
 - Sending every speech segment to the ACP agent as an independent turn.
 - Permanent raw-audio recording, downloadable multitrack archives, or podcast mixing.
@@ -153,7 +156,9 @@ OpenAB adopts those lifecycle and per-user principles, but does not copy Craig's
 - transcript logs are bounded; and
 - repeated decrypt failures require explicit recovery rather than silent success.
 
-OpenAB intentionally stops before OpenClaw's TTS, realtime model, wake-name, follow-user, and barge-in features.
+OpenAB now implements bounded intent-broker TTS, but intentionally stops before
+general ACP-response playback, realtime models, wake-name, follow-user, and
+barge-in features.
 
 ## 7. Implemented Spike Architecture
 
@@ -192,6 +197,18 @@ DiscordVoiceManager
                               │
                               ▼
                        pinned Discord text channel/thread
+```
+
+The optional intent path branches from each accepted final transcript:
+
+```text
+final operator STT
+  → intent proposal / pending confirmation
+  → bounded text prompt + optional TTS WAV
+  → Songbird playback (capture suppressed)
+  → spoken or text yes/no/correction
+  → local Dispatcher/ACP or deterministic target mention
+  → bounded local/delegated acknowledgement
 ```
 
 ### 7.1 Session Boundary
@@ -238,7 +255,10 @@ An example rendered segment is:
 The deployment is blocked by ImagePullBackOff, not MemoryPressure.
 ```
 
-Only `/voice summary` starts an ACP turn in this implementation. Individual STT segments accumulate without independently invoking the coding agent.
+In the transcript/meeting-summary path, only `/voice summary` starts an ACP turn.
+When the separately opt-in intent broker is enabled, an accepted final segment may
+instead create a pending semantic intent; it still cannot start local ACP work or
+delegate until the operator confirms it.
 
 The retained transcript is bounded by bytes and entry count. Status exposes retained
 entries/bytes, evicted entries, and rejected entries. It remains in process memory
@@ -316,6 +336,24 @@ model = "whisper-large-v3-turbo"
 base_url = "https://api.groq.com/openai/v1"
 ```
 
+Hands-free intent prompts and acknowledgements additionally require opt-in TTS:
+
+```toml
+[tts]
+enabled = true
+api_key = "${TTS_API_KEY}"
+model = "gpt-4o-mini-tts"
+voice = "marin"
+base_url = "https://api.openai.com/v1"
+instructions = "Speak briefly in Traditional Chinese."
+request_timeout_seconds = 30
+```
+
+The provider must expose an OpenAI-compatible `/audio/speech` endpoint. The model
+and voice above are defaults, not requirements. OpenAB explicitly requests WAV,
+bounds the returned audio, and leaves TTS disabled by default. Text confirmation
+continues to work without TTS.
+
 `allowed_channels` restricts joined Voice Channel IDs. It is independent of
 `[discord].allowed_channels`, which gates the text channel/thread where lifecycle
 commands run. `[discord].allowed_users` authorizes operators only: the receive path
@@ -344,6 +382,9 @@ Operators must obtain the consent required by their laws, server rules, employme
 ### 10.2 Audio and Transcript Retention
 
 - Raw PCM and encoded WAV remain in bounded process memory. The worker writes no temporary audio files and releases bytes after each STT request.
+- TTS prompt text is sent to the configured TTS provider, and the returned WAV
+  remains bounded in memory for playback. Provider retention must be disclosed
+  separately from STT and ACP retention.
 - The Voice subsystem does not persist full recordings.
 - Transcript text remains in a bounded in-memory store after stop until a new guild session replaces it or the process exits. Only explicit `/voice summary` sends it to ACP and the configured model provider; that downstream retention must be disclosed.
 - Full transcript text must not be written to normal logs. Diagnostics should contain IDs, durations, byte counts, states, and a bounded/redacted preview only when explicitly enabled.
@@ -360,10 +401,12 @@ sandbox. This unresolved risk is another reason the feature is not production-re
 
 ### 10.4 Credential and Process Boundary
 
-- `DISCORD_BOT_TOKEN` and STT credentials remain in the OpenAB process.
+- `DISCORD_BOT_TOKEN`, STT credentials, and TTS credentials remain in the OpenAB process.
 - They must not be added to `[agent].env` or exposed to the ACP child process.
 - Existing `env_clear()` child-process isolation remains unchanged.
 - A cloud `base_url` sends audio to that provider; a local OpenAI-compatible endpoint can keep audio on the operator's network.
+- A cloud TTS `base_url` receives the bounded broker prompt text; a compatible
+  local endpoint can keep synthesis on the operator's network.
 
 ### 10.5 DAVE Is Transport Security, Not No-Access
 
@@ -408,6 +451,11 @@ observability gap rather than inferring health from connection state.
 - [x] Transcript byte/entry bounds and segment drop counters have unit coverage.
 - [ ] `/voice stop` removes the call and capture sender; queued STT drain/continuation behavior is validated under load.
 - [x] Transcript rendering order is covered explicitly when STT completes out of order.
+- [x] Spoken yes/no/correction shares the pending-intent transition and rejects
+  unrelated, duplicate, wrong-speaker, and stale-session final transcripts in
+  targeted tests.
+- [x] TTS request construction, WAV validation/bounds, playback conversion, and
+  session/epoch-bound capture suppression have targeted coverage.
 
 ### Real Discord / DAVE Validation
 
@@ -425,6 +473,12 @@ observability gap rather than inferring health from connection state.
 - [ ] Backpressure is exercised by slowing or failing the STT endpoint.
 - [ ] Consent/start/stop notices are visible and accurate.
 - [ ] The deployed build writes no audio files and releases in-memory WAV payloads after STT completion.
+- [ ] The operator hears the bounded proposal and can answer yes/no/correction
+  without using the text fallback.
+- [ ] Local and delegated confirmations speak the correct acknowledgement exactly
+  once.
+- [ ] Playback does not become its own confirmation, and capture resumes after
+  track end, playback error, and watchdog release.
 
 ### Packaging Validation
 
@@ -434,7 +488,7 @@ observability gap rather than inferring health from connection state.
 
 ## 13. Rollout
 
-1. Land the receive-only implementation behind `enabled = false`.
+1. Keep receive and intent/TTS behavior behind backward-compatible opt-in flags.
 2. Complete full-repository verification beyond the passing targeted check and 78 tests.
 3. Run the real Discord/DAVE checklist in a private test server.
 4. Record measured loss, STT latency, memory growth, and reconnect behavior.

@@ -18,6 +18,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 const DISCORD_MESSAGE_LIMIT: usize = 2_000;
+const VOICE_SPEECH_LIMIT: usize = 500;
 const MAX_PROCESSED_TRANSCRIPT_KEYS: usize = 1_024;
 const MAX_CONFIRMATION_RETRY_ATTEMPTS: usize = 5;
 const MAX_STALE_CONFIRMATION_RECOVERY_ATTEMPTS: usize = 2;
@@ -61,7 +62,7 @@ pub trait VoiceIntentMessenger: Send + Sync {
     async fn delete_message(&self, channel_id: u64, message_id: &str) -> Result<()>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceIntentTranscriptOutcome {
     /// The event was disabled, stale, from another speaker/channel, or was not
     /// an unambiguous command for a supported destination.
@@ -69,7 +70,22 @@ pub enum VoiceIntentTranscriptOutcome {
     /// This exact session already has an intent waiting for text confirmation.
     AwaitingConfirmation,
     /// A new proposal was stored and its idempotent confirmation post started.
-    Proposed,
+    /// `speech_prompt` is a bounded plain-text projection suitable for TTS.
+    Proposed { speech_prompt: String },
+    /// A spoken confirmation was handled through the same state transition and
+    /// side-effect path as a text confirmation. Callers must handle
+    /// [`VoiceIntentTextOutcome::ExecuteLocal`] through the local ACP runtime.
+    Confirmation(VoiceIntentSpokenConfirmationOutcome),
+}
+
+/// Result of resolving one spoken yes/no/correction against a pending intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceIntentSpokenConfirmationOutcome {
+    /// The authoritative broker action. Local execution must be handed to the
+    /// caller's ACP runtime and completed or reopened through the broker APIs.
+    pub outcome: VoiceIntentTextOutcome,
+    /// A bounded plain-text acknowledgement or revised prompt suitable for TTS.
+    pub speech_feedback: Option<String>,
 }
 
 /// Confirmed work that should execute through the voice agent's own ACP path.
@@ -283,6 +299,37 @@ impl DiscordVoiceIntentBroker {
         true
     }
 
+    /// Restart the confirmation timeout after an audible prompt finishes.
+    ///
+    /// The waiting generation makes an older timeout task harmless. Calls for
+    /// a stale session or a proposal that is no longer waiting are ignored.
+    pub fn refresh_confirmation_timeout(self: &Arc<Self>, token: VoiceSessionToken) -> bool {
+        let (intent_id, revision, waiting_epoch) = {
+            let mut state = self.lock_state();
+            let Some(bound) = state.sessions.get_mut(&token.guild_id()) else {
+                return false;
+            };
+            if bound.token != token {
+                return false;
+            }
+            let Some(current) = bound.pending.as_ref() else {
+                return false;
+            };
+            if current.phase != PendingPhase::WaitingConfirmation {
+                return false;
+            }
+            let intent_id = current.id;
+            let revision = current.revision;
+            let waiting_epoch = bound.next_waiting_epoch;
+            bound.next_waiting_epoch = bound.next_waiting_epoch.saturating_add(1);
+            let pending = bound.pending.as_mut().expect("pending was checked above");
+            pending.waiting_epoch = waiting_epoch;
+            (intent_id, revision, waiting_epoch)
+        };
+        self.schedule_timeout(token, intent_id, revision, waiting_epoch);
+        true
+    }
+
     /// Bind the operator and Discord control channel to one exact voice session.
     ///
     /// A newer session for the same guild atomically replaces the old binding,
@@ -360,11 +407,10 @@ impl DiscordVoiceIntentBroker {
             return Ok(VoiceIntentTranscriptOutcome::Ignored);
         }
 
-        let Some(raw_proposal) = self.resolve_proposal(&event.text) else {
-            return Ok(VoiceIntentTranscriptOutcome::Ignored);
-        };
+        let confirmation = classify_confirmation(&event.text);
+        let raw_proposal = self.resolve_proposal(&event.text);
 
-        let confirmation = {
+        let effect = {
             let mut state = self.lock_state();
             let Some(bound) = state.sessions.get_mut(&event.token.guild_id()) else {
                 return Ok(VoiceIntentTranscriptOutcome::Ignored);
@@ -375,35 +421,90 @@ impl DiscordVoiceIntentBroker {
             {
                 return Ok(VoiceIntentTranscriptOutcome::Ignored);
             }
-            let Some(proposal) = self.canonicalize_proposal(bound, raw_proposal) else {
-                return Ok(VoiceIntentTranscriptOutcome::Ignored);
-            };
-            // Record every valid, unambiguous operator proposal before looking
-            // at the pending slot. A delayed replay therefore cannot become a
-            // fresh command after the current intent completes.
-            if !record_transcript_key(bound, event.key) {
-                return Ok(VoiceIntentTranscriptOutcome::Ignored);
-            }
-            if bound.pending.is_some() {
-                return Ok(VoiceIntentTranscriptOutcome::AwaitingConfirmation);
-            }
 
-            let intent = PendingIntent {
-                id: Uuid::new_v4(),
-                revision: bound.next_revision,
-                waiting_epoch: 0,
-                proposal,
-                phase: PendingPhase::PostingConfirmation,
-                confirmation_message_id: None,
-            };
-            bound.next_revision = bound.next_revision.saturating_add(1);
-            let confirmation = PendingMessage::from_bound(bound, intent.clone());
-            bound.pending = Some(intent.clone());
-            confirmation
+            if let Some(current) = bound.pending.clone() {
+                // Record every final transcript received from the bound
+                // operator while confirmation is pending, including unrelated
+                // speech. A delayed replay can therefore never resolve the
+                // pending intent after its first delivery was ignored.
+                if !record_transcript_key(bound, event.key) {
+                    return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                }
+                if matches!(confirmation, Confirmation::Unrelated) {
+                    return Ok(VoiceIntentTranscriptOutcome::AwaitingConfirmation);
+                }
+                if current.phase != PendingPhase::WaitingConfirmation {
+                    return Ok(VoiceIntentTranscriptOutcome::Confirmation(
+                        VoiceIntentSpokenConfirmationOutcome {
+                            outcome: VoiceIntentTextOutcome::AlreadyProcessing,
+                            speech_feedback: None,
+                        },
+                    ));
+                }
+
+                TranscriptEffect::Apply(self.confirmation_effect(
+                    bound,
+                    current,
+                    confirmation,
+                ))
+            } else {
+                let Some(raw_proposal) = raw_proposal else {
+                    return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                };
+                let Some(proposal) = self.canonicalize_proposal(bound, raw_proposal) else {
+                    return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                };
+                // Record every valid, unambiguous operator proposal before
+                // storing it. A delayed replay therefore cannot become a fresh
+                // command after the current intent completes.
+                if !record_transcript_key(bound, event.key) {
+                    return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                }
+
+                let intent = PendingIntent {
+                    id: Uuid::new_v4(),
+                    revision: bound.next_revision,
+                    waiting_epoch: 0,
+                    proposal,
+                    phase: PendingPhase::PostingConfirmation,
+                    confirmation_message_id: None,
+                };
+                bound.next_revision = bound.next_revision.saturating_add(1);
+                let confirmation = PendingMessage::from_bound(bound, intent.clone());
+                bound.pending = Some(intent);
+                TranscriptEffect::Post(confirmation)
+            }
         };
 
-        self.post_confirmation_or_schedule_retry(confirmation).await;
-        Ok(VoiceIntentTranscriptOutcome::Proposed)
+        match effect {
+            TranscriptEffect::Post(confirmation) => {
+                let speech_prompt = self
+                    .confirmation_speech_for(
+                        &confirmation.intent.proposal,
+                        &confirmation.intent.proposal.task,
+                    )
+                    .expect("a stored proposal must have a valid destination");
+                self.post_confirmation_or_schedule_retry(confirmation).await;
+                Ok(VoiceIntentTranscriptOutcome::Proposed { speech_prompt })
+            }
+            TranscriptEffect::Apply(effect) => {
+                let revised_prompt = match &effect {
+                    TextEffect::Correct(revised) => self.confirmation_speech_for(
+                        &revised.intent.proposal,
+                        &revised.intent.proposal.task,
+                    ),
+                    _ => None,
+                };
+                let outcome = self.apply_text_effect(effect).await?;
+                let speech_feedback = spoken_feedback_for_outcome(&outcome, revised_prompt);
+                Ok(VoiceIntentTranscriptOutcome::Confirmation(
+                    VoiceIntentSpokenConfirmationOutcome {
+                        outcome,
+                        speech_feedback,
+                    },
+                ))
+            }
+        }
     }
 
     /// Consume an exact text confirmation, cancellation, or correction.
@@ -442,58 +543,67 @@ impl DiscordVoiceIntentBroker {
                 return Ok(VoiceIntentTextOutcome::AlreadyProcessing);
             }
 
-            match confirmation {
-                Confirmation::Affirmative => match current.proposal.destination {
-                    IntentDestination::Delegate { .. } => {
-                        let updated = {
-                            let pending =
-                                bound.pending.as_mut().expect("pending was checked above");
-                            pending.phase = PendingPhase::Dispatching;
-                            pending.clone()
-                        };
-                        TextEffect::Dispatch(PendingMessage::from_bound(bound, updated))
-                    }
-                    IntentDestination::Local => {
-                        let updated = {
-                            let pending =
-                                bound.pending.as_mut().expect("pending was checked above");
-                            pending.phase = PendingPhase::Dispatching;
-                            pending.clone()
-                        };
-                        let message = PendingMessage::from_bound(bound, updated);
-                        TextEffect::ExecuteLocal(LocalIntentExecution::from_pending(&message))
-                    }
-                },
-                Confirmation::Negative => {
-                    bound.pending = None;
-                    TextEffect::Cancel(PendingMessage::from_bound(bound, current))
-                }
-                Confirmation::Correction(correction) => {
-                    if let Some(proposal) = self
-                        .resolve_correction(&current.proposal, correction)
-                        .and_then(|proposal| self.canonicalize_proposal(bound, proposal))
-                    {
-                        let revised_intent = PendingIntent {
-                            id: Uuid::new_v4(),
-                            revision: bound.next_revision,
-                            waiting_epoch: 0,
-                            proposal,
-                            phase: PendingPhase::PostingConfirmation,
-                            confirmation_message_id: None,
-                        };
-                        bound.next_revision = bound.next_revision.saturating_add(1);
-                        let revised = PendingMessage::from_bound(bound, revised_intent.clone());
-                        bound.pending = Some(revised_intent);
-                        TextEffect::Correct(revised)
-                    } else {
-                        TextEffect::RejectCorrection(PendingMessage::from_bound(bound, current))
-                    }
-                }
-                Confirmation::Unrelated => unreachable!("handled before locking broker state"),
-            }
+            self.confirmation_effect(bound, current, confirmation)
         };
 
         self.apply_text_effect(effect).await
+    }
+
+    fn confirmation_effect(
+        &self,
+        bound: &mut BoundSession,
+        current: PendingIntent,
+        confirmation: Confirmation<'_>,
+    ) -> TextEffect {
+        match confirmation {
+            Confirmation::Affirmative => match current.proposal.destination {
+                IntentDestination::Delegate { .. } => {
+                    let updated = {
+                        let pending = bound.pending.as_mut().expect("pending was checked above");
+                        pending.phase = PendingPhase::Dispatching;
+                        pending.clone()
+                    };
+                    TextEffect::Dispatch(PendingMessage::from_bound(bound, updated))
+                }
+                IntentDestination::Local => {
+                    let updated = {
+                        let pending = bound.pending.as_mut().expect("pending was checked above");
+                        pending.phase = PendingPhase::Dispatching;
+                        pending.clone()
+                    };
+                    let message = PendingMessage::from_bound(bound, updated);
+                    TextEffect::ExecuteLocal(LocalIntentExecution::from_pending(&message))
+                }
+            },
+            Confirmation::Negative => {
+                bound.pending = None;
+                TextEffect::Cancel(PendingMessage::from_bound(bound, current))
+            }
+            Confirmation::Correction(correction) => {
+                if let Some(proposal) = self
+                    .resolve_correction(&current.proposal, correction)
+                    .and_then(|proposal| self.canonicalize_proposal(bound, proposal))
+                {
+                    let revised_intent = PendingIntent {
+                        id: Uuid::new_v4(),
+                        revision: bound.next_revision,
+                        waiting_epoch: 0,
+                        proposal,
+                        phase: PendingPhase::PostingConfirmation,
+                        confirmation_message_id: None,
+                    };
+                    bound.next_revision = bound.next_revision.saturating_add(1);
+                    let revised = PendingMessage::from_bound(bound, revised_intent.clone());
+                    bound.pending = Some(revised_intent);
+                    TextEffect::Correct(revised)
+                } else {
+                    TextEffect::RejectCorrection(PendingMessage::from_bound(bound, current))
+                }
+            }
+            Confirmation::Unrelated => {
+                unreachable!("unrelated confirmation must be handled before effect construction")
+            }
+        }
     }
 
     async fn apply_text_effect(
@@ -732,6 +842,21 @@ impl DiscordVoiceIntentBroker {
             }
             IntentDestination::Local => Some(local_confirmation_message(operator_user_id, task)),
         }
+    }
+
+    fn confirmation_speech_for(
+        &self,
+        proposal: &IntentProposal,
+        task: &str,
+    ) -> Option<String> {
+        let message = match proposal.destination {
+            IntentDestination::Delegate { target_index } => {
+                let target = self.targets.get(target_index)?;
+                format!("要請 {} {}，對嗎？", target.canonical, task)
+            }
+            IntentDestination::Local => format!("由我直接處理「{task}」，對嗎？"),
+        };
+        Some(bounded_voice_speech(message))
     }
 
     async fn post_confirmation_or_schedule_retry(self: &Arc<Self>, message: PendingMessage) {
@@ -1184,6 +1309,12 @@ enum TextEffect {
     RejectCorrection(PendingMessage),
 }
 
+#[derive(Debug)]
+enum TranscriptEffect {
+    Post(PendingMessage),
+    Apply(TextEffect),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Confirmation<'a> {
     Affirmative,
@@ -1598,6 +1729,37 @@ fn confirmation_retry_delay(attempt: usize) -> Duration {
         .min(CONFIRMATION_RETRY_MAX)
 }
 
+fn spoken_feedback_for_outcome(
+    outcome: &VoiceIntentTextOutcome,
+    revised_prompt: Option<String>,
+) -> Option<String> {
+    let feedback = match outcome {
+        VoiceIntentTextOutcome::NotApplicable | VoiceIntentTextOutcome::AlreadyProcessing => {
+            return None;
+        }
+        VoiceIntentTextOutcome::Dispatching => "正在確認是否已送出。".to_string(),
+        VoiceIntentTextOutcome::Dispatched => "已送出。".to_string(),
+        VoiceIntentTextOutcome::ExecuteLocal(_) => "好的，我開始處理。".to_string(),
+        VoiceIntentTextOutcome::Cancelled => "已取消。".to_string(),
+        VoiceIntentTextOutcome::Corrected => revised_prompt?,
+        VoiceIntentTextOutcome::CorrectionRejected => {
+            "我沒有理解這個修正，請再說一次。".to_string()
+        }
+    };
+    Some(bounded_voice_speech(feedback))
+}
+
+fn bounded_voice_speech(message: String) -> String {
+    if message.chars().count() <= VOICE_SPEECH_LIMIT {
+        return message;
+    }
+    message
+        .chars()
+        .take(VOICE_SPEECH_LIMIT.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
 fn bounded_discord_message(message: String) -> String {
     if message.chars().count() <= DISCORD_MESSAGE_LIMIT {
         return message;
@@ -1834,7 +1996,9 @@ mod tests {
                 })
                 .await
                 .unwrap(),
-            VoiceIntentTranscriptOutcome::Proposed
+            VoiceIntentTranscriptOutcome::Proposed {
+                speech_prompt: "要請 B0 group review PR #123，對嗎？".to_string(),
+            }
         );
     }
 
@@ -1853,7 +2017,9 @@ mod tests {
                 })
                 .await
                 .unwrap(),
-            VoiceIntentTranscriptOutcome::Proposed
+            VoiceIntentTranscriptOutcome::Proposed {
+                speech_prompt: "由我直接處理「review PR #123」，對嗎？".to_string(),
+            }
         );
     }
 
@@ -2120,6 +2286,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spoken_affirmative_emits_typed_local_execution_and_plain_feedback() {
+        let (broker, messenger) = local_broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+        propose_local(&broker, current).await;
+
+        let outcome = broker
+            .handle_final_transcript(FinalTranscriptEvent {
+                token: current,
+                control_channel_id: 200,
+                key: TranscriptKey {
+                    speaker_id: 300,
+                    start_frame: 300,
+                    end_frame: 400,
+                },
+                text: "對".to_string(),
+            })
+            .await
+            .unwrap();
+        let VoiceIntentTranscriptOutcome::Confirmation(spoken) = outcome else {
+            panic!("expected a spoken confirmation outcome")
+        };
+        let VoiceIntentTextOutcome::ExecuteLocal(request) = spoken.outcome else {
+            panic!("expected a local execution handoff")
+        };
+        assert_eq!(request.session, current);
+        assert_eq!(request.task, "review PR #123");
+        assert_eq!(spoken.speech_feedback.as_deref(), Some("好的，我開始處理。"));
+        assert_eq!(messenger.messages().len(), 1);
+        assert!(broker.complete_local_execution(&request));
+    }
+
+    #[tokio::test]
+    async fn spoken_negative_cancels_and_spoken_correction_reprompts() {
+        let (broker, messenger) = broker(30);
+        let first = token(100, 1);
+        broker.bind_session(first, 200, 300, "Can");
+        propose(&broker, first).await;
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: first,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 300,
+                        end_frame: 400,
+                    },
+                    text: "不是".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Confirmation(
+                VoiceIntentSpokenConfirmationOutcome {
+                    outcome: VoiceIntentTextOutcome::Cancelled,
+                    speech_feedback: Some("已取消。".to_string()),
+                }
+            )
+        );
+
+        let second = token(100, 2);
+        broker.bind_session(second, 200, 300, "Can");
+        propose(&broker, second).await;
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: second,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 300,
+                        end_frame: 400,
+                    },
+                    text: "更正：請 B1 run CI".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Confirmation(
+                VoiceIntentSpokenConfirmationOutcome {
+                    outcome: VoiceIntentTextOutcome::Corrected,
+                    speech_feedback: Some("要請 B1 run CI，對嗎？".to_string()),
+                }
+            )
+        );
+        assert!(messenger
+            .messages()
+            .last()
+            .is_some_and(|message| message.content.contains("B1 run CI")));
+    }
+
+    #[tokio::test]
+    async fn unrelated_spoken_reply_leaves_pending_and_its_key_cannot_be_replayed() {
+        let (broker, messenger) = broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+        propose(&broker, current).await;
+        let replayed_key = TranscriptKey {
+            speaker_id: 300,
+            start_frame: 300,
+            end_frame: 400,
+        };
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: replayed_key,
+                    text: "今天天氣很好".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::AwaitingConfirmation
+        );
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: replayed_key,
+                    text: "對".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Ignored
+        );
+        assert_eq!(messenger.messages().len(), 1);
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 500,
+                        end_frame: 600,
+                    },
+                    text: "對".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Confirmation(
+                VoiceIntentSpokenConfirmationOutcome {
+                    outcome: VoiceIntentTextOutcome::Dispatched,
+                    speech_feedback: Some("已送出。".to_string()),
+                }
+            )
+        );
+        assert_eq!(messenger.messages().len(), 2);
+    }
+
+    #[tokio::test]
     async fn local_mode_preserves_explicit_target_delegation() {
         let (broker, messenger) = local_broker(30);
         let current = token(100, 1);
@@ -2276,22 +2596,23 @@ mod tests {
         let current = token(100, 1);
         broker.bind_session(current, 200, 300, "Can");
         let raw_task = "x".repeat(3_000);
-        assert_eq!(
-            broker
-                .handle_final_transcript(FinalTranscriptEvent {
-                    token: current,
-                    control_channel_id: 200,
-                    key: TranscriptKey {
-                        speaker_id: 300,
-                        start_frame: 100,
-                        end_frame: 200,
-                    },
-                    text: format!("請 B0 {raw_task}"),
-                })
-                .await
-                .unwrap(),
-            VoiceIntentTranscriptOutcome::Proposed
-        );
+        let proposal = broker
+            .handle_final_transcript(FinalTranscriptEvent {
+                token: current,
+                control_channel_id: 200,
+                key: TranscriptKey {
+                    speaker_id: 300,
+                    start_frame: 100,
+                    end_frame: 200,
+                },
+                text: format!("請 B0 {raw_task}"),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            proposal,
+            VoiceIntentTranscriptOutcome::Proposed { .. }
+        ));
         let confirmation = messenger.messages()[0].clone();
         assert!(confirmation.content.chars().count() <= DISCORD_MESSAGE_LIMIT);
         let confirmation_task = confirmation
@@ -2387,7 +2708,9 @@ mod tests {
         messenger.release_confirmation.notify_one();
         assert_eq!(
             proposing.await.unwrap().unwrap(),
-            VoiceIntentTranscriptOutcome::Proposed
+            VoiceIntentTranscriptOutcome::Proposed {
+                speech_prompt: "要請 B0 review PR #123，對嗎？".to_string(),
+            }
         );
         assert_eq!(
             broker
@@ -2580,6 +2903,32 @@ mod tests {
                 .unwrap(),
             VoiceIntentTextOutcome::NotApplicable
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audible_prompt_refreshes_the_confirmation_timeout_generation() {
+        let (broker, messenger) = broker(2);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+        propose(&broker, current).await;
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(broker.refresh_confirmation_timeout(current));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(messenger
+            .messages()
+            .iter()
+            .all(|message| !message.content.contains("已逾時")));
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(messenger
+            .messages()
+            .iter()
+            .any(|message| message.content.contains("已逾時")));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2808,7 +3157,9 @@ mod tests {
         messenger.release_confirmation.notify_one();
         assert_eq!(
             proposing.await.unwrap().unwrap(),
-            VoiceIntentTranscriptOutcome::Proposed
+            VoiceIntentTranscriptOutcome::Proposed {
+                speech_prompt: "要請 B0 review PR #123，對嗎？".to_string(),
+            }
         );
         assert_eq!(messenger.messages().len(), 1);
         assert!(messenger.visible_messages().is_empty());
@@ -2898,7 +3249,9 @@ mod tests {
                 })
                 .await
                 .unwrap(),
-            VoiceIntentTranscriptOutcome::Proposed
+            VoiceIntentTranscriptOutcome::Proposed {
+                speech_prompt: "要請 B0 run CI，對嗎？".to_string(),
+            }
         );
         assert_eq!(messenger.visible_messages().len(), 1);
         assert!(messenger.visible_messages()[0].content.contains("run CI"));

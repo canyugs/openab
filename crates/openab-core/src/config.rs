@@ -182,6 +182,8 @@ pub struct Config {
     #[serde(default)]
     pub stt: SttConfig,
     #[serde(default)]
+    pub tts: TtsConfig,
+    #[serde(default)]
     pub markdown: MarkdownConfig,
     #[serde(default)]
     pub cron: CronConfig,
@@ -424,6 +426,61 @@ fn default_stt_base_url() -> String {
 }
 fn default_echo_transcript() -> bool {
     false
+}
+
+/// Text-to-speech configuration for OpenAI-compatible `/audio/speech` providers.
+///
+/// TTS is opt-in so existing deployments do not make new network requests or
+/// require an additional credential after upgrading.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TtsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_tts_model")]
+    pub model: String,
+    #[serde(default = "default_tts_voice")]
+    pub voice: String,
+    #[serde(default = "default_tts_base_url")]
+    pub base_url: String,
+    /// Optional provider-specific speaking instructions. Blank values are
+    /// omitted from the API request.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// Per-request timeout in seconds.
+    #[serde(default = "default_tts_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            model: default_tts_model(),
+            voice: default_tts_voice(),
+            base_url: default_tts_base_url(),
+            instructions: None,
+            request_timeout_seconds: default_tts_request_timeout_seconds(),
+        }
+    }
+}
+
+fn default_tts_model() -> String {
+    "gpt-4o-mini-tts".into()
+}
+
+fn default_tts_voice() -> String {
+    "marin".into()
+}
+
+fn default_tts_base_url() -> String {
+    "https://api.openai.com/v1".into()
+}
+
+fn default_tts_request_timeout_seconds() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize)]
@@ -2625,6 +2682,43 @@ echo_transcript = false
         let cfg = parse_config(toml, "test").unwrap();
         assert!(cfg.stt.enabled);
         assert!(!cfg.stt.echo_transcript);
+    }
+
+    #[test]
+    fn tts_defaults_are_disabled_and_openai_compatible() {
+        let cfg = TtsConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.api_key.is_empty());
+        assert_eq!(cfg.model, "gpt-4o-mini-tts");
+        assert_eq!(cfg.voice, "marin");
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1");
+        assert!(cfg.instructions.is_none());
+        assert_eq!(cfg.request_timeout_seconds, 30);
+    }
+
+    #[test]
+    fn tts_config_parses_all_fields() {
+        let toml = r#"
+[agent]
+command = "echo"
+
+[tts]
+enabled = true
+api_key = "test"
+model = "custom-tts"
+voice = "custom-voice"
+base_url = "http://localhost:8080/v1"
+instructions = "Speak clearly."
+request_timeout_seconds = 12
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.tts.enabled);
+        assert_eq!(cfg.tts.api_key, "test");
+        assert_eq!(cfg.tts.model, "custom-tts");
+        assert_eq!(cfg.tts.voice, "custom-voice");
+        assert_eq!(cfg.tts.base_url, "http://localhost:8080/v1");
+        assert_eq!(cfg.tts.instructions.as_deref(), Some("Speak clearly."));
+        assert_eq!(cfg.tts.request_timeout_seconds, 12);
     }
 
     #[test]
