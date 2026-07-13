@@ -10,3 +10,7 @@ config.toml
 CLAUDE.md
 .claude/
 .claude.local.md
+
+# Local OpenAB runtime/auth state. Never commit provider sessions or tokens.
+.openab-home/
+config.apple-container.toml

@@ -1,0 +1,85 @@
+# Local-only Aragorn deployment for Discord Voice hybrid intent routing.
+# Live text-confirmed local ACP action loop passed on 2026-07-13.
+# Credentials are supplied by the externally managed Secret below and must not
+# be written into this file.
+image:
+  pullPolicy: Always
+
+agents:
+  kiro:
+    enabled: false
+
+  voice:
+    enabled: true
+    image: localhost:5555/openab:claude-voice-llm-first-0f8511f
+    workingDir: /home/node
+
+    env:
+      RUST_LOG: "info,openab_core::stt=debug,openab_core::discord_voice_runtime=debug"
+
+    envFrom:
+      - secretRef:
+          name: openab-discord-voice
+
+    persistence:
+      enabled: true
+      storageClass: hostpath
+      size: 1Gi
+
+    configToml: |
+      [agent]
+      command = "claude-agent-acp"
+      args = []
+      working_dir = "/home/node"
+      env = { CLAUDE_CODE_EXECUTABLE = "/usr/local/bin/claude" }
+
+      [discord]
+      bot_token = "${DISCORD_BOT_TOKEN}"
+      allow_all_channels = false
+      allowed_channels = ["1525115509870301225", "1488911260505477154"]
+      allow_all_users = false
+      allowed_users = ["213702770132385792"]
+      allow_dm = true
+
+      [discord.voice]
+      enabled = true
+      allowed_channels = ["1488911260505477154"]
+      silence_ms = 2000
+      max_segment_seconds = 30
+      max_session_minutes = 120
+      max_pending_segments = 8
+      max_transcript_bytes = 80000
+
+      [discord.voice.intent]
+      enabled = true
+      confirmation_timeout_seconds = 30
+      default_to_local = true
+
+      [discord.voice.intent.targets.sam]
+      discord_user_id = "1514670865412002014"
+      aliases = ["Samuel", "山姆", "Codex"]
+
+      [discord.voice.intent.targets.frodo]
+      discord_user_id = "1505247177935687904"
+      aliases = ["佛羅多", "佛罗多", "Grok"]
+
+      [stt]
+      enabled = true
+      api_key = "${STT_API_KEY}"
+      model = "whisper-large-v3"
+      base_url = "https://api.groq.com/openai/v1"
+      language = "zh"
+      echo_transcript = false
+
+      [tts]
+      enabled = true
+      api_key = "${TTS_API_KEY}"
+      model = "gpt-4o-mini-tts"
+      voice = "marin"
+      base_url = "https://api.openai.com/v1"
+      instructions = "請使用自然、簡短的繁體中文口語回覆。"
+      request_timeout_seconds = 30
+
+      [pool]
+      max_sessions = 3
+      session_ttl_hours = 1

@@ -197,9 +197,9 @@ without helping the initial intent-confirmation loop.
 | Explicit ACP transcript summary | **Implemented** | `/voice summary` uses the current normal ACP path. This remains separate from intent delegation. |
 | Intent proposal/router | **Hybrid Slice 1 implemented** | With `default_to_local = true`, every non-empty final operator transcript becomes a local candidate unless it explicitly addresses exactly one configured target. Local raw text is confirmed before ACP/LLM interpretation. One explicit configured target resolves to delegation; unknown or multiple target matches do not delegate and remain raw local text. |
 | Pending intent state machine | **Implemented and unit-tested** | Session/operator binding, posting/waiting/dispatching phases, correction, timeout generations, replay protection, and stale-session cleanup exist. |
-| Text-confirmed local ACP execution | **Implemented; local startup passed, live task pending** | A confirmed local request creates a stable-nonce audit root, creates a task thread for a normal text/news control channel, and submits through the existing Dispatcher/ACP path. Existing threads and Voice Channel text chat execute in that shared channel because Discord cannot nest a thread there. |
+| Text-confirmed local ACP execution | **Implemented and live-validated** | On 2026-07-13 a real operator utterance produced a text proposal, confirmation started the existing Dispatcher/Claude ACP path, the agent performed an action, and Discord received the textual result. A confirmed local request uses a stable-nonce audit root and creates a task thread where Discord permits one; Voice Channel text chat executes in the shared channel because Discord cannot nest a thread there. |
 | Text-confirmed target delegation | **Implemented; local sender/receiver startup passed, live handoff pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch remain wired. The receiver now reuses Voice Channel text chat instead of trying to create an unsupported thread. A real spoken target-agent handoff still requires operator validation. |
-| Spoken yes/no/correction | **Implemented and unit-tested; live validation pending** | Final STT from the bound operator resolves the same pending state as text. Explicit yes/no/correction is accepted, unrelated speech leaves the intent pending, and replayed segments are ignored. |
+| Spoken yes/no/correction | **Implemented and unit-tested; confirmation loop live-validated** | Final STT from the bound operator resolves the same pending state as text. A real confirmation reached local ACP execution on 2026-07-13; negative, correction, replay, and timeout variants remain covered by automated tests rather than live validation. |
 | TTS and Songbird playback | **Implemented; live provider/Voice validation pending** | Opt-in `[tts]` uses an OpenAI-compatible `/audio/speech` endpoint, requests bounded WAV audio, and plays bounded proposal/acknowledgement feedback through Songbird. Capture is suppressed and partial buffers are cleared during half-duplex playback; text remains the fallback. |
 | Realtime / GPT-Live proposal backend | **Not started** | No Realtime session or tool/event integration exists. |
 | Thread/result observation | **Not started** | Existing Discord seams are available, but no voice job observer is wired. |
@@ -230,9 +230,10 @@ The local delegated receiver is also healthy:
 Startup logs confirm `voice_intent_enabled=true`, Groq STT configuration,
 Aragorn's Discord connection, and global slash-command registration. This
 deployment contains the Slice 2+3 code, but reports `voice_tts_ready=false`
-because the local Secret does not yet contain `TTS_API_KEY`. It is therefore
-startup evidence, not proof of a spoken proposal, spoken confirmation, local
-ACP task, Sam/Frodo handoff, TTS playback, or Realtime. The previous
+because the local Secret does not yet contain `TTS_API_KEY`. On 2026-07-13 the
+real operator path from Voice STT through text proposal and confirmation to a
+local Claude ACP action and textual result passed. Sam/Frodo handoff, audible
+playback, result narration, and Realtime remain unvalidated. The previous
 `claude-voice-zh-stt` image predates Slice 1 and is no longer the active local
 artifact.
 
@@ -241,8 +242,8 @@ artifact.
 | Slice | User experience | Daily hands-free ready? |
 |---|---|---|
 | Existing receive/STT | Meeting-style capture, transcript, explicit summary | No |
-| Slice 1: text confirmation | Validates intent broker and dispatch, but requires looking at Discord | No |
-| Slice 2: spoken confirmation | Implemented; the operator can answer by voice while text remains a fallback | Code complete; live validation pending |
+| Slice 1: text confirmation | Live-validated through a real local ACP action and textual result | No |
+| Slice 2: spoken confirmation | The operator can answer by voice while text remains a fallback | Local confirmation/action loop passed; correction variants remain to validate live |
 | Slice 3: TTS playback | Implemented; confirmation, sent, cancelled, and error prompts are audible | **First hands-free daily milestone; live validation pending** |
 | Slice 4: Realtime/Live | Improves conversational parsing and response latency | Enhancement |
 | Slice 5: observation | Enables "I will keep tracking and report back" | Full daily-assistant loop |
@@ -527,8 +528,24 @@ The first observer may use existing Discord-visible state:
 - final thread messages.
 
 The observer stores a small job record keyed by intent ID and root/thread IDs.
-It reports only meaningful changes and can speak a concise final result through
-the same TTS path.
+It reports only meaningful changes and sends completion through a dedicated
+Voice Brief Composer before using the TTS path.
+
+ACP output is not itself speech content. Discord remains the full-fidelity audit
+surface for code, diffs, logs, paths, links, identifiers, and detailed test
+results. The Voice Brief Composer produces a separate bounded, conversational
+result containing only:
+
+1. whether the task completed;
+2. the most important outcome or change;
+3. validation or the blocking reason; and
+4. the next decision only when operator input is required.
+
+It emits a typed result such as `should_speak`, `spoken`, `status`, and
+`requires_response`. It must not read arbitrary ACP output verbatim. Short tasks
+receive one completion brief; long tasks speak only meaningful state changes.
+The operator can explicitly request more detail, while the complete response
+remains available in Discord.
 
 The typed ACP completion seam may later provide a more authoritative structured
 signal, but the first intent broker does not depend on it.

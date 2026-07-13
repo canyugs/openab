@@ -1,0 +1,100 @@
+# Local-only Sam deployment for the Discord voice-intent handoff.
+# Credentials are supplied by the externally managed Secrets named below and
+# must not be written into this file.
+image:
+  pullPolicy: Always
+
+agents:
+  kiro:
+    enabled: false
+
+  codex:
+    enabled: true
+    image: localhost:5555/openab:codex-voice-hybrid-66d8363
+    workingDir: /home/node
+
+    secretEnv:
+      - name: DISCORD_BOT_TOKEN
+        secretName: openab-sam-credentials
+        secretKey: DISCORD_BOT_TOKEN
+      - name: DISCUSSION_GITHUB_PAT
+        secretName: openab-sam-credentials
+        secretKey: DISCUSSION_GITHUB_PAT
+
+    persistence:
+      enabled: true
+      storageClass: hostpath
+      size: 1Gi
+
+    # Seed an existing local Codex OAuth session into the new writable PVC.
+    # The copy is only performed when the PVC has no auth.json yet, allowing
+    # Codex to refresh and persist credentials normally after startup.
+    extraInitContainers:
+      - name: seed-codex-home
+        image: localhost:5555/openab:codex-voice-hybrid-66d8363
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-ec"]
+        args:
+          - |
+            mkdir -p /home/node/.codex /home/node/discussion
+            if [ ! -s /home/node/.codex/auth.json ]; then
+              cp /seed/auth.json /home/node/.codex/auth.json
+              chmod 600 /home/node/.codex/auth.json
+            fi
+        volumeMounts:
+          - name: data
+            mountPath: /home/node
+          - name: codex-auth-seed
+            mountPath: /seed
+            readOnly: true
+
+    extraVolumes:
+      - name: codex-auth-seed
+        secret:
+          secretName: openab-sam-codex-auth
+
+    configToml: |
+      [agent]
+      command = "codex-acp"
+      args = ["-c", "sandbox_mode=\"danger-full-access\"", "-c", "approval_policy=\"never\""]
+      working_dir = "/home/node/discussion"
+      env = { GITHUB_TOKEN = "${DISCUSSION_GITHUB_PAT}", GH_TOKEN = "${DISCUSSION_GITHUB_PAT}" }
+
+      [discord]
+      bot_token = "${DISCORD_BOT_TOKEN}"
+      allow_all_channels = false
+      allowed_channels = [
+        "1493817398997029006",
+        "1497182150783537254",
+        "1501864068322033715",
+        "1502523614874964028",
+        "1488911260505477154",
+        "1525115509870301225",
+      ]
+      allow_all_users = true
+      allowed_users = []
+      allow_dm = false
+      allow_bot_messages = "mentions"
+      allow_user_messages = "multibot-mentions"
+      trusted_bot_ids = [
+        "1493950780380811415",
+        "1493950480559247481",
+        "1493950720016253089",
+        "1495622718698164345",
+        "1493950661484740749",
+        "1505247177935687904",
+        "1514670934890647683",
+        "1501661493241053384",
+        "1501891439393509438",
+        "1092059463218909214",
+        "1495097849438798046",
+        "1502524083202691142",
+      ]
+
+      [pool]
+      max_sessions = 3
+      session_ttl_hours = 1
+
+      [reactions]
+      enabled = true
+      remove_after_reply = false
