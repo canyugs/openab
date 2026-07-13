@@ -207,15 +207,15 @@ without helping the initial intent-confirmation loop.
 
 ### 4.2 Local Kubernetes status
 
-The current Slice 2+3-capable deployment in `docker-desktop/openab-local` is healthy:
+The current LLM-first local-fallback deployment in `docker-desktop/openab-local` is healthy:
 
 - deployment `openab-voice-voice`: `1/1` ready;
 - pod restarts: `0`;
-- Helm release `openab-voice`: revision `9`, status `deployed`;
+- Helm release `openab-voice`: revision `10`, status `deployed`;
 - image:
-  `localhost:5555/openab:claude-voice-spoken-28b3868`; and
+  `localhost:5555/openab:claude-voice-llm-first-0f8511f`; and
 - image digest:
-  `sha256:31f15c61a88e44c2996135f7e7884c6903159a83baa5b059ce2ef2a63aad6f47`.
+  `sha256:eae5434841f875b592583f03b100fb9f365566c9990d99760cffa9bcfbd051c7`.
 
 The local delegated receiver is also healthy:
 
