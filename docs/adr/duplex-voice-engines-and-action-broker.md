@@ -197,15 +197,15 @@ without helping the initial intent-confirmation loop.
 
 ### 4.2 Local Kubernetes status
 
-The current hybrid Slice 1 deployment in `docker-desktop/openab-local` is healthy:
+The current Slice 2+3-capable deployment in `docker-desktop/openab-local` is healthy:
 
 - deployment `openab-voice-voice`: `1/1` ready;
 - pod restarts: `0`;
-- Helm release `openab-voice`: revision `8`, status `deployed`;
+- Helm release `openab-voice`: revision `9`, status `deployed`;
 - image:
-  `localhost:5555/openab:claude-voice-hybrid-66d8363`; and
+  `localhost:5555/openab:claude-voice-spoken-28b3868`; and
 - image digest:
-  `sha256:944e281b673afe8ab69fdd7eebac2a91943f80ff226f4b9447cf175b9dcc4c94`.
+  `sha256:31f15c61a88e44c2996135f7e7884c6903159a83baa5b059ce2ef2a63aad6f47`.
 
 The local delegated receiver is also healthy:
 
@@ -219,9 +219,10 @@ The local delegated receiver is also healthy:
 
 Startup logs confirm `voice_intent_enabled=true`, Groq STT configuration,
 Aragorn's Discord connection, and global slash-command registration. This
-recorded deployment still predates the Slice 2+3 code and is therefore not proof
-of a spoken proposal, spoken confirmation, local ACP task, Sam/Frodo handoff,
-TTS playback, or Realtime. The previous
+deployment contains the Slice 2+3 code, but reports `voice_tts_ready=false`
+because the local Secret does not yet contain `TTS_API_KEY`. It is therefore
+startup evidence, not proof of a spoken proposal, spoken confirmation, local
+ACP task, Sam/Frodo handoff, TTS playback, or Realtime. The previous
 `claude-voice-zh-stt` image predates Slice 1 and is no longer the active local
 artifact.
 
