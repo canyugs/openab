@@ -211,11 +211,11 @@ The current LLM-first local-fallback deployment in `docker-desktop/openab-local`
 
 - deployment `openab-voice-voice`: `1/1` ready;
 - pod restarts: `0`;
-- Helm release `openab-voice`: revision `10`, status `deployed`;
+- Helm release `openab-voice`: revision `11`, status `deployed`;
 - image:
-  `localhost:5555/openab:claude-voice-llm-first-0f8511f`; and
+  `localhost:5555/openab:claude-voice-brief-c96ea57`; and
 - image digest:
-  `sha256:eae5434841f875b592583f03b100fb9f365566c9990d99760cffa9bcfbd051c7`.
+  `sha256:1979f2dcea61ac0013ba1817428fe2e78c57906e83de11f71c8c9669e510d618`.
 
 The local delegated receiver is also healthy:
 

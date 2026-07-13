@@ -11,7 +11,7 @@ agents:
 
   voice:
     enabled: true
-    image: localhost:5555/openab:claude-voice-llm-first-0f8511f
+    image: localhost:5555/openab:claude-voice-brief-c96ea57
     workingDir: /home/node
 
     env:
