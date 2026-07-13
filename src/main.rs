@@ -115,23 +115,32 @@ enum Commands {
     },
 }
 
-/// Returns true if any unified platform env var is set AND the corresponding feature is compiled in.
+/// Returns true if any unified platform is enabled and its corresponding
+/// feature is compiled in. Google Chat uses its config-first resolver so
+/// `[googlechat].enabled` can activate the adapter without a duplicate env var,
+/// and WeCom activates on either `WECOM_CORP_ID` or a credential-complete
+/// `[wecom]` section (#1389). Remaining platforms are still env-signaled —
+/// config-only activation parity is tracked on #1356.
 /// Single source of truth — used by both startup validation and adapter init.
-fn has_unified_platform_env() -> bool {
+fn has_unified_platform(cfg: &config::Config) -> bool {
     (cfg!(feature = "telegram") && std::env::var("TELEGRAM_BOT_TOKEN").is_ok())
         || (cfg!(feature = "line") && std::env::var("LINE_CHANNEL_SECRET").is_ok())
         || (cfg!(feature = "feishu") && std::env::var("FEISHU_APP_ID").is_ok())
-        || (cfg!(feature = "wecom") && std::env::var("WECOM_CORP_ID").is_ok())
+        || (cfg!(feature = "wecom")
+            && (std::env::var("WECOM_CORP_ID").is_ok() || has_unified_wecom_config(cfg)))
         || (cfg!(feature = "teams") && std::env::var("TEAMS_APP_ID").is_ok())
         || (cfg!(feature = "googlechat")
-            && std::env::var("GOOGLE_CHAT_ENABLED")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false))
+            && cfg
+                .googlechat
+                .clone()
+                .unwrap_or_default()
+                .resolve()
+                .enabled)
 }
 
 /// Returns true when the first-class `[wecom]` section resolves all credentials
 /// required to construct the embedded WeCom adapter. This must remain separate
-/// from [`has_unified_platform_env`]: config-first deployments may intentionally
+/// from the env arms of [`has_unified_platform`]: config-first deployments may intentionally
 /// provide literal or secret-substituted values without exporting `WECOM_*`.
 fn has_unified_wecom_config(cfg: &config::Config) -> bool {
     if !cfg!(feature = "wecom") {
@@ -284,11 +293,10 @@ async fn main() -> anyhow::Result<()> {
         && cfg.slack.is_none()
         && cfg.gateway.is_none()
         && cfg.telegram.is_none()
-        && !has_unified_platform_env()
-        && !has_unified_wecom_config(&cfg)
+        && !has_unified_platform(&cfg)
     {
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], [telegram], [wecom], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
+            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
         );
     }
 
@@ -319,8 +327,12 @@ async fn main() -> anyhow::Result<()> {
         cfg = config::parse_config_str(&substituted, &config_source)?;
     }
 
-    // Compute before individual config fields are moved into their runtime
-    // components below. Secret-backed values have been substituted by now.
+    // Resolve before adapter-specific config fields are moved into their
+    // runtime components below. Secret-backed values have been substituted by
+    // now (the earlier bail-gate call only needed reachability — placeholder
+    // values are non-empty, so this recompute is the authoritative one).
+    // cfg-gated like the unified block that consumes it, else unused under
+    // default features.
     #[cfg(any(
         feature = "telegram",
         feature = "line",
@@ -329,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
     ))]
-    let unified_wecom_configured = has_unified_wecom_config(&cfg);
+    let unified_platform_enabled = has_unified_platform(&cfg);
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
@@ -877,7 +889,7 @@ async fn main() -> anyhow::Result<()> {
     let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
 
-        if has_unified_platform_env() || cfg.telegram.is_some() || unified_wecom_configured {
+        if unified_platform_enabled || cfg.telegram.is_some() {
             let listen_addr =
                 std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
@@ -1497,7 +1509,7 @@ mod tests {
     }
 
     #[test]
-    fn has_unified_platform_env_checks() {
+    fn has_unified_platform_checks_config_and_env() {
         // Run sequentially in one test to avoid env var race conditions
         // (std::env::set_var is process-global, cargo tests run in parallel)
 
@@ -1511,24 +1523,51 @@ mod tests {
             std::env::remove_var("GOOGLE_CHAT_ENABLED");
         }
 
-        // Case 1: no env vars → false
+        let no_platform_cfg = config::parse_config_str("", "test").unwrap();
+
+        // Case 1: no config or env activation → false
         clear_all();
-        assert!(!has_unified_platform_env());
+        assert!(!has_unified_platform(&no_platform_cfg));
 
         // Case 2: GOOGLE_CHAT_ENABLED=true → true only if feature compiled
         clear_all();
         std::env::set_var("GOOGLE_CHAT_ENABLED", "true");
-        assert_eq!(has_unified_platform_env(), cfg!(feature = "googlechat"));
+        assert_eq!(
+            has_unified_platform(&no_platform_cfg),
+            cfg!(feature = "googlechat")
+        );
 
         // Case 3: GOOGLE_CHAT_ENABLED=yes (invalid) → false
         clear_all();
         std::env::set_var("GOOGLE_CHAT_ENABLED", "yes");
-        assert!(!has_unified_platform_env());
+        assert!(!has_unified_platform(&no_platform_cfg));
 
         // Case 4: TELEGRAM_BOT_TOKEN → true only if feature compiled
         clear_all();
         std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token");
-        assert_eq!(has_unified_platform_env(), cfg!(feature = "telegram"));
+        assert_eq!(
+            has_unified_platform(&no_platform_cfg),
+            cfg!(feature = "telegram")
+        );
+
+        // Case 5: config-only Google Chat activation → true without env
+        clear_all();
+        let googlechat_enabled = config::parse_config_str(
+            "[googlechat]\nenabled = true\naccess_token = \"test-token\"\n",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            has_unified_platform(&googlechat_enabled),
+            cfg!(feature = "googlechat")
+        );
+
+        // Case 6: config-authoritative false beats GOOGLE_CHAT_ENABLED=true
+        clear_all();
+        std::env::set_var("GOOGLE_CHAT_ENABLED", "true");
+        let googlechat_disabled =
+            config::parse_config_str("[googlechat]\nenabled = false\n", "test").unwrap();
+        assert!(!has_unified_platform(&googlechat_disabled));
 
         // Cleanup
         clear_all();

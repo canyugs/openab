@@ -166,7 +166,7 @@ allowed_users = ["users/123456789"]
 
 ### User Trust (`[googlechat]` section)
 
-> **Mode scoping:** the `[googlechat]` section applies when the Google Chat adapter is **embedded in the OAB binary** (unified mode, `GOOGLE_CHAT_ENABLED=true` env set on the OAB container). In the standalone-gateway mode shown above, trust is enforced by `[gateway].allow_all_users` / `allowed_users` instead — the `[googlechat]` section has no effect on that path yet (Phase 1c consolidates the two).
+> **Mode scoping:** the `[googlechat]` section applies when the Google Chat adapter is **embedded in the OAB binary** (unified mode). Enable it with `[googlechat] enabled = true`; `GOOGLE_CHAT_ENABLED=true` remains the env-only fallback. In the standalone-gateway mode shown above, trust is enforced by `[gateway].allow_all_users` / `allowed_users` instead — the `[googlechat]` section has no effect on that path yet (Phase 1c consolidates the two).
 
 Identity trust defaults to **deny-all** (identity-trust-none ADR): unknown senders are rejected until explicitly admitted. Configure trust with a first-class `[googlechat]` section:
 
