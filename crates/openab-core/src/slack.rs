@@ -1765,6 +1765,7 @@ async fn handle_message(
         estimated_tokens,
         other_bot_present,
         recipient: stream_recipient,
+        completion_tx: None,
     };
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)

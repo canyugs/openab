@@ -20,6 +20,13 @@ pub struct TurnOutput {
     /// [`TurnCompletion::eligible_speech_text`] so execution and delivery state
     /// are checked as well.
     pub speech_text: String,
+    /// Agent-authored, bounded spoken brief, when the originating prompt
+    /// requested one through the `voice_summary` output contract.
+    ///
+    /// This is deliberately separate from `speech_text`: arbitrary final ACP
+    /// output may contain code, logs, URLs, or other content that must never be
+    /// read aloud as an implicit fallback.
+    pub voice_brief: Option<String>,
 }
 
 /// The latest lifecycle state observed for an ACP tool call.
@@ -269,6 +276,19 @@ impl TurnCompletion {
         let speech_text = self.output.as_ref()?.speech_text.as_str();
         (!speech_text.trim().is_empty()).then_some(speech_text)
     }
+
+    /// Return the explicit Voice Brief only after successful execution and
+    /// canonical text delivery. Full ACP output is never used as a fallback.
+    pub fn eligible_voice_brief(&self) -> Option<&str> {
+        if !matches!(self.execution, ExecutionOutcome::Succeeded { .. })
+            || self.delivery != DeliveryOutcome::Delivered
+        {
+            return None;
+        }
+
+        let brief = self.output.as_ref()?.voice_brief.as_deref()?;
+        (!brief.trim().is_empty()).then_some(brief)
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +320,7 @@ mod tests {
             output: Some(TurnOutput {
                 display_text: "canonical result".to_string(),
                 speech_text: speech_text.to_string(),
+                voice_brief: Some("Short spoken result.".to_string()),
             }),
             delivery: DeliveryOutcome::Delivered,
             legacy_dispatch: LegacyDispatchDisposition::Succeeded,
@@ -393,6 +414,22 @@ mod tests {
         let mut completion = successful_completion("unused");
         completion.output = None;
         assert_eq!(completion.eligible_speech_text(), None);
+    }
+
+    #[test]
+    fn voice_brief_is_explicit_and_never_falls_back_to_full_speech_text() {
+        let mut completion = successful_completion("A very long full answer with code.");
+        assert_eq!(
+            completion.eligible_voice_brief(),
+            Some("Short spoken result.")
+        );
+
+        completion.output.as_mut().unwrap().voice_brief = None;
+        assert_eq!(completion.eligible_voice_brief(), None);
+        assert_eq!(
+            completion.eligible_speech_text(),
+            Some("A very long full answer with code.")
+        );
     }
 
     #[test]

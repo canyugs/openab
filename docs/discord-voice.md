@@ -79,7 +79,7 @@ path is not proof that Discord is delivering complete, correctly attributed audi
 | Transcript | **Implemented on branch.** Text is retained in bounded process memory with user ID and timing metadata; evictions and rejected entries are counted. |
 | ACP summary | **Implemented with a security limitation.** Only explicit `/voice summary` submits the transcript. It uses the normal tool-capable ACP path; instructions in the prompt say the transcript is untrusted, but tools are not technically disabled. |
 | Hybrid intent Slices 1-3 | **Experimental and opt-in; local text-confirmed action loop passed live.** With `default_to_local = true`, every non-empty final transcript from the session operator received while no confirmation is pending creates a local raw-task candidate unless it explicitly addresses exactly one configured target. On 2026-07-13 a real utterance produced a text proposal, confirmation started Claude ACP, the agent performed an action, and Discord received text. Explicit target delegation and audible TTS remain to validate live. Intent routing and TTS default to disabled. |
-| Result observation | **Later slice.** The broker does not yet poll the local or target bot's task thread for progress and completion. Initial local/delegated acknowledgements mean accepted or sent, not observed completion. |
+| Result observation | **Local completion implemented on branch; delegated observation remains later.** A confirmed local Voice action carries a one-shot completion observer through the Dispatcher. After successful ACP execution and canonical Discord delivery, only an explicit bounded `voice_summary` is eligible for TTS. Full code, logs, links, and detailed output remain in Discord. Target-bot thread polling is not implemented. |
 | Automated branch verification | **Partial pass.** `cargo clippy -p openab-core --lib -- -D warnings`, 46 focused hybrid intent/runtime tests, and the 16 binary tests pass. The core library run reaches 740/741 with one pre-existing macOS `/bin/false` assertion failure. Repository-wide fmt still reports pre-existing drift; Windows and complete live Discord validation remain pending. |
 | Local Kubernetes runtime smoke | **LLM-first local action loop passed.** Helm revision 10 runs `localhost:5555/openab:claude-voice-llm-first-0f8511f` at digest `sha256:eae5434841f875b592583f03b100fb9f365566c9990d99760cffa9bcfbd051c7`, `1/1` ready with zero restarts and `default_to_local = true`. A real Voice STT proposal, confirmation, Claude ACP action, and text result passed on 2026-07-13. Startup reports `voice_tts_ready=false` because the local Secret does not yet contain `TTS_API_KEY`; target handoff and audible playback remain pending. |
 | Discord, Groq, and Claude readiness | **Passed locally.** The bot connects, global commands register, Groq accepts the configured STT model, Claude OAuth persists on PVC, and a Discord-to-Claude ACP turn completes without an authentication error. |
@@ -87,9 +87,11 @@ path is not proof that Discord is delivering complete, correctly attributed audi
 | First STT accuracy sample | **Failed the reliability bar.** Four segments retained the correct single-speaker identity and plausible timestamps, but one result was only `...` and another hallucinated a different language. The two Chinese results were also not reliable enough to treat as a meeting record. A controlled model/language A/B retry is pending. |
 | Attribution, reconnect, and soak evidence | **Not verified.** Two-speaker attribution, reconnect health beyond a unit state transition, and a 30-minute soak remain required. |
 
-Playback is intentionally narrow: it speaks only bounded intent proposals and
-broker acknowledgements. It does not synthesize arbitrary ACP responses or observe
-and narrate task completion.
+Playback is intentionally narrow. It speaks bounded intent proposals, broker
+acknowledgements, and an explicit agent-authored Voice Brief after a successful
+local ACP completion. It never synthesizes arbitrary ACP responses. A missing or
+invalid brief produces only a generic completion notice; delegated task
+completion still requires a later Discord observer.
 
 ## Local Kubernetes Smoke and Live Test Record
 

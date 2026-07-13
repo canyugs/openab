@@ -56,6 +56,11 @@ pub struct BufferedMessage {
     /// mode's native streaming is active. `None` for non-Slack platforms and
     /// bot-authored turns.
     pub recipient: Option<(String, String)>,
+    /// Optional one-shot observer for the authoritative completion of the ACP
+    /// turn containing this event. Ordinary platform messages leave this unset;
+    /// Voice actions use it to obtain an explicit Voice Brief after canonical
+    /// Discord delivery completes.
+    pub completion_tx: Option<tokio::sync::oneshot::Sender<Result<TurnCompletion, String>>>,
 }
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
@@ -815,6 +820,11 @@ async fn dispatch_batch(
         }
     }
 
+    let completion_txs: Vec<_> = batch
+        .iter_mut()
+        .filter_map(|message| message.completion_tx.take())
+        .collect();
+
     for msg in batch {
         let mut event_blocks =
             AdapterRouter::pack_arrival_event(&msg.sender_json, &msg.prompt, msg.extra_blocks);
@@ -832,7 +842,7 @@ async fn dispatch_batch(
     ));
     // 👀 already applied above; skip set_queued() to avoid double-reaction.
 
-    let result = target
+    let completion_result = target
         .stream_prompt_blocks_typed(
             adapter,
             &session_key,
@@ -842,8 +852,18 @@ async fn dispatch_batch(
             other_bot_present,
             recipient,
         )
-        .await
-        .and_then(|completion| completion.legacy_dispatch.into_result());
+        .await;
+    let result = match &completion_result {
+        Ok(completion) => completion.legacy_dispatch.clone().into_result(),
+        Err(error) => Err(anyhow::anyhow!(error.to_string())),
+    };
+    for completion_tx in completion_txs {
+        let notification = completion_result
+            .as_ref()
+            .cloned()
+            .map_err(|error| error.to_string());
+        let _ = completion_tx.send(notification);
+    }
 
     // In assistant status mode, all status is conveyed via
     // assistant.threads.setStatus — skip emoji reactions entirely.
@@ -1599,6 +1619,7 @@ mod tests {
             estimated_tokens: tokens,
             other_bot_present: false,
             recipient: None,
+            completion_tx: None,
         }
     }
 
@@ -1640,6 +1661,25 @@ mod tests {
         // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
         assert!(!calls[0].other_bot_present);
+    }
+
+    #[tokio::test]
+    async fn completion_observer_receives_authoritative_turn_result() {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let mut message = make_msg("voice task", 10);
+        message.completion_tx = Some(completion_tx);
+
+        let calls = run_consumer_with_messages(vec![message], 1, 24_000).await;
+        assert_eq!(calls.len(), 1);
+
+        let completion = completion_rx.await.unwrap().unwrap();
+        assert!(matches!(
+            completion.execution,
+            crate::acp_turn::ExecutionOutcome::OutcomeUnknown {
+                reason: crate::acp_turn::UnknownReason::LegacyDispatchTarget,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

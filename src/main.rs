@@ -1046,11 +1046,14 @@ async fn main() -> anyhow::Result<()> {
         ));
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
         if let (Some(manager), Some(broker)) = (&voice_manager, &voice_intent_broker) {
-            let executor = Arc::new(discord::DiscordVoiceIntentActionExecutor::new(
-                Arc::new(serenity::http::Http::new(&discord_cfg.bot_token)),
-                discord_dispatcher.clone(),
-                broker.clone(),
-            ));
+            let executor = Arc::new(
+                discord::DiscordVoiceIntentActionExecutor::new(
+                    Arc::new(serenity::http::Http::new(&discord_cfg.bot_token)),
+                    discord_dispatcher.clone(),
+                    broker.clone(),
+                )
+                .with_voice_manager(Arc::downgrade(manager)),
+            );
             manager.attach_intent_action_executor(executor);
         }
 

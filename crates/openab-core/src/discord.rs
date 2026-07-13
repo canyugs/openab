@@ -33,7 +33,7 @@ use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, error, info, warn};
 
 /// Hard cap on consecutive bot messages in a channel or thread.
@@ -158,6 +158,7 @@ pub struct DiscordVoiceIntentActionExecutor {
     dispatcher: Arc<crate::dispatch::Dispatcher>,
     adapter: Arc<dyn ChatAdapter>,
     broker: Arc<DiscordVoiceIntentBroker>,
+    voice_manager: Option<Weak<DiscordVoiceManager>>,
 }
 
 impl DiscordVoiceIntentActionExecutor {
@@ -172,15 +173,18 @@ impl DiscordVoiceIntentActionExecutor {
             dispatcher,
             adapter,
             broker,
+            voice_manager: None,
         }
+    }
+
+    pub fn with_voice_manager(mut self, manager: Weak<DiscordVoiceManager>) -> Self {
+        self.voice_manager = Some(manager);
+        self
     }
 
     /// Execute a spoken confirmation, which does not have a Discord message
     /// carrying sender metadata.
-    pub async fn execute(
-        &self,
-        request: &LocalIntentExecution,
-    ) -> DiscordVoiceIntentActionOutcome {
+    pub async fn execute(&self, request: &LocalIntentExecution) -> DiscordVoiceIntentActionOutcome {
         let context = DiscordVoiceIntentActionContext::from_request(request);
         self.execute_with_context(request, &context).await
     }
@@ -341,17 +345,20 @@ impl DiscordVoiceIntentActionExecutor {
         let thread_key = self
             .dispatcher
             .key("discord", &thread_channel.channel_id, &sender_id);
-        let estimated_tokens = crate::dispatch::estimate_tokens(&request.task, &[]);
+        let prompt = local_voice_agent_prompt(&request.task);
+        let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &[]);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let message = crate::dispatch::BufferedMessage {
             sender_json,
             sender_name,
-            prompt: request.task.clone(),
+            prompt,
             extra_blocks: Vec::new(),
             trigger_msg: audit_ref,
             arrived_at: std::time::Instant::now(),
             estimated_tokens,
             other_bot_present: false,
             recipient: None,
+            completion_tx: Some(completion_tx),
         };
         self.dispatcher
             .submit(
@@ -362,6 +369,7 @@ impl DiscordVoiceIntentActionExecutor {
             )
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.observe_completion(request, completion_rx);
         info!(
             intent_id = %request.intent_id,
             revision = request.revision,
@@ -369,6 +377,61 @@ impl DiscordVoiceIntentActionExecutor {
             "queued confirmed local Discord voice intent"
         );
         Ok(())
+    }
+
+    fn observe_completion(
+        &self,
+        request: &LocalIntentExecution,
+        completion_rx: tokio::sync::oneshot::Receiver<
+            Result<crate::acp_turn::TurnCompletion, String>,
+        >,
+    ) {
+        let Some(manager) = self.voice_manager.clone() else {
+            return;
+        };
+        let token = request.session;
+        let intent_id = request.intent_id;
+        tokio::spawn(async move {
+            let completion =
+                match tokio::time::timeout(std::time::Duration::from_secs(30 * 60), completion_rx)
+                    .await
+                {
+                    Ok(Ok(Ok(completion))) => completion,
+                    Ok(Ok(Err(error))) => {
+                        warn!(%intent_id, %error, "voice action completion failed");
+                        return;
+                    }
+                    Ok(Err(error)) => {
+                        warn!(%intent_id, %error, "voice action completion observer was dropped");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(%intent_id, "voice action completion observer timed out");
+                        return;
+                    }
+                };
+
+            let brief = if let Some(brief) = completion.eligible_voice_brief() {
+                brief.to_string()
+            } else if matches!(
+                completion.execution,
+                crate::acp_turn::ExecutionOutcome::Succeeded { .. }
+            ) && completion.delivery == crate::acp_turn::DeliveryOutcome::Delivered
+            {
+                // Never fall back to arbitrary ACP output: an omitted/invalid
+                // directive gets a safe generic completion notice.
+                "處理完成，完整結果已放在 Discord。".to_string()
+            } else {
+                warn!(%intent_id, "voice action did not produce a speakable successful completion");
+                return;
+            };
+            let Some(manager) = manager.upgrade() else {
+                return;
+            };
+            if let Err(error) = manager.speak_brief(token, &brief).await {
+                warn!(%intent_id, %error, "failed to play Discord voice result brief");
+            }
+        });
     }
 
     async fn report_failure(
@@ -399,6 +462,12 @@ impl DiscordVoiceIntentActionExecutor {
             );
         }
     }
+}
+
+fn local_voice_agent_prompt(task: &str) -> String {
+    format!(
+        "{task}\n\n<openab_voice_response_contract>\nYour final answer MUST begin with exactly one single-line directive: [[voice_summary:...]]. Write its value as a natural Traditional Chinese spoken brief of at most 120 characters. State the outcome first, then the most important change or blocker, and mention a next decision only when the operator must act. Never include code, logs, URLs, file paths, hashes, long identifiers, markdown, or exhaustive lists. Put the complete detailed answer after the directive; OpenAB will keep that detailed answer in Discord and speak only the directive value.\n</openab_voice_response_contract>"
+    )
 }
 
 #[async_trait]
@@ -811,11 +880,14 @@ impl EventHandler for Handler {
                     .await
                 {
                     Ok(VoiceIntentTextOutcome::ExecuteLocal(request)) => {
-                        let executor = DiscordVoiceIntentActionExecutor::new(
+                        let mut executor = DiscordVoiceIntentActionExecutor::new(
                             ctx.http.clone(),
                             self.dispatcher.clone(),
                             broker,
                         );
+                        if let Some(manager) = &self.voice_manager {
+                            executor = executor.with_voice_manager(Arc::downgrade(manager));
+                        }
                         let action_context = DiscordVoiceIntentActionContext {
                             sender_name: msg.author.name.clone(),
                             timestamp: Some(
@@ -1514,6 +1586,7 @@ impl EventHandler for Handler {
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
+                completion_tx: None,
             };
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -1755,6 +1828,7 @@ impl EventHandler for Handler {
                 estimated_tokens,
                 other_bot_present,
                 recipient: None,
+                completion_tx: None,
             };
 
             if let Err(e) = dispatcher
@@ -2351,6 +2425,7 @@ impl Handler {
             estimated_tokens,
             other_bot_present: false,
             recipient: None,
+            completion_tx: None,
         };
         self.dispatcher
             .submit(thread_key, channel, adapter, message)
@@ -4043,6 +4118,15 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
 mod tests {
     use super::*;
     use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+
+    #[test]
+    fn local_voice_prompt_requests_separate_bounded_spoken_output() {
+        let prompt = local_voice_agent_prompt("檢查 PR 1368");
+        assert!(prompt.starts_with("檢查 PR 1368\n\n"));
+        assert!(prompt.contains("[[voice_summary:...]]"));
+        assert!(prompt.contains("Never include code, logs, URLs"));
+        assert!(prompt.contains("complete detailed answer after the directive"));
+    }
 
     // --- truncate_to_utf16_budget tests (#1185 /auth output relay) ---
 

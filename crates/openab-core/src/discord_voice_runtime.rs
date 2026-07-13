@@ -722,6 +722,14 @@ impl DiscordVoiceManager {
         Ok(true)
     }
 
+    pub(crate) async fn speak_brief(
+        self: &Arc<Self>,
+        token: VoiceSessionToken,
+        brief: &str,
+    ) -> Result<bool> {
+        self.speak(token, brief).await
+    }
+
     fn begin_playback(&self, token: VoiceSessionToken) -> Option<u64> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let session = sessions.get_mut(&token.guild_id)?;

@@ -200,9 +200,9 @@ without helping the initial intent-confirmation loop.
 | Text-confirmed local ACP execution | **Implemented and live-validated** | On 2026-07-13 a real operator utterance produced a text proposal, confirmation started the existing Dispatcher/Claude ACP path, the agent performed an action, and Discord received the textual result. A confirmed local request uses a stable-nonce audit root and creates a task thread where Discord permits one; Voice Channel text chat executes in the shared channel because Discord cannot nest a thread there. |
 | Text-confirmed target delegation | **Implemented; local sender/receiver startup passed, live handoff pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch remain wired. The receiver now reuses Voice Channel text chat instead of trying to create an unsupported thread. A real spoken target-agent handoff still requires operator validation. |
 | Spoken yes/no/correction | **Implemented and unit-tested; confirmation loop live-validated** | Final STT from the bound operator resolves the same pending state as text. A real confirmation reached local ACP execution on 2026-07-13; negative, correction, replay, and timeout variants remain covered by automated tests rather than live validation. |
-| TTS and Songbird playback | **Implemented; live provider/Voice validation pending** | Opt-in `[tts]` uses an OpenAI-compatible `/audio/speech` endpoint, requests bounded WAV audio, and plays bounded proposal/acknowledgement feedback through Songbird. Capture is suppressed and partial buffers are cleared during half-duplex playback; text remains the fallback. |
+| TTS and Songbird playback | **Implemented with local-result Voice Brief; live provider/Voice validation pending** | Opt-in `[tts]` uses an OpenAI-compatible `/audio/speech` endpoint. Local Voice actions require the agent to emit a hidden, bounded `voice_summary`; typed ACP completion is observed only after canonical Discord delivery, and TTS receives the brief rather than arbitrary ACP output. Missing briefs use a generic completion sentence, never the full answer. |
 | Realtime / GPT-Live proposal backend | **Not started** | No Realtime session or tool/event integration exists. |
-| Thread/result observation | **Not started** | Existing Discord seams are available, but no voice job observer is wired. |
+| Thread/result observation | **Local typed completion implemented; delegated observation pending** | Local Voice actions attach a one-shot observer to the buffered dispatch and receive the exact typed ACP completion. Polling another bot's Discord thread remains unimplemented. |
 | Typed ACP completion seam | **Implemented and unit-tested; orthogonal** | Useful later for structured observation, but not a v1 dispatch blocker. |
 
 ### 4.2 Local Kubernetes status
@@ -547,8 +547,9 @@ receive one completion brief; long tasks speak only meaningful state changes.
 The operator can explicitly request more detail, while the complete response
 remains available in Discord.
 
-The typed ACP completion seam may later provide a more authoritative structured
-signal, but the first intent broker does not depend on it.
+Local execution now uses the typed ACP completion seam as the authoritative
+signal after canonical Discord delivery. Delegated execution still requires the
+Discord observer described above because the target bot owns that ACP turn.
 
 ## 11. Repository Seams
 

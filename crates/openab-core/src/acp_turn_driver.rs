@@ -636,7 +636,7 @@ impl AcpTurnDriver {
                 legacy_dispatch: LegacyDispatchDisposition::Failed { error },
             }
         } else {
-            let (_, authoritative_answer) =
+            let (answer_directives, authoritative_answer) =
                 split_delivery(&agent_text_buf, agent_answer_start, false);
             let authoritative_output_present = !authoritative_answer.trim().is_empty();
             let terminal =
@@ -650,6 +650,9 @@ impl AcpTurnDriver {
                 classify_execution(terminal, authoritative_output_present, observed_tools);
 
             let (directives, text_body) = split_delivery(&text_buf, answer_start, keep_full_text);
+            let voice_brief = answer_directives
+                .voice_summary
+                .or_else(|| directives.voice_summary.clone());
             let text_body = finalize_body(reset, keep_full_text, answer_start, text_body);
             // Speech is always the directive-free final agent answer, never the
             // streaming/narration display buffer or session-reset notice.
@@ -898,6 +901,7 @@ impl AcpTurnDriver {
                 output: Some(TurnOutput {
                     display_text: final_content,
                     speech_text,
+                    voice_brief,
                 }),
                 delivery,
                 legacy_dispatch,
@@ -953,6 +957,8 @@ const SESSION_RESET_NOTICE: &str = "⚠️ _Session expired, starting fresh..._\
 pub struct OutputDirectives {
     /// Platform message ID that the finalized answer should reply to.
     pub reply_to: Option<String>,
+    /// Bounded, single-line summary intended specifically for spoken output.
+    pub voice_summary: Option<String>,
 }
 
 /// Parse consecutive `[[key:value]]` directives at the start of output.
@@ -982,6 +988,11 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                             })
                         {
                             directives.reply_to = Some(value.to_string());
+                        }
+                    } else if key.trim() == "voice_summary" {
+                        let value = normalize_voice_summary(value);
+                        if !value.is_empty() {
+                            directives.voice_summary = Some(value);
                         }
                     } else {
                         tracing::debug!(key = key.trim(), "unknown output directive ignored");
@@ -1018,6 +1029,26 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
     (directives, remaining)
 }
 
+const MAX_VOICE_SUMMARY_CHARS: usize = 240;
+
+fn normalize_voice_summary(value: &str) -> String {
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("```", "")
+        .trim()
+        .to_string();
+    if normalized.chars().count() <= MAX_VOICE_SUMMARY_CHARS {
+        return normalized;
+    }
+    normalized
+        .chars()
+        .take(MAX_VOICE_SUMMARY_CHARS.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
 fn advance_line_ending(content: &str, content_start: &mut usize, line_len: usize) {
     *content_start += line_len;
     if content.as_bytes().get(*content_start) == Some(&b'\r') {
@@ -1050,13 +1081,12 @@ pub fn split_delivery(
     answer_start: usize,
     keep_full: bool,
 ) -> (OutputDirectives, String) {
-    let (directives, _) = parse_output_directives(full);
+    let (mut directives, _) = parse_output_directives(full);
     let delivered = select_delivery_text(full, answer_start, keep_full);
-    let body = if answer_start == 0 || keep_full {
-        parse_output_directives(delivered).1
-    } else {
-        delivered.to_owned()
-    };
+    let (delivered_directives, body) = parse_output_directives(delivered);
+    if directives.voice_summary.is_none() {
+        directives.voice_summary = delivered_directives.voice_summary;
+    }
     (directives, body)
 }
 
@@ -1694,6 +1724,7 @@ mod tests {
             Some(TurnOutput {
                 display_text: "authoritative answer".to_string(),
                 speech_text: "authoritative answer".to_string(),
+                voice_brief: None,
             })
         );
         assert_eq!(
@@ -2101,6 +2132,52 @@ mod tests {
     fn output_directive_is_not_speakable_text() {
         let (_, body) = split_delivery("[[reply_to:42]]\nfinal answer", 0, false);
         assert_eq!(body, "final answer");
+    }
+
+    #[test]
+    fn voice_summary_directive_is_bounded_and_removed_from_display_text() {
+        let (directives, body) = split_delivery(
+            "[[voice_summary:完成部署，測試已通過；完整內容在 Discord。]]\n完整回答與程式碼",
+            0,
+            false,
+        );
+        assert_eq!(
+            directives.voice_summary.as_deref(),
+            Some("完成部署，測試已通過；完整內容在 Discord。")
+        );
+        assert_eq!(body, "完整回答與程式碼");
+    }
+
+    #[test]
+    fn voice_summary_is_parsed_from_authoritative_segment_after_tools() {
+        let full = "working notes[[tool]][[voice_summary:完成修改，測試已通過。]]\n完整回答";
+        let answer_start = "working notes[[tool]]".len();
+        let (directives, body) = split_delivery(full, answer_start, false);
+
+        assert_eq!(
+            directives.voice_summary.as_deref(),
+            Some("完成修改，測試已通過。")
+        );
+        assert_eq!(body, "完整回答");
+    }
+
+    #[tokio::test]
+    async fn successful_turn_exposes_explicit_voice_brief_separately() {
+        let adapter = Arc::new(RecordingAdapter::new(false, false));
+        let mut conn = FakeTurnConnection::new(vec![
+            text_notification(
+                "[[voice_summary:已完成修改，測試通過。]]\n完整回答包含程式碼與詳細紀錄",
+            ),
+            final_result(42, "end_turn"),
+        ]);
+
+        let completion = run_fake(&mut conn, delivery_context(adapter.clone())).await;
+
+        assert_eq!(
+            completion.eligible_voice_brief(),
+            Some("已完成修改，測試通過。")
+        );
+        assert_eq!(adapter.sent(), vec!["完整回答包含程式碼與詳細紀錄"]);
     }
 
     #[test]
