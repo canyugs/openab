@@ -4,9 +4,11 @@
 > `feat/discord-voice-receive` can register and run the `/voice` lifecycle, join
 > through Songbird 0.6, segment per-user decoded PCM, transcribe it, and explicitly
 > send a retained transcript to ACP for summary. The opt-in intent broker now
-> implements hybrid routing with spoken or text confirmation: unaddressed commands
-> can run through Aragorn's existing ACP path, while commands naming configured
-> targets use deterministic Discord delegation. Optional OpenAI-compatible TTS
+> implements hybrid routing with spoken or text confirmation: with
+> `default_to_local = true`, every non-empty final operator transcript received
+> while no confirmation is pending becomes a local raw-task candidate unless it
+> explicitly addresses exactly one configured target. Confirmed local text is interpreted by Aragorn's existing ACP agent;
+> explicit configured targets use deterministic Discord delegation. Optional OpenAI-compatible TTS
 > plays the paraphrase and short local/delegated acknowledgements through Songbird
 > with half-duplex capture suppression. The new spoken/TTS path is implemented but
 > has not yet been deployed and validated in a live Voice Channel; text remains the
@@ -49,10 +51,11 @@ Discord Voice Channel
 
 ```text
 operator speech
-  → STT intent proposal
+  → non-empty final STT transcript
+  → exactly one explicit configured target, or local raw-task fallback
   → text paraphrase + optional spoken paraphrase
   → spoken or text yes/no/correction
-  → unaddressed command: this bot's existing Dispatcher/ACP flow
+  → local candidate: this bot's existing Dispatcher/ACP interprets the raw task
   → named target: nonce-enforced Discord mention and target bot's ACP flow
   → optional spoken local/delegated acknowledgement
 ```
@@ -75,7 +78,7 @@ path is not proof that Discord is delivering complete, correctly attributed audi
 | STT pipeline | **Implemented on branch.** A bounded queue feeds workers that encode WAV in memory and call the existing STT client. No temporary audio files are written. Queue loss and STT failures are counted. |
 | Transcript | **Implemented on branch.** Text is retained in bounded process memory with user ID and timing metadata; evictions and rejected entries are counted. |
 | ACP summary | **Implemented with a security limitation.** Only explicit `/voice summary` submits the transcript. It uses the normal tool-capable ACP path; instructions in the prompt say the transcript is untrusted, but tools are not technically disabled. |
-| Hybrid intent Slices 1-3 | **Experimental and opt-in on branch; live spoken/TTS validation pending.** A recognized command creates one pending intent and accepts the session operator's spoken or text yes/no/correction. With `default_to_local = true`, an unaddressed command is queued through this bot's existing Dispatcher/ACP path; a named configured target receives one nonce-enforced real Discord mention. Optional TTS plays bounded proposal and acknowledgement audio through Songbird while capture is suppressed. Intent routing and TTS default to disabled. |
+| Hybrid intent Slices 1-3 | **Experimental and opt-in on branch; live spoken/TTS validation pending.** With `default_to_local = true`, every non-empty final transcript from the session operator received while no confirmation is pending creates a local raw-task candidate unless it explicitly addresses exactly one configured target. Spoken or text yes/no/correction resolves the pending intent. Confirmed local text enters this bot's existing Dispatcher/ACP path for LLM interpretation; one explicit configured target receives one nonce-enforced real Discord mention. Optional TTS plays bounded proposal and acknowledgement audio through Songbird while capture is suppressed. Intent routing and TTS default to disabled. |
 | Result observation | **Later slice.** The broker does not yet poll the local or target bot's task thread for progress and completion. Initial local/delegated acknowledgements mean accepted or sent, not observed completion. |
 | Automated branch verification | **Partial pass.** `cargo clippy -p openab-core --lib -- -D warnings`, 46 focused hybrid intent/runtime tests, and the 16 binary tests pass. The core library run reaches 740/741 with one pre-existing macOS `/bin/false` assertion failure. Repository-wide fmt still reports pre-existing drift; Windows and complete live Discord validation remain pending. |
 | Local Kubernetes runtime smoke | **Slice 2+3-capable startup passed.** Helm revision 9 runs `localhost:5555/openab:claude-voice-spoken-28b3868` at digest `sha256:31f15c61a88e44c2996135f7e7884c6903159a83baa5b059ce2ef2a63aad6f47`, `1/1` ready with zero restarts and `default_to_local = true`. Startup reports `voice_tts_ready=false` because the local Secret does not yet contain `TTS_API_KEY`. Local Sam revision 2 remains ready, accepts the Voice text destination, and trusts Aragorn. Real spoken proposal/confirmation/handoff and TTS playback validation remain pending. |
@@ -216,9 +219,9 @@ max_pending_segments = 8
 max_transcript_bytes = 80000
 ```
 
-Hybrid intent routing is independently opt-in. Enable local fallback when
-unaddressed commands should run through this bot, and optionally register target
-bots under stable spoken names:
+Hybrid intent routing is independently opt-in. Enable local fallback when every
+non-empty final operator transcript should be confirmed and then interpreted by
+this bot, and optionally register target bots under stable spoken names:
 
 ```toml
 [discord.voice.intent]
@@ -246,8 +249,12 @@ The default is `false`. Omitting `[discord.voice]` must preserve all existing Di
 the existing Voice receive, transcript, and explicit summary behavior. Enabling
 it requires Voice Channel receive, STT, a positive confirmation timeout, and at
 least one available route. `default_to_local` also defaults to `false`; set it to
-`true` to route unaddressed, command-shaped speech through this bot's existing
-Dispatcher/ACP path. A local-only configuration may omit all target tables. If
+`true` to make any non-empty final session-operator transcript received while no
+confirmation is pending a local raw-task candidate unless it explicitly addresses
+exactly one configured target. The raw task reaches this bot's existing
+Dispatcher/ACP path only after confirmation, and the ACP/LLM interprets it there;
+no request-prefix or known-action allowlist is applied. A local-only configuration
+may omit all target tables. If
 targets are present, the target table name is its canonical spoken name and is
 recognized alongside its `aliases`; `discord_user_id` must be the target bot's
 real Discord user ID so OpenAB can emit a valid mention token. Because the
@@ -320,11 +327,13 @@ OpenAB, in Voice when TTS is enabled:
 
 The confirmation approves the semantic target and task, not the exact wording of
 the final Discord message. The broker owns the destination, mention token, and
-dispatch idempotency; a parser, LLM, or future Realtime/Live backend may only
-propose the intent.
+dispatch idempotency. The initial STT path uses deterministic configured-target
+resolution and a local raw-task fallback; any future Realtime/Live backend may
+only propose the intent.
 
-With `default_to_local = true`, an unaddressed command instead runs through the
-same OpenAB bot (Aragorn in this example):
+With `default_to_local = true`, any other non-empty finalized operator speech
+received while no confirmation is pending becomes a raw task for the same OpenAB
+bot (Aragorn in this example):
 
 ```text
 Can, in the Voice Channel:
@@ -361,29 +370,34 @@ Intent rules:
 3. A spoken or text no cancels it without dispatch.
 4. A spoken or text correction replaces the pending destination/task and asks for confirmation again; an explicit target or explicit self-directed phrase can switch routes.
 5. Timeout, `/voice stop`, or replacing the Voice session abandons the pending intent.
-6. Explicitly naming one configured target always selects delegation. Naming two configured targets is ambiguous and never falls back to local execution.
+6. Explicitly addressing exactly one configured target selects delegation. Unknown or multiple configured-target matches never create a guessed delegation; with local default enabled, the full utterance remains a raw local candidate.
 7. If local thread creation or Dispatcher submission definitely fails, the broker reopens confirmation instead of silently losing the task.
 8. Only finalized STT from the session operator can resolve a spoken confirmation. Unrelated, duplicate, wrong-speaker, and stale-session segments cannot dispatch.
 9. TTS is half-duplex. Capture is suppressed and partial buffers are discarded while the bot speaks so playback cannot become its own affirmative confirmation.
 
-The initial deterministic parser recognizes a simple single-target command such
-as `叫 Sam review openab issue 20`. With `default_to_local = true`, it also
-recognizes unaddressed commands that have a request prefix or begin with a known
-action. These two real STT outputs are regression examples and resolve to local
-execution in opt-in mode:
+The initial deterministic router recognizes an explicitly addressed,
+single-configured-target request such as `叫 Sam review openab issue 20`. With
+`default_to_local = true`, every other non-empty final operator transcript
+received while no confirmation is pending is a local candidate, whether or not
+it has a request prefix or begins with a known action. These two real STT outputs
+remain regression examples and resolve to local execution in opt-in mode:
 
 ```text
 先查看 OpenAPI 171368整理目前施作方向
 請先查看 Open App取得issue 1368整理目前行作方向
 ```
 
-Ordinary narration remains a no-op. If another configured target alias appears
-later in a targeted task, the whole utterance is rejected rather than guessing
-the addressee or treating it as local. A name absent from the target registry can
-never create a Discord delegation; the utterance is local only if it independently
-matches the local command shape. Ambiguous configured targets and incomplete
-commands are silent no-ops. During validation, use `/voice transcript` to
-distinguish an STT mismatch from a parser rejection.
+An empty or whitespace-only final transcript remains a no-op. If another
+configured target alias appears later in a targeted task, OpenAB does not guess
+the addressee. A name absent from the target registry likewise never creates a
+Discord delegation. In local-default mode, either case keeps the entire utterance
+as raw local task text for ACP/LLM interpretation after confirmation. During
+validation, use `/voice transcript` to distinguish an STT mismatch from a routing
+decision.
+
+This behavior is intentionally broad: ordinary non-empty operator narration also
+opens a confirmation while the broker is idle. Enable local-default intent mode
+for command-style voice sessions; passive meeting capture can leave it disabled.
 
 The receiving target does not need new Rust code. It handles the broker's message
 through the existing bot-to-bot Discord and ACP path. On every target bot, allow
@@ -462,11 +476,11 @@ For the optional intent broker, also verify:
 
 - [ ] A configured spoken target produces one paraphrased confirmation in the pinned text channel and, with TTS enabled, one audible paraphrase.
 - [ ] Spoken or text yes sends exactly one real target-bot mention; duplicate confirmation does not send twice.
-- [ ] With `default_to_local = true`, each documented real STT example produces a local paraphrase and queues the confirmed task through this bot's Dispatcher/ACP path.
+- [ ] With `default_to_local = true`, each documented real STT example and a non-command-shaped non-empty sample produces a local paraphrase and queues the confirmed raw task through this bot's Dispatcher/ACP path.
 - [ ] A local task creates one task thread from a normal text control channel, while an existing thread or Voice Channel text chat is used directly.
 - [ ] With `default_to_local = false`, the same unaddressed speech remains a no-op and existing explicit-target behavior is unchanged.
 - [ ] Spoken and text no/correction, timeout, `/voice stop`, and session replacement follow the documented pending-intent rules.
-- [ ] An unknown name never produces a Discord target mention; two configured target names never dispatch or fall back to local execution.
+- [ ] Unknown or multiple configured target names never produce a Discord target mention and remain raw local text in local-default mode.
 - [ ] The receiving bot admits the trusted voice bot's mention and starts its normal Discord/ACP flow.
 - [ ] A local acceptance speaks the local acknowledgement; delegation speaks the sent acknowledgement; cancelled and failed routes speak their bounded feedback.
 - [ ] The bot does not transcribe its own playback into a confirmation, and capture resumes after track end, playback error, and watchdog release.

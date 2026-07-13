@@ -596,9 +596,10 @@ pub struct DiscordVoiceIntentConfig {
     /// Time allowed for the operator to confirm or correct a proposed intent.
     #[serde(default = "default_voice_intent_confirmation_timeout_seconds")]
     pub confirmation_timeout_seconds: u64,
-    /// Treat an unaddressed, command-shaped operator utterance as a request for
-    /// this OpenAB instance to execute locally. Disabled by default so enabling
-    /// the intent broker preserves the original explicit-target-only behavior.
+    /// Treat any non-empty operator utterance that is not an unambiguous
+    /// configured-target request as a candidate for local execution. The raw
+    /// text reaches this OpenAB instance's ACP agent only after confirmation.
+    /// Disabled by default to preserve explicit-target-only behavior.
     #[serde(default)]
     pub default_to_local: bool,
     /// Canonical target name to Discord bot identity and optional spoken aliases.

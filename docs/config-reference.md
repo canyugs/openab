@@ -123,7 +123,7 @@ behavior unchanged.
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable the experimental Slice 1 intent broker. `[discord.voice].enabled` and `[stt].enabled` must also be `true`. |
 | `confirmation_timeout_seconds` | u64 | `30` | Time allowed for the operator's text yes, no, or correction. Expiration abandons the pending intent and never dispatches it automatically. |
-| `default_to_local` | bool | `false` | When `true`, an unaddressed, command-shaped utterance is proposed for this bot to execute through its existing Dispatcher/ACP path. The default preserves the original explicit-target-only behavior. |
+| `default_to_local` | bool | `false` | When `true`, every non-empty final operator transcript that is not an unambiguous configured-target request becomes a local candidate. After confirmation, its raw text enters this bot's existing Dispatcher/ACP path for LLM interpretation. The default preserves explicit-target-only behavior. |
 
 Targets form a registry keyed by a stable canonical name:
 
@@ -148,15 +148,17 @@ Each `[discord.voice.intent.targets.<name>]` table supports:
 At least one route must be configured: set `default_to_local = true`, register at
 least one target, or do both. A local-only setup therefore needs no `targets`
 tables. With both routes enabled, an explicitly named configured target still
-uses nonce-enforced Discord delegation; an utterance containing two configured
-targets is rejected and never falls back to local execution. An unaddressed,
-command-shaped utterance uses this bot's existing Dispatcher/ACP path only when
+uses nonce-enforced Discord delegation. Unknown or multiple configured-target
+matches never create a guessed delegation; with local default enabled, the full
+utterance remains a local candidate. Any other non-empty operator utterance uses
+this bot's existing Dispatcher/ACP path after confirmation when
 `default_to_local = true`.
 
 Both routes require one Discord text confirmation. For local execution, a normal
 text control channel gets a dedicated task thread; an existing thread or a Voice
-Channel's text chat is used directly. Slice 1 does not yet accept spoken
-confirmation, play Voice Channel TTS, or observe a delegated target's result.
+Channel's text chat is used directly. Spoken confirmation and optional Voice
+Channel TTS are implemented separately; delegated-result observation remains a
+later slice.
 
 Each receiving target bot keeps its normal OpenAB Discord/ACP flow. Allow the
 pinned dispatch channel and trust the voice-dispatching bot's **Discord user ID**:

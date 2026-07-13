@@ -25,7 +25,7 @@ This table records implementation state separately from runtime validation. Upda
 | Local Discord/Groq/Claude readiness | **Passed; Slice 2+3-capable startup passed** | Helm revision 9 runs `localhost:5555/openab:claude-voice-spoken-28b3868` at digest `sha256:31f15c61a88e44c2996135f7e7884c6903159a83baa5b059ce2ef2a63aad6f47`, `1/1` ready with zero restarts. Logs confirm `voice_intent_enabled=true`, Aragorn connected, slash commands registered, and `voice_tts_ready=false` because `TTS_API_KEY` is not yet present. Local Sam revision 2 remains ready on the matching Slice 1 Codex image. A real spoken proposal, local ACP task, target-agent handoff, and TTS playback remain pending. |
 | Real Discord receive | **Passed for one speaker** | The first Songbird join exposed a Rustls 0.23 provider ambiguity in unified builds. Commit `7b8f90f` explicitly selects AWS-LC when AgentCore features are present and ring for Discord-only builds. After that fix, join, decoded receive, attribution, timestamps, and raw transcript download passed. The rollout ended the session; explicit stop and DAVE remain separate checks. |
 | STT accuracy sample | **Failed; controlled retry pending** | The first four-segment raw transcript preserved one-speaker attribution and timing, but contained an ellipsis-only segment, an incorrect-language hallucination, and unreliable Chinese text. Image `sha256:423cdf29675a4d8666cf19a686626dee2a75217312789b1fb057deda806fae88` is deployed with `whisper-large-v3` plus `language = "zh"` for the next A/B sample. |
-| Voice intent broker | **Hybrid Slices 1-3 implemented; rollout/live validation pending** | With explicit opt-in, an unaddressed command-shaped transcript enters Aragorn's existing Dispatcher/ACP path after spoken or text confirmation; a request naming one configured target still dispatches a nonce-enforced real Discord mention. Target-head coordination grammar and typed clarification remain follow-up work. |
+| Voice intent broker | **Hybrid Slices 1-3 implemented; rollout/live validation pending** | With explicit opt-in and `default_to_local = true`, every non-empty final transcript from the session operator received while no confirmation is pending becomes a local raw-task candidate unless it explicitly addresses exactly one configured target. Confirmation precedes ACP/LLM interpretation; only one explicit configured target dispatches a nonce-enforced real Discord mention. Unknown or multiple target matches remain raw local text rather than guessed delegation. |
 | Spoken confirmation and TTS | **Implemented; live provider/Voice validation pending** | Final STT from the bound operator handles yes/no/correction through the same pending state as text. Opt-in OpenAI-compatible TTS plays bounded proposal and local/delegated acknowledgement prompts through Songbird while capture is suppressed; text fallback remains available. |
 | Realtime/Live and result observation | **Not started; optional later slices** | Realtime/Live must emit the same proposal contract. Thread observation must not block the initial confirmed-dispatch loop. |
 | Two-speaker and reconnect soak test | **Pending real-world validation** | Attribution, reconnect health beyond a unit state transition, and a 30-minute minimum soak remain unverified. |
@@ -256,9 +256,13 @@ The deployment is blocked by ImagePullBackOff, not MemoryPressure.
 ```
 
 In the transcript/meeting-summary path, only `/voice summary` starts an ACP turn.
-When the separately opt-in intent broker is enabled, an accepted final segment may
-instead create a pending semantic intent; it still cannot start local ACP work or
-delegate until the operator confirms it.
+When the separately opt-in intent broker is enabled with `default_to_local = true`,
+every non-empty final segment from the session operator received while no
+confirmation is pending creates a pending local raw-task candidate unless it
+explicitly addresses exactly one configured target. It still cannot start local
+ACP work or delegate until the operator confirms it. The existing ACP/LLM
+interprets local raw text only after that confirmation; voice routing does not
+require a request-prefix or known-action allowlist.
 
 The retained transcript is bounded by bytes and entry count. Status exposes retained
 entries/bytes, evicted entries, and rejected entries. It remains in process memory

@@ -19,7 +19,10 @@ confirmation:
 Discord Voice Channel
   → OpenAB Songbird receive
   → STT or a future Realtime/Live engine
-  → semantic intent proposal
+  → non-empty final operator transcript
+  → deterministic destination envelope
+      ├─ exactly one explicitly addressed configured target → delegate
+      └─ otherwise, with default_to_local = true             → local raw task
   → bounded spoken paraphrase (with text fallback)
   → one spoken or text semantic confirmation
   → deterministic destination router
@@ -30,10 +33,14 @@ Discord Voice Channel
 The voice-dispatching OpenAB instance will gain a small deterministic intent
 broker inside or immediately beside its Discord Voice subsystem. It receives an
 intent proposal, asks the operator to confirm what it understood, and routes the
-confirmed task once. An unaddressed command-shaped utterance may execute through
-the same instance's existing `Dispatcher` and ACP session path when explicitly
-enabled. A request naming Sam, Frodo, or another registered target is dispatched
-as a Discord message to that existing OAB agent.
+confirmed task once. When no confirmation is pending and `default_to_local =
+true`, every non-empty finalized transcript from the session operator that is not
+an unambiguous configured-target request becomes a local task candidate; there is
+no request-prefix or known-action allowlist. After confirmation, the same
+instance's existing `Dispatcher` and ACP session interpret and execute that raw
+task. A request explicitly addressing exactly one configured target such as Sam
+or Frodo is still dispatched deterministically as a Discord message to that
+existing OAB agent.
 
 The receiving B0-B15 agents continue using their existing Discord and ACP code.
 They do not receive a new voice protocol or a new ACP executor.
@@ -46,7 +53,10 @@ The following are explicit decisions:
 - keep target OAB agents unchanged except for Discord configuration;
 - keep Discord text as the dispatch and audit surface;
 - confirm semantic intent and destination once before execution or dispatch;
-- let parser, LLM, Realtime, or GPT-Live implementations only propose intents;
+- keep configured-target recognition deterministic and treat other non-empty
+  operator transcripts as raw local proposals when local-default mode is enabled;
+- let the local ACP/LLM interpret the raw task only after confirmation;
+- let any future Realtime or GPT-Live implementation only propose intents;
 - let deterministic OpenAB state, not the model, perform final dispatch;
 - do not involve OCP in the first path; and
 - do not block initial dispatch on structured ACP lifecycle observation.
@@ -185,7 +195,7 @@ without helping the initial intent-confirmation loop.
 | PCM segmentation and bounded STT queue | **Implemented** | Per-user 48 kHz stereo segmentation, in-memory WAV encoding, bounded workers, and drop accounting exist. |
 | STT and retained transcript | **Implemented; accuracy retry pending** | Groq `whisper-large-v3` with `language = "zh"` is deployed. The first sample was not reliable enough. |
 | Explicit ACP transcript summary | **Implemented** | `/voice summary` uses the current normal ACP path. This remains separate from intent delegation. |
-| Intent proposal/parser | **Hybrid Slice 1 implemented** | With `default_to_local = true`, command-shaped speech without a named target resolves to local execution. An explicit configured target still resolves to delegation. Multiple configured targets remain rejected rather than guessed. |
+| Intent proposal/router | **Hybrid Slice 1 implemented** | With `default_to_local = true`, every non-empty final operator transcript becomes a local candidate unless it explicitly addresses exactly one configured target. Local raw text is confirmed before ACP/LLM interpretation. One explicit configured target resolves to delegation; unknown or multiple target matches do not delegate and remain raw local text. |
 | Pending intent state machine | **Implemented and unit-tested** | Session/operator binding, posting/waiting/dispatching phases, correction, timeout generations, replay protection, and stale-session cleanup exist. |
 | Text-confirmed local ACP execution | **Implemented; local startup passed, live task pending** | A confirmed local request creates a stable-nonce audit root, creates a task thread for a normal text/news control channel, and submits through the existing Dispatcher/ACP path. Existing threads and Voice Channel text chat execute in that shared channel because Discord cannot nest a thread there. |
 | Text-confirmed target delegation | **Implemented; local sender/receiver startup passed, live handoff pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch remain wired. The receiver now reuses Voice Channel text chat instead of trying to create an unsupported thread. A real spoken target-agent handoff still requires operator validation. |
@@ -333,9 +343,19 @@ struct PendingIntent {
 }
 ```
 
+For the initial STT path, local-default routing does not require a model or
+command classifier to construct that contract. OpenAB places the trimmed raw
+final operator transcript in `task`, chooses `Local`, and asks for confirmation.
+Only after an explicit yes does the existing ACP agent interpret the raw task.
+Deterministic alias matching may instead choose `Delegate` only when the
+operator explicitly addresses exactly one configured target. Empty or
+whitespace-only transcripts are ignored. Unknown or multiple target matches do
+not delegate; in local-default mode the full transcript remains the raw local
+task for ACP/LLM interpretation after confirmation.
+
 The proposal engine may be:
 
-- a small deterministic target/task grammar;
+- the initial non-empty local fallback plus deterministic target-alias router;
 - an LLM over the latest attributed transcript segment;
 - OpenAI Realtime function calling; or
 - a future GPT-Live delegation event.
@@ -361,20 +381,26 @@ aliases = ["sam", "山姆"]
 ```
 
 `default_to_local` is backward-compatible and defaults to `false`. When it is
-`true`, an unaddressed command-shaped utterance resolves to this bot; when it is
-`false`, such speech remains ignored. A local-only setup may omit `targets`.
+`true`, while no confirmation is pending, any non-empty final transcript from the
+session operator resolves to this bot unless it explicitly addresses exactly one
+configured target; when it is `false`, unaddressed speech remains ignored. The
+local task is the raw trimmed transcript and is interpreted by ACP only after
+confirmation. A local-only setup may omit `targets`.
+
 Delegated destinations require:
 
 - a stable canonical target name;
 - the real Discord bot user ID;
 - spoken aliases; and
-- deterministic rejection of unknown or ambiguous targets.
+- deterministic refusal to delegate unknown aliases or multiple configured
+  targets. In local-default mode, the full utterance remains a raw local task
+  instead of becoming a guessed Discord destination.
 
 ### 7.2 Local execution
 
 After confirmation, OpenAB posts a stable-nonce audit root under its own Discord
 identity. In a normal text/news control channel it creates a dedicated task
-thread, then submits the canonical task through the existing `Dispatcher`,
+thread, then submits the confirmed raw task through the existing `Dispatcher`,
 `AdapterRouter`, and ACP turn driver. This is the same program-execution path as
 a normal human Discord task; the bot does not mention itself and does not create
 a second executor.
@@ -479,8 +505,10 @@ When a proposal event arrives:
 4. the same deterministic confirmation state handles yes/no/correction; and
 5. OpenAB performs the final local ACP enqueue or Discord delegation.
 
-This lets the first slice use existing STT plus a simple parser and later swap
-in Realtime/Live without rewriting dispatch behavior.
+This lets the first slice use existing STT plus a deterministic routing envelope
+and defer local-language understanding to the existing ACP agent. Realtime/Live
+can later improve proposal quality without rewriting confirmation or dispatch
+behavior.
 
 ## 10. Optional Observation and Spoken Results
 
@@ -512,9 +540,9 @@ signal, but the first intent broker does not depend on it.
 | `crates/openab-core/src/discord_voice.rs` | PCM segmentation and retained transcript primitives | Add transport-neutral intent/confirmation state types or keep them in a new sibling module. |
 | `crates/openab-core/src/discord_voice_runtime.rs` | Songbird receive, STT workers, session generation | Feed final attributed transcript events to the intent broker, synthesize bounded feedback, and own session/epoch-bound playback suppression. |
 | `crates/openab-core/src/discord.rs` | `/voice` commands, pinned control channel, and normal Dispatcher ingress | Route confirmed local tasks through the existing ACP path and retain deterministic target mention dispatch. |
-| `crates/openab-core/src/discord_voice_intent.rs` | Intent parsing and pending-confirmation state | Resolve typed `Local`/`Delegate` destinations, handle spoken and text confirmation, and hand local execution to the adapter only after confirmation. |
-| `crates/openab-core/src/config.rs` | Discord Voice, STT, and TTS configuration | Provide opt-in local default, targets, timeout, parser, and OpenAI-compatible TTS settings; later add Realtime settings. Defaults remain disabled. |
-| `crates/openab-core/src/stt.rs` | OpenAI-compatible transcription | Reuse unchanged for the first parser backend. |
+| `crates/openab-core/src/discord_voice_intent.rs` | Intent routing and pending-confirmation state | Wrap non-empty transcripts as local raw tasks in local-default mode, resolve explicit typed `Delegate` destinations, handle spoken and text confirmation, and hand local execution to the adapter only after confirmation. |
+| `crates/openab-core/src/config.rs` | Discord Voice, STT, and TTS configuration | Provide opt-in local default, targets, timeout, deterministic target routing, and OpenAI-compatible TTS settings; later add Realtime settings. Defaults remain disabled. |
+| `crates/openab-core/src/stt.rs` | OpenAI-compatible transcription | Reuse unchanged to produce finalized operator transcripts. |
 | `crates/openab-core/src/tts.rs` | OpenAI-compatible speech synthesis | Request bounded WAV speech from the configured provider. |
 | `crates/openab-core/src/discord_voice_speech.rs` | TTS WAV decoding and playback conversion | Validate/decode provider WAV and build Songbird PCM input. |
 | `crates/openab-core/src/acp_turn.rs` | Typed ACP result boundary | Optional later observation input; not required for initial dispatch. |
@@ -544,7 +572,8 @@ real Discord Voice proposal/confirmation/handoff validation pending.**
 
 - add destination/task proposal types;
 - implement one-pending-intent state per guild/voice session;
-- start with a small command grammar plus explicit target aliases;
+- treat every non-empty final operator transcript as a local raw-task candidate
+  when `default_to_local = true`, while retaining explicit target aliases;
 - post the confirmation question in the pinned text channel;
 - accept text yes/no/correction;
 - implement timeout and session replacement;
@@ -553,18 +582,19 @@ real Discord Voice proposal/confirmation/handoff validation pending.**
 - add unit tests for every state transition; and
 - validate in `docker-desktop/openab-local`.
 
-The first deterministic parser intentionally has these documented limitations:
+The first deterministic router has these documented boundaries:
 
-- with `default_to_local = true`, unaddressed speech must still be
-  command-shaped, such as `先查看 openab issue 1368 整理目前施作方向`;
+- with `default_to_local = true`, every non-empty final operator transcript is
+  confirmed as local unless it explicitly addresses exactly one configured
+  target; the local ACP/LLM interprets the raw text only after confirmation;
 - it supports explicit delegation with one configured target, such as
   `叫 Sam review openab issue 20`; if another configured target alias appears
-  later in the task text, the utterance is rejected rather than guessing which
-  bot is the addressee; and
-- unknown or ambiguous-target requests are currently ignored instead of
-  producing the clarification required by acceptance scenario 3. Use
-  `/voice transcript` while validating STT/parser mismatches. Typed resolution
-  reasons and spoken/text clarification are follow-up work.
+  later in the task text, OpenAB does not guess which bot is the addressee and
+  keeps the full utterance as a raw local task in local-default mode; and
+- an unknown name likewise cannot create a Discord delegation and remains raw
+  local task text in local-default mode. Use `/voice transcript` while validating
+  STT/routing mismatches. Typed resolution reasons and spoken/text clarification
+  are follow-up work.
 
 ### Slice 2 — Spoken confirmation
 
@@ -594,7 +624,7 @@ pending. This is the first hands-free daily milestone.**
 
 - add a backend that emits `propose_intent`;
 - preserve deterministic OpenAB confirmation and dispatch;
-- compare latency and intent quality against STT + parser; and
+- compare latency and intent quality against STT + deterministic routing; and
 - keep provider selection configurable.
 
 ### Slice 5 — Thread observation and spoken reporting
@@ -613,42 +643,47 @@ pending. This is the first hands-free daily milestone.**
 
 1. "先查看 openab issue 1368 整理目前施作方向" produces one normalized
    local proposal when `default_to_local = true`.
-2. "叫 Sam 看 canyugs/openab issue 20" produces one normalized delegated
+2. While no confirmation is pending, any other non-empty finalized operator
+   transcript, even without a request prefix or known action, produces a local
+   raw-task proposal in that mode.
+3. "叫 Sam 看 canyugs/openab issue 20" produces one normalized delegated
    proposal even when local-default mode is enabled.
-3. Unknown or ambiguous target produces clarification, not dispatch.
-4. Explicit yes queues one local task or posts one real mention exactly once.
-5. Explicit no abandons without execution or dispatch.
-6. A correction replaces the task and may explicitly switch destinations.
-7. Timeout, `/voice stop`, or session replacement abandons the pending intent.
-8. Duplicate STT/provider events cannot route the task twice.
-9. A model proposal alone cannot execute or dispatch.
+4. Empty or whitespace-only STT produces no proposal. Unknown or multiple
+   configured-target matches never create a Discord delegation; with local
+   default enabled, the full utterance remains a confirmed raw local task.
+5. Explicit yes queues one local task or posts one real mention exactly once.
+6. Explicit no abandons without execution or dispatch.
+7. A correction replaces the task and may explicitly switch destinations.
+8. Timeout, `/voice stop`, or session replacement abandons the pending intent.
+9. Duplicate STT/provider events cannot route the task twice.
+10. A model proposal alone cannot execute or dispatch.
 
 ### Discord integration
 
-10. A local task gets an auditable root and enters this bot's normal
+11. A local task gets an auditable root and enters this bot's normal
     Dispatcher/ACP path without a self-authored mention.
-11. The target receives a real `<@...>` mention and enters its unchanged normal
+12. The target receives a real `<@...>` mention and enters its unchanged normal
     bot-to-bot/ACP path.
-12. `trusted_bot_ids` admits the voice-dispatching bot without enabling all bot
+13. `trusted_bot_ids` admits the voice-dispatching bot without enabling all bot
     chatter.
-13. A pre-enqueue or dispatch failure is reported as not started/sent and
+14. A pre-enqueue or dispatch failure is reported as not started/sent and
     remains safe to retry.
 
 ### Daily voice UX
 
-14. The operator hears the semantic paraphrase and can answer without looking
+15. The operator hears the semantic paraphrase and can answer without looking
     at Discord after Slice 3.
-15. "對", "不是", and a corrected task are distinguished consistently.
-16. The bot does not hear its own TTS as an affirmative confirmation.
-17. Confirmation, sent, cancelled, and error speech is short and bounded;
+16. "對", "不是", and a corrected task are distinguished consistently.
+17. The bot does not hear its own TTS as an affirmative confirmation.
+18. Confirmation, sent, cancelled, and error speech is short and bounded;
     `/voice stop` terminates playback cleanly while conversational barge-in is
     deferred.
 
 ### Optional observation
 
-18. After Slice 5, OpenAB can say that the local or target agent started only after observing
+19. After Slice 5, OpenAB can say that the local or target agent started only after observing
     corresponding Discord evidence.
-19. A final result is associated with the correct routed intent and is not
+20. A final result is associated with the correct routed intent and is not
     spoken into a replacement voice session accidentally.
 
 ## 14. Alternatives Considered
@@ -666,9 +701,11 @@ It may remain useful later for a device-native assistant outside Discord Voice.
 Not selected. OCP coordinates stock OpenAB runtimes; it does not need to own a
 platform interaction already handled by OpenAB's Discord adapter.
 
-### Send every transcript directly to ACP or Discord
+### Send every transcript directly to ACP or Discord without confirmation
 
-Rejected. The desired unit is a confirmed semantic intent, not a raw transcript.
+Rejected. Local-default mode deliberately accepts any non-empty final operator
+transcript as a candidate, but it still requires confirmation before the raw task
+reaches ACP or Discord.
 
 ### Let Realtime call Discord directly
 
@@ -688,7 +725,8 @@ added after those semantics exist, and full duplex can wait.
 - Keeps real program execution in the existing local or target ACP agent.
 - Adds one small state machine instead of another execution runtime.
 - Preserves Discord bot identity and the existing multi-agent audit trail.
-- Allows a simple parser first and Realtime/Live later.
+- Avoids a brittle local command-shape allowlist while leaving room for
+  Realtime/Live to improve later proposal quality.
 - Provides a clear path from engineering scaffold to hands-free daily use.
 - Keeps OCP and target-agent code out of the first implementation.
 
@@ -705,6 +743,9 @@ added after those semantics exist, and full duplex can wait.
 - V1 TTS is half-duplex: operator capture is intentionally unavailable while the
   bot is speaking.
 - V1 allows only one pending confirmation per guild/session.
+- In local-default mode, ordinary non-empty operator narration while the broker
+  is idle also triggers confirmation; this opt-in mode is a command interaction
+  surface rather than a passive meeting filter.
 - Background progress/reporting arrives after the core dispatch loop.
 - Full duplex, barge-in, wake words, and echo cancellation remain later work.
 

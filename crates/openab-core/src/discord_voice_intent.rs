@@ -685,31 +685,45 @@ impl DiscordVoiceIntentBroker {
                 end,
             } => {
                 if !command_prefix_allowed(&normalized.value[..start]) {
-                    return if self.default_to_local {
-                        resolve_local_task(text).map(|task| IntentProposal {
-                            destination: IntentDestination::Local,
-                            task,
-                        })
-                    } else {
-                        None
-                    };
+                    return self.resolve_local_passthrough(text);
                 }
-                let original_end = normalized.original_index(end)?;
-                let task = clean_task(&text[original_end..])?;
-                Some(IntentProposal {
-                    destination: IntentDestination::Delegate { target_index },
-                    task,
-                })
+                let Some(original_end) = normalized.original_index(end) else {
+                    return self.resolve_local_passthrough(text);
+                };
+                match clean_task(&text[original_end..]) {
+                    Some(task) => Some(IntentProposal {
+                        destination: IntentDestination::Delegate { target_index },
+                        task,
+                    }),
+                    None => self.resolve_local_passthrough(text),
+                }
             }
-            TargetMatch::Ambiguous => None,
-            TargetMatch::None if self.default_to_local => {
-                resolve_local_task(text).map(|task| IntentProposal {
-                    destination: IntentDestination::Local,
-                    task,
-                })
-            }
-            TargetMatch::None => None,
+            TargetMatch::Ambiguous | TargetMatch::None => self.resolve_local_passthrough(text),
         }
+    }
+
+    /// In local-default mode, the ACP agent is the semantic interpreter.
+    ///
+    /// The deterministic grammar remains responsible only for an unambiguous
+    /// configured delegation target. Every other non-empty operator utterance
+    /// is confirmed and then passed through to the local agent verbatim instead
+    /// of being silently rejected by a command allowlist.
+    fn resolve_local_passthrough(&self, text: &str) -> Option<IntentProposal> {
+        if !self.default_to_local {
+            return None;
+        }
+        let task = text
+            .trim_matches(|character: char| {
+                character.is_whitespace() || is_command_separator(character)
+            })
+            .trim();
+        if task.is_empty() {
+            return None;
+        }
+        Some(IntentProposal {
+            destination: IntentDestination::Local,
+            task: task.to_string(),
+        })
     }
 
     fn find_target_match(&self, normalized: &str) -> TargetMatch {
@@ -759,9 +773,14 @@ impl DiscordVoiceIntentBroker {
         current: &IntentProposal,
         correction: &str,
     ) -> Option<IntentProposal> {
+        let normalized = NormalizedText::new(correction);
+        let target_match = self.find_target_match(&normalized.value);
         if let Some(proposal) = self.resolve_proposal(correction) {
             return Some(match proposal.destination {
-                IntentDestination::Local if !has_explicit_local_prefix(correction) => {
+                IntentDestination::Local
+                    if matches!(target_match, TargetMatch::None)
+                        && !has_explicit_local_prefix(correction) =>
+                {
                     IntentProposal {
                         destination: current.destination,
                         task: proposal.task,
@@ -1524,20 +1543,6 @@ const LOCAL_REQUEST_PREFIXES: &[&str] = &[
     "请",
 ];
 
-fn resolve_local_task(text: &str) -> Option<String> {
-    let trimmed = text
-        .trim_matches(|character: char| {
-            character.is_whitespace() || is_command_separator(character)
-        })
-        .trim();
-    if let Some(remainder) = strip_local_request_prefix(trimmed) {
-        return clean_task(remainder);
-    }
-    starts_with_local_action(trimmed)
-        .then(|| clean_task(trimmed))
-        .flatten()
-}
-
 fn has_explicit_local_prefix(text: &str) -> bool {
     let trimmed = text
         .trim_matches(|character: char| {
@@ -2018,7 +2023,7 @@ mod tests {
                 .await
                 .unwrap(),
             VoiceIntentTranscriptOutcome::Proposed {
-                speech_prompt: "由我直接處理「review PR #123」，對嗎？".to_string(),
+                speech_prompt: "由我直接處理「請幫我 review PR #123」，對嗎？".to_string(),
             }
         );
     }
@@ -2054,13 +2059,13 @@ mod tests {
     }
 
     #[test]
-    fn local_mode_only_falls_back_for_command_shaped_unaddressed_tasks() {
+    fn local_mode_passes_unstructured_operator_speech_to_the_agent() {
         let (broker, _) = local_broker(30);
         assert_eq!(
             broker.resolve_proposal("請幫我 review PR #123"),
             Some(IntentProposal {
                 destination: IntentDestination::Local,
-                task: "review PR #123".to_string(),
+                task: "請幫我 review PR #123".to_string(),
             })
         );
         assert_eq!(
@@ -2089,10 +2094,64 @@ mod tests {
                 task: "group review PR #123".to_string(),
             })
         );
-        assert!(broker
-            .resolve_proposal("請 B0 跟 B1 一起 review PR #123")
-            .is_none());
-        assert!(broker.resolve_proposal("我昨天 review PR #123").is_none());
+        for (speech, expected_task) in [
+            (
+                "請 B0 跟 B1 一起 review PR #123",
+                "請 B0 跟 B1 一起 review PR #123",
+            ),
+            ("我昨天 review PR #123", "我昨天 review PR #123"),
+            ("這件事你看著辦", "這件事你看著辦"),
+            ("請 B0", "請 B0"),
+        ] {
+            assert_eq!(
+                broker.resolve_proposal(speech),
+                Some(IntentProposal {
+                    destination: IntentDestination::Local,
+                    task: expected_task.to_string(),
+                })
+            );
+        }
+        assert!(broker.resolve_proposal("  ，。！？  ").is_none());
+    }
+
+    #[tokio::test]
+    async fn unstructured_operator_speech_is_confirmed_then_executed_locally() {
+        let (broker, messenger) = local_broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 100,
+                        end_frame: 200,
+                    },
+                    text: "這件事你看著辦".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Proposed {
+                speech_prompt: "由我直接處理「這件事你看著辦」，對嗎？".to_string(),
+            }
+        );
+        assert_eq!(messenger.messages().len(), 1);
+
+        let VoiceIntentTextOutcome::ExecuteLocal(request) = broker
+            .handle_text_message(100, 200, 300, "對")
+            .await
+            .unwrap()
+        else {
+            panic!("expected unstructured speech to reach the local ACP agent")
+        };
+        assert_eq!(request.task, "這件事你看著辦");
+        assert!(messenger.messages().iter().all(|message| !message
+            .nonce
+            .as_deref()
+            .is_some_and(|nonce| nonce.starts_with("oabv1"))));
     }
 
     #[test]
@@ -2236,7 +2295,7 @@ mod tests {
         let prompt = messenger.messages().pop().unwrap();
         assert!(prompt
             .content
-            .contains("由我直接處理「review PR #123」"));
+            .contains("由我直接處理「請幫我 review PR #123」"));
         let outcome = broker
             .handle_text_message(100, 200, 300, "對")
             .await
@@ -2250,7 +2309,7 @@ mod tests {
         assert_eq!(request.control_channel_id, 200);
         assert_eq!(request.operator_user_id, 300);
         assert_eq!(request.operator_display_name, "Can");
-        assert_eq!(request.task, "review PR #123");
+        assert_eq!(request.task, "請幫我 review PR #123");
 
         assert_eq!(messenger.messages().len(), 1);
         assert!(messenger.messages().iter().all(|message| !message
@@ -2312,7 +2371,7 @@ mod tests {
             panic!("expected a local execution handoff")
         };
         assert_eq!(request.session, current);
-        assert_eq!(request.task, "review PR #123");
+        assert_eq!(request.task, "請幫我 review PR #123");
         assert_eq!(spoken.speech_feedback.as_deref(), Some("好的，我開始處理。"));
         assert_eq!(messenger.messages().len(), 1);
         assert!(broker.complete_local_execution(&request));
@@ -2545,7 +2604,7 @@ mod tests {
             .last()
             .unwrap()
             .content
-            .contains("由我直接處理「run CI」"));
+            .contains("由我直接處理「你幫我 run CI」"));
         let VoiceIntentTextOutcome::ExecuteLocal(request) = broker
             .handle_text_message(100, 200, 300, "對")
             .await
@@ -2553,7 +2612,43 @@ mod tests {
         else {
             panic!("expected correction to switch to local execution")
         };
-        assert_eq!(request.task, "run CI");
+        assert_eq!(request.task, "你幫我 run CI");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_target_correction_falls_back_to_local_agent_interpretation() {
+        let (broker, messenger) = local_broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+        propose(&broker, current).await;
+
+        let corrected = "請 B0 跟 B1 一起 review PR #123";
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, &format!("更正：{corrected}"))
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::Corrected
+        );
+        assert!(messenger
+            .messages()
+            .last()
+            .unwrap()
+            .content
+            .contains(&format!("由我直接處理「{corrected}」")));
+
+        let VoiceIntentTextOutcome::ExecuteLocal(request) = broker
+            .handle_text_message(100, 200, 300, "對")
+            .await
+            .unwrap()
+        else {
+            panic!("expected ambiguous target correction to use local ACP")
+        };
+        assert_eq!(request.task, corrected);
+        assert!(messenger.messages().iter().all(|message| !message
+            .nonce
+            .as_deref()
+            .is_some_and(|nonce| nonce.starts_with("oabv1"))));
     }
 
     #[tokio::test]
