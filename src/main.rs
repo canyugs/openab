@@ -129,6 +129,24 @@ fn has_unified_platform_env() -> bool {
                 .unwrap_or(false))
 }
 
+/// Returns true when the first-class `[wecom]` section resolves all credentials
+/// required to construct the embedded WeCom adapter. This must remain separate
+/// from [`has_unified_platform_env`]: config-first deployments may intentionally
+/// provide literal or secret-substituted values without exporting `WECOM_*`.
+fn has_unified_wecom_config(cfg: &config::Config) -> bool {
+    if !cfg!(feature = "wecom") {
+        return false;
+    }
+    cfg.wecom.as_ref().is_some_and(|wecom| {
+        let resolved = wecom.resolve();
+        resolved.corp_id.is_some()
+            && resolved.secret.is_some()
+            && resolved.token.is_some()
+            && resolved.encoding_aes_key.is_some()
+            && resolved.agent_id.is_some()
+    })
+}
+
 /// Apply a platform's first-class trust section to the registry, or — when the
 /// platform is active but still trust-driven by the deprecated uniform
 /// `GATEWAY_ALLOW_ALL_USERS`/`GATEWAY_ALLOWED_USERS` env — log the Phase 1
@@ -267,9 +285,10 @@ async fn main() -> anyhow::Result<()> {
         && cfg.gateway.is_none()
         && cfg.telegram.is_none()
         && !has_unified_platform_env()
+        && !has_unified_wecom_config(&cfg)
     {
         anyhow::bail!(
-            "no adapter configured — add [discord], [slack], [telegram], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
+            "no adapter configured — add [discord], [slack], [telegram], [wecom], or [gateway] to config, or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
         );
     }
 
@@ -299,6 +318,18 @@ async fn main() -> anyhow::Result<()> {
         let substituted = secrets::substitute(&raw_expanded, &resolved);
         cfg = config::parse_config_str(&substituted, &config_source)?;
     }
+
+    // Compute before individual config fields are moved into their runtime
+    // components below. Secret-backed values have been substituted by now.
+    #[cfg(any(
+        feature = "telegram",
+        feature = "line",
+        feature = "feishu",
+        feature = "googlechat",
+        feature = "wecom",
+        feature = "teams",
+    ))]
+    let unified_wecom_configured = has_unified_wecom_config(&cfg);
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
@@ -846,7 +877,7 @@ async fn main() -> anyhow::Result<()> {
     let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
 
-        if has_unified_platform_env() || cfg.telegram.is_some() {
+        if has_unified_platform_env() || cfg.telegram.is_some() || unified_wecom_configured {
             let listen_addr =
                 std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
@@ -1501,5 +1532,23 @@ mod tests {
 
         // Cleanup
         clear_all();
+    }
+
+    #[test]
+    fn complete_wecom_section_enables_unified_startup_without_env() {
+        let cfg = config::parse_config_str(
+            r#"
+[wecom]
+corp_id = "ww1234567890abcdef"
+secret = "test-secret"
+token = "test-token"
+encoding_aes_key = "abcdefghijklmnopqrstuvwxyzABCDEFGH123456789"
+agent_id = "1000002"
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(has_unified_wecom_config(&cfg), cfg!(feature = "wecom"));
     }
 }
