@@ -117,6 +117,9 @@ pub enum VoiceIntentTextOutcome {
     Dispatched,
     /// Execute this confirmed task through the voice agent's own ACP runtime.
     ExecuteLocal(LocalIntentExecution),
+    /// The operator rejected the paraphrase without cancelling the task. The
+    /// pending draft remains open for a natural-language replacement.
+    CorrectionRequested,
     Cancelled,
     Corrected,
     /// The message used correction syntax but did not contain a usable task.
@@ -430,9 +433,6 @@ impl DiscordVoiceIntentBroker {
                 if !record_transcript_key(bound, event.key) {
                     return Ok(VoiceIntentTranscriptOutcome::Ignored);
                 }
-                if matches!(confirmation, Confirmation::Unrelated) {
-                    return Ok(VoiceIntentTranscriptOutcome::AwaitingConfirmation);
-                }
                 if current.phase != PendingPhase::WaitingConfirmation {
                     return Ok(VoiceIntentTranscriptOutcome::Confirmation(
                         VoiceIntentSpokenConfirmationOutcome {
@@ -442,11 +442,15 @@ impl DiscordVoiceIntentBroker {
                     ));
                 }
 
-                TranscriptEffect::Apply(self.confirmation_effect(
-                    bound,
-                    current,
-                    confirmation,
-                ))
+                // Once a spoken draft is pending, the next meaningful operator
+                // utterance is part of that dialogue. Exact confirmation and
+                // cancellation phrases take the fast path; everything else is
+                // a natural-language replacement for the current draft.
+                let conversational = match confirmation {
+                    Confirmation::Unrelated => Confirmation::Correction(event.text.trim()),
+                    classified => classified,
+                };
+                TranscriptEffect::Apply(self.confirmation_effect(bound, current, conversational))
             } else {
                 let Some(raw_proposal) = raw_proposal else {
                     return Ok(VoiceIntentTranscriptOutcome::Ignored);
@@ -575,7 +579,10 @@ impl DiscordVoiceIntentBroker {
                     TextEffect::ExecuteLocal(LocalIntentExecution::from_pending(&message))
                 }
             },
-            Confirmation::Negative => {
+            Confirmation::Reject => {
+                TextEffect::RequestCorrection(PendingMessage::from_bound(bound, current))
+            }
+            Confirmation::Cancel => {
                 bound.pending = None;
                 TextEffect::Cancel(PendingMessage::from_bound(bound, current))
             }
@@ -647,6 +654,17 @@ impl DiscordVoiceIntentBroker {
                 Ok(VoiceIntentTextOutcome::Dispatched)
             }
             TextEffect::ExecuteLocal(request) => Ok(VoiceIntentTextOutcome::ExecuteLocal(request)),
+            TextEffect::RequestCorrection(message) => {
+                let content = bounded_discord_message(format!(
+                    "<@{}> 這次語音意圖仍保留；請直接說正確內容，或說「取消」。",
+                    message.operator_user_id
+                ));
+                self.messenger
+                    .send_message(message.control_channel_id, &content, None)
+                    .await
+                    .context("failed to request a revised Discord voice intent")?;
+                Ok(VoiceIntentTextOutcome::CorrectionRequested)
+            }
             TextEffect::Cancel(message) => {
                 let content = bounded_discord_message(format!(
                     "<@{}> 已取消這次語音任務。",
@@ -718,6 +736,9 @@ impl DiscordVoiceIntentBroker {
             })
             .trim();
         if task.is_empty() {
+            return None;
+        }
+        if is_idle_voice_chatter(task) {
             return None;
         }
         Some(IntentProposal {
@@ -863,11 +884,7 @@ impl DiscordVoiceIntentBroker {
         }
     }
 
-    fn confirmation_speech_for(
-        &self,
-        proposal: &IntentProposal,
-        task: &str,
-    ) -> Option<String> {
+    fn confirmation_speech_for(&self, proposal: &IntentProposal, task: &str) -> Option<String> {
         let message = match proposal.destination {
             IntentDestination::Delegate { target_index } => {
                 let target = self.targets.get(target_index)?;
@@ -1323,6 +1340,7 @@ impl LocalIntentExecution {
 enum TextEffect {
     Dispatch(PendingMessage),
     ExecuteLocal(LocalIntentExecution),
+    RequestCorrection(PendingMessage),
     Cancel(PendingMessage),
     Correct(PendingMessage),
     RejectCorrection(PendingMessage),
@@ -1337,7 +1355,8 @@ enum TranscriptEffect {
 #[derive(Debug, PartialEq, Eq)]
 enum Confirmation<'a> {
     Affirmative,
-    Negative,
+    Reject,
+    Cancel,
     Correction(&'a str),
     Unrelated,
 }
@@ -1366,18 +1385,43 @@ fn classify_confirmation(content: &str) -> Confirmation<'_> {
     }
     if matches!(
         exact.as_str(),
-        "不是" | "不對" | "不对" | "不要" | "取消" | "no" | "nope" | "cancel"
+        "不是" | "不對" | "不对" | "否" | "no" | "nope"
     ) {
-        return Confirmation::Negative;
+        return Confirmation::Reject;
+    }
+    if matches!(
+        exact.as_str(),
+        "不要"
+            | "取消"
+            | "算了"
+            | "不用"
+            | "不用了"
+            | "先不要"
+            | "先不用"
+            | "停止"
+            | "cancel"
+            | "stop"
+    ) {
+        return Confirmation::Cancel;
     }
 
     const CORRECTION_PREFIXES: &[&str] = &[
         "更正",
         "修正",
         "改成",
+        "改為",
+        "改为",
         "其實",
         "其实",
         "不是",
+        "不對",
+        "不对",
+        "我是說",
+        "我是说",
+        "我的意思是",
+        "應該是",
+        "应该是",
+        "我要的是",
         "correction",
         "actually",
     ];
@@ -1390,19 +1434,49 @@ fn classify_confirmation(content: &str) -> Confirmation<'_> {
         if remainder.is_empty() {
             continue;
         }
-        if let Some(first) = remainder.chars().next() {
-            if first.is_whitespace() || is_correction_separator(first) {
-                return Confirmation::Correction(
-                    remainder
-                        .trim_start_matches(|character: char| {
-                            character.is_whitespace() || is_correction_separator(character)
-                        })
-                        .trim(),
-                );
-            }
+        let correction = remainder
+            .trim_start_matches(|character: char| {
+                character.is_whitespace() || is_correction_separator(character)
+            })
+            .trim();
+        if !correction.is_empty() {
+            return Confirmation::Correction(correction);
         }
     }
     Confirmation::Unrelated
+}
+
+fn is_idle_voice_chatter(content: &str) -> bool {
+    let normalized = content
+        .trim()
+        .trim_matches(is_confirmation_punctuation)
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "嗯" | "嗯嗯"
+            | "喔"
+            | "哦"
+            | "好"
+            | "好的"
+            | "好啦"
+            | "了解"
+            | "知道了"
+            | "沒事"
+            | "没事"
+            | "謝謝"
+            | "谢谢"
+            | "辛苦了"
+            | "不是"
+            | "不對"
+            | "不对"
+            | "取消"
+            | "算了"
+            | "不用了"
+            | "no"
+            | "nope"
+            | "cancel"
+    )
 }
 
 fn normalize_for_matching(text: &str) -> String {
@@ -1745,6 +1819,7 @@ fn spoken_feedback_for_outcome(
         VoiceIntentTextOutcome::Dispatching => "正在確認是否已送出。".to_string(),
         VoiceIntentTextOutcome::Dispatched => "已送出。".to_string(),
         VoiceIntentTextOutcome::ExecuteLocal(_) => "好的，我開始處理。".to_string(),
+        VoiceIntentTextOutcome::CorrectionRequested => "好，那要改成什麼？".to_string(),
         VoiceIntentTextOutcome::Cancelled => "已取消。".to_string(),
         VoiceIntentTextOutcome::Corrected => revised_prompt?,
         VoiceIntentTextOutcome::CorrectionRejected => {
@@ -2154,6 +2229,31 @@ mod tests {
             .is_some_and(|nonce| nonce.starts_with("oabv1"))));
     }
 
+    #[tokio::test]
+    async fn idle_chatter_does_not_become_a_local_task() {
+        let (broker, messenger) = local_broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 100,
+                        end_frame: 200,
+                    },
+                    text: "嗯".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Ignored
+        );
+        assert!(messenger.messages().is_empty());
+    }
+
     #[test]
     fn target_name_inside_a_local_task_does_not_force_delegation() {
         let (broker, _) = local_broker(30);
@@ -2188,10 +2288,15 @@ mod tests {
     #[test]
     fn confirmation_classification_is_exact_but_allows_punctuation() {
         assert_eq!(classify_confirmation(" 對！ "), Confirmation::Affirmative);
-        assert_eq!(classify_confirmation("不是"), Confirmation::Negative);
+        assert_eq!(classify_confirmation("不是"), Confirmation::Reject);
+        assert_eq!(classify_confirmation("算了"), Confirmation::Cancel);
         assert_eq!(
             classify_confirmation("不是，review only"),
             Confirmation::Correction("review only")
+        );
+        assert_eq!(
+            classify_confirmation("不對我是說查 OpenAI"),
+            Confirmation::Correction("我是說查 OpenAI")
         );
         assert_eq!(
             classify_confirmation("更正：請 B1 run CI"),
@@ -2372,13 +2477,16 @@ mod tests {
         };
         assert_eq!(request.session, current);
         assert_eq!(request.task, "請幫我 review PR #123");
-        assert_eq!(spoken.speech_feedback.as_deref(), Some("好的，我開始處理。"));
+        assert_eq!(
+            spoken.speech_feedback.as_deref(),
+            Some("好的，我開始處理。")
+        );
         assert_eq!(messenger.messages().len(), 1);
         assert!(broker.complete_local_execution(&request));
     }
 
     #[tokio::test]
-    async fn spoken_negative_cancels_and_spoken_correction_reprompts() {
+    async fn spoken_rejection_keeps_the_draft_open_and_cancellation_clears_it() {
         let (broker, messenger) = broker(30);
         let first = token(100, 1);
         broker.bind_session(first, 200, 300, "Can");
@@ -2398,12 +2506,30 @@ mod tests {
                 })
                 .await
                 .unwrap(),
-            VoiceIntentTranscriptOutcome::Confirmation(
-                VoiceIntentSpokenConfirmationOutcome {
-                    outcome: VoiceIntentTextOutcome::Cancelled,
-                    speech_feedback: Some("已取消。".to_string()),
-                }
-            )
+            VoiceIntentTranscriptOutcome::Confirmation(VoiceIntentSpokenConfirmationOutcome {
+                outcome: VoiceIntentTextOutcome::CorrectionRequested,
+                speech_feedback: Some("好，那要改成什麼？".to_string()),
+            })
+        );
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: first,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 500,
+                        end_frame: 600,
+                    },
+                    text: "算了".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Confirmation(VoiceIntentSpokenConfirmationOutcome {
+                outcome: VoiceIntentTextOutcome::Cancelled,
+                speech_feedback: Some("已取消。".to_string()),
+            })
         );
 
         let second = token(100, 2);
@@ -2423,12 +2549,10 @@ mod tests {
                 })
                 .await
                 .unwrap(),
-            VoiceIntentTranscriptOutcome::Confirmation(
-                VoiceIntentSpokenConfirmationOutcome {
-                    outcome: VoiceIntentTextOutcome::Corrected,
-                    speech_feedback: Some("要請 B1 run CI，對嗎？".to_string()),
-                }
-            )
+            VoiceIntentTranscriptOutcome::Confirmation(VoiceIntentSpokenConfirmationOutcome {
+                outcome: VoiceIntentTextOutcome::Corrected,
+                speech_feedback: Some("要請 B1 run CI，對嗎？".to_string()),
+            })
         );
         assert!(messenger
             .messages()
@@ -2437,7 +2561,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unrelated_spoken_reply_leaves_pending_and_its_key_cannot_be_replayed() {
+    async fn rejection_then_natural_replacement_revises_without_a_command_prefix() {
+        let (broker, messenger) = broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+        propose(&broker, current).await;
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 300,
+                        end_frame: 400,
+                    },
+                    text: "不對".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Confirmation(VoiceIntentSpokenConfirmationOutcome {
+                outcome: VoiceIntentTextOutcome::CorrectionRequested,
+                speech_feedback: Some("好，那要改成什麼？".to_string()),
+            })
+        );
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 500,
+                        end_frame: 600,
+                    },
+                    text: "我是說查 OpenAI".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Confirmation(VoiceIntentSpokenConfirmationOutcome {
+                outcome: VoiceIntentTextOutcome::Corrected,
+                speech_feedback: Some("要請 B0 查 OpenAI，對嗎？".to_string()),
+            })
+        );
+        assert!(messenger
+            .messages()
+            .last()
+            .is_some_and(|message| message.content.contains("B0 查 OpenAI")));
+    }
+
+    #[tokio::test]
+    async fn cancellation_then_idle_chatter_does_not_start_another_task() {
+        let (broker, messenger) = local_broker(30);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+        propose_local(&broker, current).await;
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 300,
+                        end_frame: 400,
+                    },
+                    text: "取消".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Confirmation(VoiceIntentSpokenConfirmationOutcome {
+                outcome: VoiceIntentTextOutcome::Cancelled,
+                speech_feedback: Some("已取消。".to_string()),
+            })
+        );
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 500,
+                        end_frame: 600,
+                    },
+                    text: "嗯".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Ignored
+        );
+        assert_eq!(messenger.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn natural_spoken_reply_revises_pending_and_its_key_cannot_be_replayed() {
         let (broker, messenger) = broker(30);
         let current = token(100, 1);
         broker.bind_session(current, 200, 300, "Can");
@@ -2458,7 +2679,10 @@ mod tests {
                 })
                 .await
                 .unwrap(),
-            VoiceIntentTranscriptOutcome::AwaitingConfirmation
+            VoiceIntentTranscriptOutcome::Confirmation(VoiceIntentSpokenConfirmationOutcome {
+                outcome: VoiceIntentTextOutcome::Corrected,
+                speech_feedback: Some("要請 B0 今天天氣很好，對嗎？".to_string()),
+            })
         );
         assert_eq!(
             broker
@@ -2472,7 +2696,7 @@ mod tests {
                 .unwrap(),
             VoiceIntentTranscriptOutcome::Ignored
         );
-        assert_eq!(messenger.messages().len(), 1);
+        assert_eq!(messenger.messages().len(), 2);
 
         assert_eq!(
             broker
@@ -2488,14 +2712,12 @@ mod tests {
                 })
                 .await
                 .unwrap(),
-            VoiceIntentTranscriptOutcome::Confirmation(
-                VoiceIntentSpokenConfirmationOutcome {
-                    outcome: VoiceIntentTextOutcome::Dispatched,
-                    speech_feedback: Some("已送出。".to_string()),
-                }
-            )
+            VoiceIntentTranscriptOutcome::Confirmation(VoiceIntentSpokenConfirmationOutcome {
+                outcome: VoiceIntentTextOutcome::Dispatched,
+                speech_feedback: Some("已送出。".to_string()),
+            })
         );
-        assert_eq!(messenger.messages().len(), 2);
+        assert_eq!(messenger.messages().len(), 3);
     }
 
     #[tokio::test]
@@ -2531,7 +2753,7 @@ mod tests {
 
         assert_eq!(
             broker
-                .handle_text_message(100, 200, 300, "不是")
+                .handle_text_message(100, 200, 300, "取消")
                 .await
                 .unwrap(),
             VoiceIntentTextOutcome::Cancelled
@@ -2890,7 +3112,7 @@ mod tests {
         propose(&broker, current).await;
         assert_eq!(
             broker
-                .handle_text_message(100, 200, 300, "不是")
+                .handle_text_message(100, 200, 300, "取消")
                 .await
                 .unwrap(),
             VoiceIntentTextOutcome::Cancelled

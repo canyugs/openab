@@ -313,8 +313,7 @@ Can, in the Voice Channel:
   "叫 Sam 看 canyugs/openab issue 20"
 
 OpenAB, in the pinned text channel and, when TTS is enabled, in Voice:
-  "我理解為：要請 Sam 看 canyugs/openab#20 嗎？
-   請回覆「對」、「不是」，或用「更正：...」修正。"
+  "要請 Sam 看 canyugs/openab#20，對嗎？"
 
 Can, in Voice or text:
   "對"
@@ -342,8 +341,7 @@ Can, in the Voice Channel:
   "請先查看 Open App取得issue 1368整理目前行作方向"
 
 Aragorn, in the pinned text destination and, when TTS is enabled, in Voice:
-  "我理解為：由我直接處理『先查看 Open App取得issue 1368整理目前行作方向』，對嗎？
-   請回覆「對」、「不是」，或用「更正：...」修正。"
+  "由我直接處理『先查看 Open App取得issue 1368整理目前行作方向』，對嗎？"
 
 Can, in Voice or text:
   "對"
@@ -358,6 +356,17 @@ Aragorn:
 Aragorn, in Voice when TTS is enabled:
   "好的，我開始處理。"
 ```
+
+The confirmation is conversational rather than command-shaped:
+
+- `對` confirms and starts the task;
+- `不是` or `不對` rejects the paraphrase but keeps the draft open, and the
+  broker asks what should change;
+- the operator can then speak the replacement naturally, for example
+  `我是說查 OpenAI`; a `更正：` prefix is optional;
+- `取消` or `算了` abandons the draft;
+- short idle acknowledgements such as `嗯`, `好的`, and `謝謝` do not become
+  new tasks when no draft is pending.
 
 When the pinned destination is an ordinary text/news channel, the audit message
 anchors a dedicated task thread and ACP replies there. If `/voice join` was run

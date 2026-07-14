@@ -453,13 +453,17 @@ While `WaitingConfirmation`, new final STT segments from the same voice-session
 generation are interpreted as:
 
 - affirmative;
-- negative;
-- correction; or
-- unrelated speech.
+- rejection without cancellation;
+- explicit cancellation; or
+- a natural-language replacement.
 
-Unrelated speech leaves the intent pending. A correction replaces the intent
-and asks again. This path is implemented through the same deterministic state
-transition as text confirmation; live Discord Voice validation is still pending.
+`對` confirms. `不是` or `不對` rejects the paraphrase, keeps the draft open,
+and prompts for the corrected intent. The next meaningful utterance replaces
+the draft without requiring a `更正：` command prefix. Only explicit cancellation
+such as `取消` or `算了` abandons it. When no draft is pending, short idle
+acknowledgements such as `嗯`, `好的`, and `謝謝` are ignored instead of becoming
+new local tasks. This path uses the same deterministic state transitions as text
+confirmation.
 
 ### 8.3 Slice 3: TTS prompt and feedback
 
@@ -670,8 +674,10 @@ pending. This is the first hands-free daily milestone.**
    configured-target matches never create a Discord delegation; with local
    default enabled, the full utterance remains a confirmed raw local task.
 5. Explicit yes queues one local task or posts one real mention exactly once.
-6. Explicit no abandons without execution or dispatch.
-7. A correction replaces the task and may explicitly switch destinations.
+6. A rejection keeps the draft open; explicit cancellation abandons without
+   execution or dispatch.
+7. A natural correction replaces the task without requiring command syntax and
+   may explicitly switch destinations.
 8. Timeout, `/voice stop`, or session replacement abandons the pending intent.
 9. Duplicate STT/provider events cannot route the task twice.
 10. A model proposal alone cannot execute or dispatch.
@@ -691,7 +697,8 @@ pending. This is the first hands-free daily milestone.**
 
 15. The operator hears the semantic paraphrase and can answer without looking
     at Discord after Slice 3.
-16. "對", "不是", and a corrected task are distinguished consistently.
+16. "對", rejection, explicit cancellation, and a corrected task are
+    distinguished consistently.
 17. The bot does not hear its own TTS as an affirmative confirmation.
 18. Confirmation, sent, cancelled, and error speech is short and bounded;
     `/voice stop` terminates playback cleanly while conversational barge-in is

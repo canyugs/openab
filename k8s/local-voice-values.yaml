@@ -11,7 +11,7 @@ agents:
 
   voice:
     enabled: true
-    image: localhost:5555/openab:claude-tts-pcm
+    image: localhost:5555/openab:claude-voice-dialogue
     workingDir: /home/node
 
     env:
