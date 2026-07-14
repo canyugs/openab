@@ -215,6 +215,33 @@ mod tests {
     }
 
     #[test]
+    fn songbird_can_parse_and_decode_the_pcm_input() {
+        let audio =
+            DiscordVoiceSpeechAudio::from_wav(&pcm16_wav(24_000, 1, &vec![i16::MAX; 24_000]))
+                .unwrap();
+        let input = audio.into_songbird_input();
+        let Input::Live(live, _) = input else {
+            panic!("raw adapter must produce live input");
+        };
+        let songbird::input::LiveInput::Parsed(mut parsed) = live
+            .promote(
+                songbird::input::codecs::get_codec_registry(),
+                songbird::input::codecs::get_probe(),
+            )
+            .unwrap()
+        else {
+            panic!("raw input must promote to parsed input");
+        };
+
+        let packet = parsed.format.next_packet().unwrap();
+        let decoded = parsed.decoder.decode(&packet).unwrap();
+
+        assert_eq!(decoded.spec().rate, 24_000);
+        assert_eq!(decoded.spec().channels.count(), 1);
+        assert_eq!(decoded.frames(), 480);
+    }
+
+    #[test]
     fn rejects_unsupported_and_truncated_wav() {
         let mut unsupported = pcm16_wav(24_000, 1, &[0]);
         unsupported[20..22].copy_from_slice(&6_u16.to_le_bytes());
