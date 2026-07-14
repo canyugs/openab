@@ -28,16 +28,28 @@ impl DiscordVoiceSpeechAudio {
         let mut cursor = 12_usize;
         while cursor.checked_add(8).is_some_and(|end| end <= wav.len()) {
             let chunk_id = &wav[cursor..cursor + 4];
-            let chunk_len = u32::from_le_bytes(
+            let declared_chunk_len = u32::from_le_bytes(
                 wav[cursor + 4..cursor + 8]
                     .try_into()
                     .expect("WAV chunk length has four bytes"),
-            ) as usize;
+            );
             let chunk_start = cursor + 8;
-            let chunk_end = chunk_start
-                .checked_add(chunk_len)
-                .context("WAV chunk length overflow")?;
-            ensure!(chunk_end <= wav.len(), "truncated WAV chunk");
+            let streaming_data = declared_chunk_len == u32::MAX && chunk_id == b"data";
+            let chunk_end = if streaming_data {
+                // OpenAI's low-latency WAV response uses 0xffffffff for the
+                // data size because the final length is unknown when the
+                // streaming header is emitted. The completed HTTP body is the
+                // authoritative boundary in that representation.
+                wav.len()
+            } else {
+                let chunk_len = usize::try_from(declared_chunk_len)
+                    .context("WAV chunk length does not fit usize")?;
+                let chunk_end = chunk_start
+                    .checked_add(chunk_len)
+                    .context("WAV chunk length overflow")?;
+                ensure!(chunk_end <= wav.len(), "truncated WAV chunk");
+                chunk_end
+            };
 
             match chunk_id {
                 b"fmt " if format.is_none() => {
@@ -46,9 +58,13 @@ impl DiscordVoiceSpeechAudio {
                 b"data" if data.is_none() => data = Some(&wav[chunk_start..chunk_end]),
                 _ => {}
             }
-            cursor = chunk_end
-                .checked_add(chunk_len % 2)
-                .context("WAV chunk padding overflow")?;
+            cursor = if streaming_data {
+                chunk_end
+            } else {
+                chunk_end
+                    .checked_add((declared_chunk_len % 2) as usize)
+                    .context("WAV chunk padding overflow")?
+            };
         }
 
         let format = format.context("WAV payload has no fmt chunk")?;
@@ -178,6 +194,20 @@ mod tests {
         let audio =
             DiscordVoiceSpeechAudio::from_wav(&pcm16_wav(24_000, 1, &vec![i16::MAX; 24_000]))
                 .unwrap();
+        assert_eq!(audio.sample_rate, 24_000);
+        assert_eq!(audio.channels, 1);
+        assert_eq!(audio.samples.len(), 24_000);
+        assert_eq!(audio.duration(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn decodes_streaming_wav_with_unknown_riff_and_data_lengths() {
+        let mut wav = pcm16_wav(24_000, 1, &vec![i16::MAX; 24_000]);
+        wav[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        wav[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let audio = DiscordVoiceSpeechAudio::from_wav(&wav).unwrap();
+
         assert_eq!(audio.sample_rate, 24_000);
         assert_eq!(audio.channels, 1);
         assert_eq!(audio.samples.len(), 24_000);
