@@ -11,7 +11,7 @@ agents:
 
   voice:
     enabled: true
-    image: localhost:5555/openab:claude-voice-dialogue
+    image: localhost:5555/openab:claude-voice-llm-dialogue
     workingDir: /home/node
 
     env:
@@ -54,6 +54,13 @@ agents:
       enabled = true
       confirmation_timeout_seconds = 30
       default_to_local = true
+
+      [discord.voice.intent.interpreter]
+      enabled = true
+      api_key = "${TTS_API_KEY}"
+      model = "gpt-4o-mini"
+      base_url = "https://api.openai.com/v1"
+      request_timeout_seconds = 8
 
       [discord.voice.intent.targets.sam]
       discord_user_id = "1514670865412002014"

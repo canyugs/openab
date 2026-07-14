@@ -8,6 +8,10 @@
 //! exactly-once transition before any network request is awaited.
 
 use crate::config::DiscordVoiceIntentConfig;
+use crate::discord_voice_interpreter::{
+    OpenAiVoiceTurnInterpreter, VoiceTurnDecision, VoiceTurnInput, VoiceTurnInterpreter,
+    VoiceTurnPhase,
+};
 use crate::discord_voice_runtime::VoiceSessionToken;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -72,6 +76,9 @@ pub enum VoiceIntentTranscriptOutcome {
     /// A new proposal was stored and its idempotent confirmation post started.
     /// `speech_prompt` is a bounded plain-text projection suitable for TTS.
     Proposed { speech_prompt: String },
+    /// A conversational response that does not create, revise, or execute an
+    /// intent. The text audit has already been posted by the broker.
+    Reply { speech: String },
     /// A spoken confirmation was handled through the same state transition and
     /// side-effect path as a text confirmation. Callers must handle
     /// [`VoiceIntentTextOutcome::ExecuteLocal`] through the local ACP runtime.
@@ -204,6 +211,7 @@ pub struct DiscordVoiceIntentBroker {
     default_to_local: bool,
     confirmation_timeout: Duration,
     targets: Vec<IntentTarget>,
+    interpreter: Option<Arc<dyn VoiceTurnInterpreter>>,
     messenger: Arc<dyn VoiceIntentMessenger>,
     state: Mutex<BrokerState>,
 }
@@ -212,6 +220,21 @@ impl DiscordVoiceIntentBroker {
     pub fn new(
         config: DiscordVoiceIntentConfig,
         messenger: Arc<dyn VoiceIntentMessenger>,
+    ) -> Result<Arc<Self>> {
+        let interpreter: Option<Arc<dyn VoiceTurnInterpreter>> = if config.interpreter.enabled {
+            Some(Arc::new(OpenAiVoiceTurnInterpreter::new(
+                &config.interpreter,
+            )?))
+        } else {
+            None
+        };
+        Self::new_with_interpreter(config, messenger, interpreter)
+    }
+
+    fn new_with_interpreter(
+        config: DiscordVoiceIntentConfig,
+        messenger: Arc<dyn VoiceIntentMessenger>,
+        interpreter: Option<Arc<dyn VoiceTurnInterpreter>>,
     ) -> Result<Arc<Self>> {
         // The parent voice configuration is validated by the caller. Passing
         // `true` here still gives this standalone subsystem strict validation.
@@ -249,6 +272,7 @@ impl DiscordVoiceIntentBroker {
             default_to_local,
             confirmation_timeout: Duration::from_secs(config.confirmation_timeout_seconds.max(1)),
             targets,
+            interpreter,
             messenger,
             state: Mutex::new(BrokerState::default()),
         }))
@@ -256,6 +280,10 @@ impl DiscordVoiceIntentBroker {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn interpreter_enabled(&self) -> bool {
+        self.interpreter.is_some()
     }
 
     /// Mark a local ACP handoff as accepted by the in-process execution queue.
@@ -402,6 +430,89 @@ impl DiscordVoiceIntentBroker {
     }
 
     /// Propose an intent from one accepted, finalized STT segment.
+    async fn interpret_turn(&self, event: &FinalTranscriptEvent) -> Option<InterpretedTurn> {
+        let interpreter = self.interpreter.as_ref()?;
+        let (snapshot, phase) = {
+            let state = self.lock_state();
+            let bound = state.sessions.get(&event.token.guild_id())?;
+            if bound.token != event.token
+                || bound.control_channel_id != event.control_channel_id
+                || bound.operator_user_id != event.key.speaker_id
+            {
+                return None;
+            }
+            match bound.pending.as_ref() {
+                None => (InterpreterSnapshot::Idle, VoiceTurnPhase::Idle),
+                Some(pending) if pending.phase == PendingPhase::WaitingConfirmation => (
+                    InterpreterSnapshot::Waiting {
+                        intent_id: pending.id,
+                        revision: pending.revision,
+                    },
+                    VoiceTurnPhase::WaitingConfirmation {
+                        destination: self.destination_name(pending.proposal.destination),
+                        task: pending.proposal.task.clone(),
+                    },
+                ),
+                Some(_) => return None,
+            }
+        };
+        let mut available_destinations = Vec::with_capacity(self.targets.len() + 1);
+        if self.default_to_local {
+            available_destinations.push("local".to_string());
+        }
+        available_destinations.extend(self.targets.iter().map(|target| target.canonical.clone()));
+        let input = VoiceTurnInput {
+            transcript: event.text.clone(),
+            phase,
+            available_destinations,
+        };
+        match interpreter.interpret(&input).await {
+            Ok(decision) => Some(InterpretedTurn { snapshot, decision }),
+            Err(error) => {
+                warn!(error = %error, "voice turn interpreter failed; using deterministic fallback");
+                None
+            }
+        }
+    }
+
+    fn destination_name(&self, destination: IntentDestination) -> String {
+        match destination {
+            IntentDestination::Local => "local".to_string(),
+            IntentDestination::Delegate { target_index } => {
+                self.targets[target_index].canonical.clone()
+            }
+        }
+    }
+
+    fn interpreted_proposal(&self, destination: &str, task: &str) -> Option<IntentProposal> {
+        let task = clean_task(task)?;
+        let normalized = normalize_for_matching(destination);
+        let destination = if normalized == "local" {
+            self.default_to_local.then_some(IntentDestination::Local)?
+        } else {
+            let target_index = self.targets.iter().position(|target| {
+                normalize_for_matching(&target.canonical) == normalized
+                    || target.aliases.iter().any(|alias| alias == &normalized)
+            })?;
+            IntentDestination::Delegate { target_index }
+        };
+        Some(IntentProposal { destination, task })
+    }
+
+    fn interpretation_is_current(bound: &BoundSession, snapshot: InterpreterSnapshot) -> bool {
+        match snapshot {
+            InterpreterSnapshot::Idle => bound.pending.is_none(),
+            InterpreterSnapshot::Waiting {
+                intent_id,
+                revision,
+            } => bound.pending.as_ref().is_some_and(|pending| {
+                pending.id == intent_id
+                    && pending.revision == revision
+                    && pending.phase == PendingPhase::WaitingConfirmation
+            }),
+        }
+    }
+
     pub async fn handle_final_transcript(
         self: &Arc<Self>,
         event: FinalTranscriptEvent,
@@ -411,6 +522,11 @@ impl DiscordVoiceIntentBroker {
         }
 
         let confirmation = classify_confirmation(&event.text);
+        let interpreted = if matches!(confirmation, Confirmation::Unrelated) {
+            self.interpret_turn(&event).await
+        } else {
+            None
+        };
         let raw_proposal = self.resolve_proposal(&event.text);
 
         let effect = {
@@ -442,41 +558,113 @@ impl DiscordVoiceIntentBroker {
                     ));
                 }
 
-                // Once a spoken draft is pending, the next meaningful operator
-                // utterance is part of that dialogue. Exact confirmation and
-                // cancellation phrases take the fast path; everything else is
-                // a natural-language replacement for the current draft.
-                let conversational = match confirmation {
-                    Confirmation::Unrelated => Confirmation::Correction(event.text.trim()),
-                    classified => classified,
-                };
-                TranscriptEffect::Apply(self.confirmation_effect(bound, current, conversational))
-            } else {
-                let Some(raw_proposal) = raw_proposal else {
-                    return Ok(VoiceIntentTranscriptOutcome::Ignored);
-                };
-                let Some(proposal) = self.canonicalize_proposal(bound, raw_proposal) else {
-                    return Ok(VoiceIntentTranscriptOutcome::Ignored);
-                };
-                // Record every valid, unambiguous operator proposal before
-                // storing it. A delayed replay therefore cannot become a fresh
-                // command after the current intent completes.
-                if !record_transcript_key(bound, event.key) {
-                    return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                let current_interpretation = interpreted
+                    .as_ref()
+                    .filter(|turn| Self::interpretation_is_current(bound, turn.snapshot));
+                match current_interpretation.map(|turn| &turn.decision) {
+                    Some(VoiceTurnDecision::Ignore) => {
+                        return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                    }
+                    Some(VoiceTurnDecision::Reply { speech }) => {
+                        TranscriptEffect::Reply(ConversationalReply {
+                            control_channel_id: bound.control_channel_id,
+                            operator_user_id: bound.operator_user_id,
+                            speech: speech.clone(),
+                        })
+                    }
+                    interpreted_decision => {
+                        // Exact confirmation phrases take the deterministic fast
+                        // path. Otherwise a current model decision enters the
+                        // same Rust-owned state transition as text confirmation.
+                        let conversational = match interpreted_decision {
+                            Some(VoiceTurnDecision::Accept) => Confirmation::Affirmative,
+                            Some(VoiceTurnDecision::Reject) => Confirmation::Reject,
+                            Some(VoiceTurnDecision::Cancel) => Confirmation::Cancel,
+                            Some(VoiceTurnDecision::Propose { destination, task })
+                            | Some(VoiceTurnDecision::Revise { destination, task }) => self
+                                .interpreted_proposal(destination, task)
+                                .map(Confirmation::InterpretedCorrection)
+                                .unwrap_or_else(|| Confirmation::Correction(event.text.trim())),
+                            Some(VoiceTurnDecision::Ignore | VoiceTurnDecision::Reply { .. }) => {
+                                unreachable!("non-stateful model decisions handled above")
+                            }
+                            None => match confirmation {
+                                Confirmation::Unrelated => {
+                                    Confirmation::Correction(event.text.trim())
+                                }
+                                classified => classified,
+                            },
+                        };
+                        TranscriptEffect::Apply(self.confirmation_effect(
+                            bound,
+                            current,
+                            conversational,
+                        ))
+                    }
                 }
+            } else {
+                let current_interpretation = interpreted
+                    .as_ref()
+                    .filter(|turn| Self::interpretation_is_current(bound, turn.snapshot));
+                match current_interpretation.map(|turn| &turn.decision) {
+                    Some(VoiceTurnDecision::Ignore) => {
+                        record_transcript_key(bound, event.key);
+                        return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                    }
+                    Some(VoiceTurnDecision::Reply { speech }) => {
+                        if !record_transcript_key(bound, event.key) {
+                            return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                        }
+                        TranscriptEffect::Reply(ConversationalReply {
+                            control_channel_id: bound.control_channel_id,
+                            operator_user_id: bound.operator_user_id,
+                            speech: speech.clone(),
+                        })
+                    }
+                    Some(
+                        VoiceTurnDecision::Accept
+                        | VoiceTurnDecision::Reject
+                        | VoiceTurnDecision::Cancel,
+                    ) => {
+                        record_transcript_key(bound, event.key);
+                        return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                    }
+                    interpreted_decision => {
+                        let interpreted_proposal = match interpreted_decision {
+                            Some(VoiceTurnDecision::Propose { destination, task })
+                            | Some(VoiceTurnDecision::Revise { destination, task }) => {
+                                self.interpreted_proposal(destination, task)
+                            }
+                            _ => None,
+                        };
+                        let raw_proposal = interpreted_proposal.or(raw_proposal);
+                        let Some(raw_proposal) = raw_proposal else {
+                            return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                        };
+                        let Some(proposal) = self.canonicalize_proposal(bound, raw_proposal) else {
+                            return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                        };
+                        // Record every valid, unambiguous operator proposal before
+                        // storing it. A delayed replay therefore cannot become a fresh
+                        // command after the current intent completes.
+                        if !record_transcript_key(bound, event.key) {
+                            return Ok(VoiceIntentTranscriptOutcome::Ignored);
+                        }
 
-                let intent = PendingIntent {
-                    id: Uuid::new_v4(),
-                    revision: bound.next_revision,
-                    waiting_epoch: 0,
-                    proposal,
-                    phase: PendingPhase::PostingConfirmation,
-                    confirmation_message_id: None,
-                };
-                bound.next_revision = bound.next_revision.saturating_add(1);
-                let confirmation = PendingMessage::from_bound(bound, intent.clone());
-                bound.pending = Some(intent);
-                TranscriptEffect::Post(confirmation)
+                        let intent = PendingIntent {
+                            id: Uuid::new_v4(),
+                            revision: bound.next_revision,
+                            waiting_epoch: 0,
+                            proposal,
+                            phase: PendingPhase::PostingConfirmation,
+                            confirmation_message_id: None,
+                        };
+                        bound.next_revision = bound.next_revision.saturating_add(1);
+                        let confirmation = PendingMessage::from_bound(bound, intent.clone());
+                        bound.pending = Some(intent);
+                        TranscriptEffect::Post(confirmation)
+                    }
+                }
             }
         };
 
@@ -507,6 +695,19 @@ impl DiscordVoiceIntentBroker {
                         speech_feedback,
                     },
                 ))
+            }
+            TranscriptEffect::Reply(reply) => {
+                let content = bounded_discord_message(format!(
+                    "<@{}> {}",
+                    reply.operator_user_id, reply.speech
+                ));
+                self.messenger
+                    .send_message(reply.control_channel_id, &content, None)
+                    .await
+                    .context("failed to post conversational Discord voice reply")?;
+                Ok(VoiceIntentTranscriptOutcome::Reply {
+                    speech: reply.speech,
+                })
             }
         }
     }
@@ -591,6 +792,24 @@ impl DiscordVoiceIntentBroker {
                     .resolve_correction(&current.proposal, correction)
                     .and_then(|proposal| self.canonicalize_proposal(bound, proposal))
                 {
+                    let revised_intent = PendingIntent {
+                        id: Uuid::new_v4(),
+                        revision: bound.next_revision,
+                        waiting_epoch: 0,
+                        proposal,
+                        phase: PendingPhase::PostingConfirmation,
+                        confirmation_message_id: None,
+                    };
+                    bound.next_revision = bound.next_revision.saturating_add(1);
+                    let revised = PendingMessage::from_bound(bound, revised_intent.clone());
+                    bound.pending = Some(revised_intent);
+                    TextEffect::Correct(revised)
+                } else {
+                    TextEffect::RejectCorrection(PendingMessage::from_bound(bound, current))
+                }
+            }
+            Confirmation::InterpretedCorrection(proposal) => {
+                if let Some(proposal) = self.canonicalize_proposal(bound, proposal) {
                     let revised_intent = PendingIntent {
                         id: Uuid::new_v4(),
                         revision: bound.next_revision,
@@ -1310,6 +1529,13 @@ struct PendingMessage {
     intent: PendingIntent,
 }
 
+#[derive(Debug)]
+struct ConversationalReply {
+    control_channel_id: u64,
+    operator_user_id: u64,
+    speech: String,
+}
+
 impl PendingMessage {
     fn from_bound(bound: &BoundSession, intent: PendingIntent) -> Self {
         Self {
@@ -1350,6 +1576,7 @@ enum TextEffect {
 enum TranscriptEffect {
     Post(PendingMessage),
     Apply(TextEffect),
+    Reply(ConversationalReply),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1358,7 +1585,19 @@ enum Confirmation<'a> {
     Reject,
     Cancel,
     Correction(&'a str),
+    InterpretedCorrection(IntentProposal),
     Unrelated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterpreterSnapshot {
+    Idle,
+    Waiting { intent_id: Uuid, revision: u64 },
+}
+
+struct InterpretedTurn {
+    snapshot: InterpreterSnapshot,
+    decision: VoiceTurnDecision,
 }
 
 fn classify_confirmation(content: &str) -> Confirmation<'_> {
@@ -1886,7 +2125,7 @@ mod tests {
     use super::*;
     use crate::config::DiscordVoiceIntentTargetConfig;
     use anyhow::anyhow;
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::Notify;
 
@@ -2016,11 +2255,48 @@ mod tests {
         }
     }
 
+    struct StubInterpreter {
+        decisions: Mutex<VecDeque<VoiceTurnDecision>>,
+        inputs: Mutex<Vec<VoiceTurnInput>>,
+    }
+
+    impl StubInterpreter {
+        fn new(decisions: Vec<VoiceTurnDecision>) -> Arc<Self> {
+            Arc::new(Self {
+                decisions: Mutex::new(decisions.into()),
+                inputs: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn inputs(&self) -> Vec<VoiceTurnInput> {
+            self.inputs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl VoiceTurnInterpreter for StubInterpreter {
+        async fn interpret(&self, input: &VoiceTurnInput) -> Result<VoiceTurnDecision> {
+            self.inputs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(input.clone());
+            self.decisions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .context("stub interpreter ran out of decisions")
+        }
+    }
+
     fn intent_config(timeout_seconds: u64) -> DiscordVoiceIntentConfig {
         DiscordVoiceIntentConfig {
             enabled: true,
             confirmation_timeout_seconds: timeout_seconds,
             default_to_local: false,
+            interpreter: crate::config::VoiceIntentInterpreterConfig::default(),
             targets: BTreeMap::from([
                 (
                     "B0".to_string(),
@@ -2059,6 +2335,28 @@ mod tests {
         let broker = DiscordVoiceIntentBroker::new(config, messenger.clone())
             .expect("valid local-first test broker");
         (broker, messenger)
+    }
+
+    fn interpreted_local_broker(
+        decisions: Vec<VoiceTurnDecision>,
+    ) -> (
+        Arc<DiscordVoiceIntentBroker>,
+        Arc<FakeMessenger>,
+        Arc<StubInterpreter>,
+    ) {
+        let messenger = Arc::new(FakeMessenger::default());
+        let interpreter = StubInterpreter::new(decisions);
+        let mut config = intent_config(30);
+        config.default_to_local = true;
+        config.interpreter.enabled = true;
+        config.interpreter.api_key = "test".into();
+        let broker = DiscordVoiceIntentBroker::new_with_interpreter(
+            config,
+            messenger.clone(),
+            Some(interpreter.clone()),
+        )
+        .expect("valid interpreted test broker");
+        (broker, messenger, interpreter)
     }
 
     async fn propose(broker: &Arc<DiscordVoiceIntentBroker>, token: VoiceSessionToken) {
@@ -2252,6 +2550,145 @@ mod tests {
             VoiceIntentTranscriptOutcome::Ignored
         );
         assert!(messenger.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interpreter_can_reply_without_creating_or_executing_an_intent() {
+        let (broker, messenger, interpreter) =
+            interpreted_local_broker(vec![VoiceTurnDecision::Reply {
+                speech: "不客氣，路上小心。".into(),
+            }]);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 100,
+                        end_frame: 200,
+                    },
+                    text: "謝啦".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Reply {
+                speech: "不客氣，路上小心。".into(),
+            }
+        );
+        assert_eq!(interpreter.inputs().len(), 1);
+        assert!(matches!(
+            interpreter.inputs()[0].phase,
+            VoiceTurnPhase::Idle
+        ));
+        let messages = messenger.messages();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("不客氣，路上小心"));
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "對")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::NotApplicable
+        );
+    }
+
+    #[tokio::test]
+    async fn interpreter_can_ignore_idle_speech_without_an_audit_message() {
+        let (broker, messenger, _) = interpreted_local_broker(vec![VoiceTurnDecision::Ignore]);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 100,
+                        end_frame: 200,
+                    },
+                    text: "我只是在跟旁邊的人說話".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Ignored
+        );
+        assert!(messenger.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interpreter_proposal_and_revision_still_require_rust_confirmation() {
+        let (broker, messenger, interpreter) = interpreted_local_broker(vec![
+            VoiceTurnDecision::Propose {
+                destination: "B0".into(),
+                task: "查看 issue 1368".into(),
+            },
+            VoiceTurnDecision::Revise {
+                destination: "B0".into(),
+                task: "查看 issue 1364".into(),
+            },
+        ]);
+        let current = token(100, 1);
+        broker.bind_session(current, 200, 300, "Can");
+
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 100,
+                        end_frame: 200,
+                    },
+                    text: "先幫我看看那個 issue".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Proposed {
+                speech_prompt: "要請 B0 查看 issue 1368，對嗎？".into(),
+            }
+        );
+        assert_eq!(
+            broker
+                .handle_final_transcript(FinalTranscriptEvent {
+                    token: current,
+                    control_channel_id: 200,
+                    key: TranscriptKey {
+                        speaker_id: 300,
+                        start_frame: 300,
+                        end_frame: 400,
+                    },
+                    text: "剛剛那個編號應該是別的".to_string(),
+                })
+                .await
+                .unwrap(),
+            VoiceIntentTranscriptOutcome::Confirmation(VoiceIntentSpokenConfirmationOutcome {
+                outcome: VoiceIntentTextOutcome::Corrected,
+                speech_feedback: Some("要請 B0 查看 issue 1364，對嗎？".into()),
+            })
+        );
+        assert_eq!(interpreter.inputs().len(), 2);
+        assert!(matches!(
+            interpreter.inputs()[1].phase,
+            VoiceTurnPhase::WaitingConfirmation { .. }
+        ));
+        assert_eq!(
+            broker
+                .handle_text_message(100, 200, 300, "對")
+                .await
+                .unwrap(),
+            VoiceIntentTextOutcome::Dispatched
+        );
+        assert!(messenger
+            .messages()
+            .last()
+            .is_some_and(|message| message.content.contains("查看 issue 1364")));
     }
 
     #[test]

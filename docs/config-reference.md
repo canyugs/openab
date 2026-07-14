@@ -125,6 +125,33 @@ behavior unchanged.
 | `confirmation_timeout_seconds` | u64 | `30` | Time allowed for the operator's text yes, no, or correction. Expiration abandons the pending intent and never dispatches it automatically. |
 | `default_to_local` | bool | `false` | When `true`, every non-empty final operator transcript that is not an unambiguous configured-target request becomes a local candidate. After confirmation, its raw text enters this bot's existing Dispatcher/ACP path for LLM interpretation. The default preserves explicit-target-only behavior. |
 
+#### `[discord.voice.intent.interpreter]` (experimental)
+
+Optional OpenAI Responses-compatible dialogue interpretation. The model receives
+only the current transcript, pending semantic intent, and configured destination
+names. It returns a strict structured decision (`ignore`, `reply`, `propose`,
+`revise`, `accept`, `reject`, or `cancel`) and receives no Discord, ACP, shell, or
+filesystem tools. Rust still owns confirmation, audit messages, and exactly-once
+dispatch. If the request fails or returns invalid data, OpenAB falls back to the
+deterministic intent rules.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable the restricted dialogue interpreter. Disabled preserves previous behavior and makes no model request. |
+| `api_key` | string | `""` | Bearer token for the Responses-compatible endpoint. Required when enabled. Use `${VOICE_LLM_API_KEY}` or another environment expansion. |
+| `model` | string | `"gpt-4o-mini"` | Structured-output-capable model used for the low-latency dialogue decision. |
+| `base_url` | string | `"https://api.openai.com/v1"` | Provider base URL; OpenAB calls `<base_url>/responses`. |
+| `request_timeout_seconds` | u64 | `8` | Hard timeout before deterministic fallback. |
+
+```toml
+[discord.voice.intent.interpreter]
+enabled = true
+api_key = "${VOICE_LLM_API_KEY}"
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+request_timeout_seconds = 8
+```
+
 Targets form a registry keyed by a stable canonical name:
 
 ```toml
@@ -154,7 +181,7 @@ utterance remains a local candidate. Any other non-empty operator utterance uses
 this bot's existing Dispatcher/ACP path after confirmation when
 `default_to_local = true`.
 
-Both routes require one Discord text confirmation. For local execution, a normal
+Both routes require one semantic confirmation in speech or Discord text. For local execution, a normal
 text control channel gets a dedicated task thread; an existing thread or a Voice
 Channel's text chat is used directly. Spoken confirmation and optional Voice
 Channel TTS are implemented separately; delegated-result observation remains a

@@ -1166,6 +1166,7 @@ async fn handle_voice_intent_outcome(
 ) {
     let feedback = match outcome {
         VoiceIntentTranscriptOutcome::Proposed { speech_prompt } => Some(speech_prompt),
+        VoiceIntentTranscriptOutcome::Reply { speech } => Some(speech),
         VoiceIntentTranscriptOutcome::Confirmation(confirmation) => {
             let mut feedback = confirmation.speech_feedback;
             if let VoiceIntentTextOutcome::ExecuteLocal(request) = confirmation.outcome {
@@ -1432,6 +1433,7 @@ mod tests {
             enabled: true,
             confirmation_timeout_seconds: 30,
             default_to_local: false,
+            interpreter: crate::config::VoiceIntentInterpreterConfig::default(),
             targets: BTreeMap::from([(
                 "B0".to_string(),
                 DiscordVoiceIntentTargetConfig {
@@ -1615,6 +1617,7 @@ mod tests {
             enabled: true,
             confirmation_timeout_seconds: 30,
             default_to_local: false,
+            interpreter: crate::config::VoiceIntentInterpreterConfig::default(),
             targets: BTreeMap::from([(
                 "B0".to_string(),
                 DiscordVoiceIntentTargetConfig {
@@ -1663,6 +1666,10 @@ mod tests {
         .expect("slow Discord delivery must not block the transcript producer");
 
         drop(tx);
+        messenger.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), messenger.entered.notified())
+            .await
+            .expect("intent worker should process the queued correction");
         messenger.release.notify_one();
         tokio::time::timeout(Duration::from_secs(1), worker)
             .await

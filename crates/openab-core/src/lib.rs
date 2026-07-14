@@ -8,6 +8,8 @@ pub mod cron;
 pub mod directives;
 pub mod dispatch;
 pub mod error_display;
+#[cfg(feature = "filestore")]
+pub mod filestore;
 pub mod format;
 pub mod gateway;
 pub mod hooks;
@@ -16,8 +18,6 @@ pub mod media;
 pub mod multibot_cache;
 #[cfg(feature = "pre-seed")]
 pub mod pre_seed;
-#[cfg(feature = "filestore")]
-pub mod filestore;
 pub mod reactions;
 #[cfg(feature = "discord")]
 pub mod remind;
@@ -25,9 +25,11 @@ pub mod secrets;
 pub mod setup;
 pub mod stt;
 pub mod timestamp;
-pub mod tts;
 pub mod trust;
+pub mod tts;
 
+#[cfg(feature = "discord")]
+pub mod ambient;
 #[cfg(feature = "discord")]
 pub mod discord;
 #[cfg(feature = "discord")]
@@ -35,10 +37,10 @@ pub mod discord_voice;
 #[cfg(feature = "discord")]
 pub mod discord_voice_intent;
 #[cfg(feature = "discord")]
+pub mod discord_voice_interpreter;
+#[cfg(feature = "discord")]
 pub mod discord_voice_runtime;
 #[cfg(feature = "discord")]
 pub mod discord_voice_speech;
-#[cfg(feature = "discord")]
-pub mod ambient;
 #[cfg(feature = "slack")]
 pub mod slack;

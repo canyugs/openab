@@ -368,6 +368,14 @@ The confirmation is conversational rather than command-shaped:
 - short idle acknowledgements such as `嗯`, `好的`, and `謝謝` do not become
   new tasks when no draft is pending.
 
+When `[discord.voice.intent.interpreter]` is enabled, other finalized turns are
+sent to a restricted dialogue model. It may ignore incidental speech, post and
+speak a short conversational reply, or return a structured intent proposal or
+revision. The interpreter has no ACP or Discord action tools: proposals still
+enter the same visible confirmation state, and only Rust can dispatch a confirmed
+intent. API errors, invalid structured output, and timeouts use the deterministic
+rules above as a fallback.
+
 When the pinned destination is an ordinary text/news channel, the audit message
 anchors a dedicated task thread and ACP replies there. If `/voice join` was run
 from an existing thread or from a Voice Channel's text chat, Aragorn uses that

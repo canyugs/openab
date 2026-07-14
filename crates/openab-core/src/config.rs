@@ -602,6 +602,10 @@ pub struct DiscordVoiceIntentConfig {
     /// Disabled by default to preserve explicit-target-only behavior.
     #[serde(default)]
     pub default_to_local: bool,
+    /// Optional LLM turn interpreter. It may classify conversational turns and
+    /// propose bounded intent data, but never receives ACP or Discord tools.
+    #[serde(default)]
+    pub interpreter: VoiceIntentInterpreterConfig,
     /// Canonical target name to Discord bot identity and optional spoken aliases.
     #[serde(default)]
     pub targets: BTreeMap<String, DiscordVoiceIntentTargetConfig>,
@@ -613,6 +617,7 @@ impl Default for DiscordVoiceIntentConfig {
             enabled: false,
             confirmation_timeout_seconds: default_voice_intent_confirmation_timeout_seconds(),
             default_to_local: false,
+            interpreter: VoiceIntentInterpreterConfig::default(),
             targets: BTreeMap::new(),
         }
     }
@@ -640,6 +645,7 @@ impl DiscordVoiceIntentConfig {
             self.default_to_local || !self.targets.is_empty(),
             "discord.voice.intent requires default_to_local = true or at least one target"
         );
+        self.interpreter.validate()?;
 
         let mut aliases = HashMap::<String, String>::new();
         for (canonical, target) in &self.targets {
@@ -670,6 +676,73 @@ impl DiscordVoiceIntentConfig {
 
         Ok(())
     }
+}
+
+/// OpenAI Responses-compatible interpreter for one finalized voice turn.
+///
+/// This is independently opt-in. Existing deployments retain the deterministic
+/// voice-intent parser and make no additional model calls by default.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VoiceIntentInterpreterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_voice_intent_interpreter_model")]
+    pub model: String,
+    #[serde(default = "default_voice_intent_interpreter_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_voice_intent_interpreter_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+}
+
+impl Default for VoiceIntentInterpreterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            model: default_voice_intent_interpreter_model(),
+            base_url: default_voice_intent_interpreter_base_url(),
+            request_timeout_seconds: default_voice_intent_interpreter_timeout_seconds(),
+        }
+    }
+}
+
+impl VoiceIntentInterpreterConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !self.api_key.trim().is_empty(),
+            "discord.voice.intent.interpreter.enabled requires a non-empty api_key"
+        );
+        anyhow::ensure!(
+            !self.model.trim().is_empty(),
+            "discord.voice.intent.interpreter.model must not be blank"
+        );
+        anyhow::ensure!(
+            !self.base_url.trim().is_empty(),
+            "discord.voice.intent.interpreter.base_url must not be blank"
+        );
+        anyhow::ensure!(
+            self.request_timeout_seconds > 0,
+            "discord.voice.intent.interpreter.request_timeout_seconds must be > 0"
+        );
+        Ok(())
+    }
+}
+
+fn default_voice_intent_interpreter_model() -> String {
+    "gpt-4o-mini".into()
+}
+
+fn default_voice_intent_interpreter_base_url() -> String {
+    "https://api.openai.com/v1".into()
+}
+
+fn default_voice_intent_interpreter_timeout_seconds() -> u64 {
+    8
 }
 
 /// One Discord bot that may be addressed by a voice intent.
@@ -2422,6 +2495,7 @@ command = "echo"
         assert_eq!(voice.max_transcript_bytes, 80_000);
         assert!(!voice.intent.enabled);
         assert_eq!(voice.intent.confirmation_timeout_seconds, 30);
+        assert!(!voice.intent.interpreter.enabled);
         assert!(voice.intent.targets.is_empty());
     }
 
@@ -2468,6 +2542,13 @@ enabled = true
 confirmation_timeout_seconds = 45
 default_to_local = true
 
+[discord.voice.intent.interpreter]
+enabled = true
+api_key = "test-key"
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"
+request_timeout_seconds = 7
+
 [discord.voice.intent.targets.sam]
 discord_user_id = "123456789012345678"
 aliases = ["Samuel", "山姆"]
@@ -2480,6 +2561,9 @@ command = "echo"
         assert!(intent.enabled);
         assert_eq!(intent.confirmation_timeout_seconds, 45);
         assert!(intent.default_to_local);
+        assert!(intent.interpreter.enabled);
+        assert_eq!(intent.interpreter.api_key, "test-key");
+        assert_eq!(intent.interpreter.request_timeout_seconds, 7);
         let sam = intent.targets.get("sam").unwrap();
         assert_eq!(sam.discord_user_id, "123456789012345678");
         assert_eq!(sam.aliases, ["Samuel", "山姆"]);
@@ -2490,6 +2574,7 @@ command = "echo"
             enabled: true,
             confirmation_timeout_seconds: 30,
             default_to_local: false,
+            interpreter: VoiceIntentInterpreterConfig::default(),
             targets: BTreeMap::from([(
                 "sam".to_string(),
                 DiscordVoiceIntentTargetConfig {
@@ -2609,9 +2694,24 @@ command = "echo"
             enabled: false,
             confirmation_timeout_seconds: 0,
             default_to_local: false,
+            interpreter: VoiceIntentInterpreterConfig::default(),
             targets: BTreeMap::new(),
         };
         assert!(intent.validate(false).is_ok());
+    }
+
+    #[test]
+    fn discord_voice_interpreter_requires_its_own_runtime_configuration() {
+        let mut intent = valid_voice_intent_config();
+        intent.interpreter.enabled = true;
+        assert!(intent
+            .validate(true)
+            .unwrap_err()
+            .to_string()
+            .contains("interpreter.enabled"));
+
+        intent.interpreter.api_key = "test".into();
+        assert!(intent.validate(true).is_ok());
     }
 
     #[test]

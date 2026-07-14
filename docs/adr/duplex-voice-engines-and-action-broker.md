@@ -200,6 +200,7 @@ without helping the initial intent-confirmation loop.
 | Text-confirmed local ACP execution | **Implemented and live-validated** | On 2026-07-13 a real operator utterance produced a text proposal, confirmation started the existing Dispatcher/Claude ACP path, the agent performed an action, and Discord received the textual result. A confirmed local request uses a stable-nonce audit root and creates a task thread where Discord permits one; Voice Channel text chat executes in the shared channel because Discord cannot nest a thread there. |
 | Text-confirmed target delegation | **Implemented; local sender/receiver startup passed, live handoff pending** | Text yes/no/correction and nonce-enforced real Discord mention dispatch remain wired. The receiver now reuses Voice Channel text chat instead of trying to create an unsupported thread. A real spoken target-agent handoff still requires operator validation. |
 | Spoken yes/no/correction | **Implemented and unit-tested; confirmation loop live-validated** | Final STT from the bound operator resolves the same pending state as text. A real confirmation reached local ACP execution on 2026-07-13; negative, correction, replay, and timeout variants remain covered by automated tests rather than live validation. |
+| Restricted LLM voice-turn interpreter | **Implemented, deployed locally, and API-smoke-tested; live dialogue validation pending** | An opt-in OpenAI Responses-compatible client returns a strict `ignore` / `reply` / `propose` / `revise` / `accept` / `reject` / `cancel` decision. It receives no action tools; Rust validates destinations and continues to own confirmation and dispatch. Invalid, failed, or timed-out decisions fall back to deterministic parsing. |
 | TTS and Songbird playback | **Implemented with local-result Voice Brief; live provider/Voice validation pending** | Opt-in `[tts]` uses an OpenAI-compatible `/audio/speech` endpoint. Local Voice actions require the agent to emit a hidden, bounded `voice_summary`; typed ACP completion is observed only after canonical Discord delivery, and TTS receives the brief rather than arbitrary ACP output. Missing briefs use a generic completion sentence, never the full answer. |
 | Realtime / GPT-Live proposal backend | **Not started** | No Realtime session or tool/event integration exists. |
 | Thread/result observation | **Local typed completion implemented; delegated observation pending** | Local Voice actions attach a one-shot observer to the buffered dispatch and receive the exact typed ACP completion. Polling another bot's Discord thread remains unimplemented. |
@@ -211,11 +212,11 @@ The current LLM-first local-fallback deployment in `docker-desktop/openab-local`
 
 - deployment `openab-voice-voice`: `1/1` ready;
 - pod restarts: `0`;
-- Helm release `openab-voice`: revision `11`, status `deployed`;
+- Helm release `openab-voice`: revision `15`, status `deployed`;
 - image:
-  `localhost:5555/openab:claude-voice-brief-c96ea57`; and
+  `localhost:5555/openab:claude-voice-llm-dialogue`; and
 - image digest:
-  `sha256:1979f2dcea61ac0013ba1817428fe2e78c57906e83de11f71c8c9669e510d618`.
+  `sha256:0764c0f01ab5f73a4bc3ce433e38806fae6c8cef3266f9812cbeafdc1b8ee3a4`.
 
 The local delegated receiver is also healthy:
 
@@ -227,15 +228,16 @@ The local delegated receiver is also healthy:
 - Sam allows both the pinned text channel and the Voice Channel text chat, and
   trusts Aragorn's Discord bot identity.
 
-Startup logs confirm `voice_intent_enabled=true`, Groq STT configuration,
-Aragorn's Discord connection, and global slash-command registration. This
-deployment contains the Slice 2+3 code, but reports `voice_tts_ready=false`
-because the local Secret does not yet contain `TTS_API_KEY`. On 2026-07-13 the
-real operator path from Voice STT through text proposal and confirmation to a
-local Claude ACP action and textual result passed. Sam/Frodo handoff, audible
-playback, result narration, and Realtime remain unvalidated. The previous
-`claude-voice-zh-stt` image predates Slice 1 and is no longer the active local
-artifact.
+Startup logs confirm `voice_intent_enabled=true`,
+`voice_interpreter_enabled=true`, `voice_tts_ready=true`, Groq STT
+configuration, Aragorn's Discord connection, and global slash-command
+registration. An in-pod strict-schema request to the configured OpenAI
+Responses endpoint returned HTTP 200 on 2026-07-15; a real spoken dialogue
+still needs operator validation after rejoining the Voice Channel. On
+2026-07-13 the real operator path from Voice STT through text proposal and
+confirmation to a local Claude ACP action and textual result passed. Sam/Frodo
+handoff and Realtime remain unvalidated. The previous `claude-voice-zh-stt`
+image predates Slice 1 and is no longer the active local artifact.
 
 ### 4.3 Daily-UX readiness
 
@@ -492,6 +494,14 @@ text confirmation path remain usable.
 ## 9. Realtime and GPT-Live Backends
 
 Realtime or GPT-Live sits behind the same `IntentProposal` contract.
+
+The first model-mediated slice does not yet use a persistent Realtime session.
+It calls an OpenAI Responses-compatible endpoint once per nontrivial finalized
+STT turn and requests a strict structured decision. This lets the model decide
+whether to ignore, answer conversationally, propose work, or revise the pending
+intent without receiving action tools. Exact confirmation phrases retain a
+low-latency deterministic path, and any model failure falls back to the existing
+parser.
 
 The only action-proposal model tool/event is equivalent to:
 

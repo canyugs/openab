@@ -1027,6 +1027,9 @@ async fn main() -> anyhow::Result<()> {
             allow_dm = discord_cfg.allow_dm,
             voice_enabled = voice_manager.is_some(),
             voice_intent_enabled = voice_intent_broker.is_some(),
+            voice_interpreter_enabled = voice_intent_broker
+                .as_ref()
+                .is_some_and(|broker| broker.interpreter_enabled()),
             voice_tts_ready = voice_manager
                 .as_ref()
                 .is_some_and(|manager| manager.tts_ready()),
