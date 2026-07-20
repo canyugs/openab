@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/openab-core", "crates/openab-gateway"]
-exclude = ["openab-agent"]
+exclude = ["openab-agent", "crates/platform-schema"]
 
 [package]
 name = "openab"
@@ -24,8 +24,8 @@ async-trait = "0.1"
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend", "cache"], optional = true }
 
 [features]
-# Default: core only (Discord + Slack). Platform adapters are opt-in.
-default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3", "pre-seed"]
+# Default: core only (Discord + Slack). Gateway ships as separate binary.
+default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3", "pre-seed", "filestore"]
 
 # Opt-in: compile all platform adapters into a single unified binary
 unified = ["telegram", "line", "feishu", "googlechat", "wecom", "teams", "vtuber"]
@@ -39,6 +39,7 @@ secrets-aws = ["openab-core/secrets-aws"]
 agentcore = ["openab-core/agentcore"]
 config-s3 = ["openab-core/config-s3"]
 pre-seed = ["openab-core/pre-seed"]
+filestore = ["openab-core/filestore"]
 
 # Platform adapters (each pulls in the gateway crate + axum for embedded server)
 telegram = ["dep:openab-gateway", "dep:axum", "openab-gateway/telegram"]
