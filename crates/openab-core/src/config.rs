@@ -1,6 +1,6 @@
 use crate::markdown::TableMode;
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -1425,6 +1425,52 @@ impl PlatformTrustConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct McpConfigEntry {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpRemoteTransport {
+    Http,
+    Sse,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpRemoteServerConfig {
+    #[serde(rename = "type")]
+    pub transport: McpRemoteTransport,
+    pub name: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<McpConfigEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpStdioServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<McpConfigEntry>,
+}
+
+/// ACP MCP server configuration forwarded to `session/new` and `session/load`.
+///
+/// HTTP/SSE servers carry a `type` discriminator. Stdio servers intentionally
+/// omit it to match the ACP v1 wire schema.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum McpServerConfig {
+    Remote(McpRemoteServerConfig),
+    Stdio(McpStdioServerConfig),
+}
+
 /// Raw intermediate struct for serde — uses `Option` to detect explicit fields.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -1434,6 +1480,7 @@ struct AgentConfigRaw {
     working_dir: String,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
+    mcp_servers: Vec<McpServerConfig>,
 }
 
 impl Default for AgentConfigRaw {
@@ -1444,6 +1491,7 @@ impl Default for AgentConfigRaw {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -1455,6 +1503,7 @@ pub struct AgentConfig {
     pub working_dir: String,
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
+    pub mcp_servers: Vec<McpServerConfig>,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
     pub command_explicit: bool,
 }
@@ -1467,6 +1516,7 @@ impl Default for AgentConfig {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            mcp_servers: Vec::new(),
             command_explicit: false,
         }
     }
@@ -1493,6 +1543,7 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             working_dir: raw.working_dir,
             env: raw.env,
             inherit_env: raw.inherit_env,
+            mcp_servers: raw.mcp_servers,
             command_explicit: cmd_explicit,
         })
     }
@@ -2072,6 +2123,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 working_dir: config.agent.working_dir.clone(),
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
+                mcp_servers: config.agent.mcp_servers.clone(),
                 command_explicit: true, // synthesized counts as explicit
             };
         }
@@ -3629,5 +3681,56 @@ cancel_strategy = "noop"
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
+    }
+
+    #[test]
+    fn agent_mcp_servers_parse_to_acp_wire_shapes() {
+        let cfg = parse_config_str(
+            r#"
+[agent]
+command = "claude-agent-acp"
+
+[[agent.mcp_servers]]
+type = "http"
+name = "github"
+url = "http://octobroker:8080/mcp"
+headers = [
+  { name = "X-Octobroker-Key", value = "test-secret" },
+]
+
+[[agent.mcp_servers]]
+name = "local-tools"
+command = "/usr/local/bin/local-tools"
+args = ["--stdio"]
+env = [
+  { name = "LOCAL_TOKEN", value = "test-local-secret" },
+]
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.agent.mcp_servers.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&cfg.agent.mcp_servers).unwrap(),
+            serde_json::json!([
+                {
+                    "type": "http",
+                    "name": "github",
+                    "url": "http://octobroker:8080/mcp",
+                    "headers": [
+                        {"name": "X-Octobroker-Key", "value": "test-secret"}
+                    ]
+                },
+                {
+                    "name": "local-tools",
+                    "command": "/usr/local/bin/local-tools",
+                    "args": ["--stdio"],
+                    "env": [
+                        {"name": "LOCAL_TOKEN", "value": "test-local-secret"}
+                    ]
+                }
+            ])
+        );
     }
 }

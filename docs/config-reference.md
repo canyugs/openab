@@ -288,8 +288,29 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 | `working_dir` | string | `$HOME` | Working directory for the agent process. Optional — defaults to container's `$HOME`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
+| `mcp_servers` | table[] | `[]` | MCP servers forwarded to the ACP agent on every `session/new` and `session/load`. Supports ACP HTTP, SSE, and stdio server shapes. |
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
+
+### ACP MCP servers
+
+OpenAB is the ACP client, so MCP servers configured here are attached to each
+agent session. This is distinct from MCP configuration read directly by an
+agent CLI outside OpenAB.
+
+```toml
+[[agent.mcp_servers]]
+type = "http"
+name = "github"
+url = "http://octobroker:8080/mcp"
+headers = [
+  { name = "X-Octobroker-Key", value = "${OCTOBROKER_KEY}" },
+]
+```
+
+HTTP header values and stdio environment values are redacted from OpenAB's ACP
+debug log. Keep their source values in environment variables or a configured
+secret provider rather than committing credentials.
 
 ### Authentication
 

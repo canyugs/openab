@@ -2,6 +2,7 @@ use crate::acp::protocol::{
     parse_config_options, parse_usage_report, ConfigOption, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, UsageReport,
 };
+use crate::config::McpServerConfig;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -12,6 +13,31 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace};
+
+fn redact_acp_mcp_secrets(data: &str) -> String {
+    let Ok(mut message) = serde_json::from_str::<Value>(data) else {
+        return "<unparseable ACP message>".to_string();
+    };
+
+    if let Some(servers) = message
+        .pointer_mut("/params/mcpServers")
+        .and_then(Value::as_array_mut)
+    {
+        for server in servers {
+            for field in ["headers", "env"] {
+                if let Some(entries) = server.get_mut(field).and_then(Value::as_array_mut) {
+                    for entry in entries {
+                        if let Some(value) = entry.get_mut("value") {
+                            *value = Value::String("[REDACTED]".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    serde_json::to_string(&message).unwrap_or_else(|_| "<unserializable ACP message>".to_string())
+}
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -493,7 +519,7 @@ impl AcpConnection {
     }
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
-        debug!(data = data.trim(), "acp_send");
+        debug!(data = %redact_acp_mcp_secrets(data), "acp_send");
         // A hung agent can stop draining stdin; bound the write so callers
         // (and the mutexes they hold) can never block on it indefinitely.
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -562,9 +588,16 @@ impl AcpConnection {
         Ok(())
     }
 
-    pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
+    pub async fn session_new(
+        &mut self,
+        cwd: &str,
+        mcp_servers: &[McpServerConfig],
+    ) -> Result<String> {
         let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
+            .send_request(
+                "session/new",
+                Some(json!({"cwd": cwd, "mcpServers": mcp_servers})),
+            )
             .await?;
 
         let session_id = resp
@@ -777,11 +810,20 @@ impl AcpConnection {
 
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
     /// the load, or an error if it failed (caller should fall back to session/new).
-    pub async fn session_load(&mut self, session_id: &str, cwd: &str) -> Result<()> {
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: &[McpServerConfig],
+    ) -> Result<()> {
         let resp = self
             .send_request(
                 "session/load",
-                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+                Some(json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": mcp_servers
+                })),
             )
             .await?;
         // Accept any non-error response as success
@@ -836,7 +878,9 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{
+        build_agent_env, build_permission_response, pick_best_option, redact_acp_mcp_secrets,
+    };
     use serde_json::json;
 
     #[test]
@@ -968,6 +1012,43 @@ mod tests {
 
         assert!(!result.contains_key("OAB_TEST_NONEXISTENT_VAR_12345"));
         assert!(inherited.is_empty());
+    }
+
+    #[test]
+    fn outbound_acp_logs_redact_mcp_credentials() {
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {
+                "cwd": "/workspace",
+                "mcpServers": [
+                    {
+                        "type": "http",
+                        "name": "github",
+                        "url": "http://octobroker:8080/mcp",
+                        "headers": [
+                            {"name": "X-Octobroker-Key", "value": "super-secret"}
+                        ]
+                    },
+                    {
+                        "name": "local",
+                        "command": "/bin/local",
+                        "env": [
+                            {"name": "LOCAL_TOKEN", "value": "local-secret"}
+                        ]
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        let redacted = redact_acp_mcp_secrets(&raw);
+
+        assert!(!redacted.contains("super-secret"));
+        assert!(!redacted.contains("local-secret"));
+        assert_eq!(redacted.matches("[REDACTED]").count(), 2);
+        assert!(redacted.contains("octobroker:8080/mcp"));
     }
 }
 
