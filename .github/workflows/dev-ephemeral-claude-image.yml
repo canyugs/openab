@@ -1,0 +1,40 @@
+name: Dev ephemeral Claude image
+
+on:
+  push:
+    branches:
+      - dev/acp-mcp-ttl-image
+    paths:
+      - .github/workflows/dev-ephemeral-claude-image.yml
+      - Cargo.lock
+      - Cargo.toml
+      - Dockerfile.claude
+      - crates/**
+      - src/**
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ttl.sh/canyugs-openab-claude-acp-0ae5d9b-20260723:24h
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ephemeral amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.claude
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha,scope=snapshot-claude-linux/amd64
+
+      - name: Record image
+        run: echo "\`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
