@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/canyugs/openab-claude:octobroker-acp-0ae5d9b-dev
+  IMAGE: ghcr.io/canyugs/openab-octobroker-canary:0ae5d9b
 
 jobs:
   build:
@@ -29,8 +29,8 @@ jobs:
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: canyugs
-          password: ${{ secrets.GHCR_PAT }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push private amd64 image
         uses: docker/build-push-action@v6
