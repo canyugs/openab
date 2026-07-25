@@ -32,12 +32,26 @@ the adapter itself. All were hit (and fixed for lineworks) during bring-up:
 5. `src/main.rs` — cron `configured_platforms` + `cron_adapters` map, and
    `crates/openab-core/src/cron.rs` — `VALID_PLATFORMS`.
 
-### Remaining roadmap (v2)
+### v2 — all shipped (verified live 2026-07-25/26)
 
-Priority order agreed: inbound/outbound attachments (fileId content API) →
-flex-template rendering for markdown (precedent: `feishu_card.rs`) →
-group @mention gating (text-match on bot name; no `isSelf` equivalent).
-Ceiling stays: no streaming/edit, no reactions, no threads.
+- **Mention gating**: channel messages require `@BotName` (plain-text match;
+  the callback has no structured mention data), mention stripped from the
+  prompt, bot name auto-resolved from `GET /bots/{botId}`, `require_mention`
+  / `bot_name` config. 1:1 always passes.
+- **Flex rendering**: markdown replies render as flexible-template bubbles
+  (headings/lists/code boxes/inline spans) with plain-text fallback on
+  no-markdown, size ceilings, or API rejection. `rich_messages` config.
+- **Receipt ack**: optional `ack_message` pushed on accept — the platform
+  has no reaction/typing APIs, so this is the only "working on it" signal.
+- **Inbound attachments**: fileId download with manual 302-follow (auth
+  header survives the storage-host hop), shared media pipeline — image →
+  vision (verified: agent described a real screenshot), audio → STT, text
+  files by whitelist. Size caps enforced mid-stream.
+
+Outbound attachments follow the repo convention (agent calls the platform
+API directly, see `docs/sendimages.md`) — a LINE WORKS variant of that doc
+is the remaining optional follow-up. Ceiling stays: no streaming/edit, no
+reactions, no threads.
 
 ## Goal
 
