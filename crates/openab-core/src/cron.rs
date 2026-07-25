@@ -238,7 +238,7 @@ pub fn should_fire(schedule: &Schedule, tz: Tz) -> bool {
 }
 
 /// Known platforms that have adapter support.
-const VALID_PLATFORMS: &[&str] = &["discord", "slack", "telegram", "googlechat"];
+const VALID_PLATFORMS: &[&str] = &["discord", "slack", "telegram", "googlechat", "lineworks"];
 
 fn should_create_cron_thread(job: &CronJobConfig) -> bool {
     job.thread_id.is_none() && job.platform != "googlechat"

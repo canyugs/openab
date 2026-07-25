@@ -191,6 +191,7 @@ pub struct Config {
     pub gateway: Option<GatewayConfig>,
     pub telegram: Option<TelegramConfig>,
     pub line: Option<LineConfig>,
+    pub lineworks: Option<LineWorksConfig>,
     pub wecom: Option<WecomConfig>,
     pub googlechat: Option<GoogleChatConfig>,
     pub teams: Option<TeamsConfig>,
@@ -884,6 +885,77 @@ impl LineConfig {
     /// uniform `GATEWAY_*` seed (and to warn when it does).
     pub fn env_trust_present() -> bool {
         std::env::var("LINE_ALLOW_ALL_USERS").is_ok() || std::env::var("LINE_ALLOWED_USERS").is_ok()
+    }
+}
+
+/// First-class `[lineworks]` section — credentials for the LINE WORKS bot
+/// adapter. Config-first invariant (#1375): each field resolves
+/// `[lineworks].field` (with `${}` expansion) → `LINEWORKS_*` env var →
+/// default. The adapter is enabled only when bot id, bot secret, and the
+/// full service-account auth material all resolve to non-empty values.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct LineWorksConfig {
+    /// Bot ID (also cross-checked against the `X-WORKS-BotId` callback
+    /// header). Env fallback: `LINEWORKS_BOT_ID`.
+    pub bot_id: Option<String>,
+    /// Bot Secret for webhook HMAC-SHA256 signature verification (L1).
+    /// Env fallback: `LINEWORKS_BOT_SECRET`.
+    pub bot_secret: Option<String>,
+    /// App Client ID (JWT `iss`). Env fallback: `LINEWORKS_CLIENT_ID`.
+    pub client_id: Option<String>,
+    /// App Client Secret (token request). Env fallback:
+    /// `LINEWORKS_CLIENT_SECRET`.
+    pub client_secret: Option<String>,
+    /// Service account email (JWT `sub`). Env fallback:
+    /// `LINEWORKS_SERVICE_ACCOUNT`.
+    pub service_account: Option<String>,
+    /// RS256 private key PEM (inline). Env fallback: `LINEWORKS_PRIVATE_KEY`.
+    /// Takes precedence over `private_key_file`.
+    pub private_key: Option<String>,
+    /// Path to the RS256 private key PEM downloaded from the Developer
+    /// Console. Env fallback: `LINEWORKS_PRIVATE_KEY_FILE`.
+    pub private_key_file: Option<String>,
+    /// Webhook mount path. Env fallback: `LINEWORKS_WEBHOOK_PATH`
+    /// (default `/webhook/lineworks`).
+    pub webhook_path: Option<String>,
+}
+
+/// Fully resolved LINE WORKS settings (config → env → default applied).
+#[derive(Debug, Clone)]
+pub struct ResolvedLineWorks {
+    pub bot_id: Option<String>,
+    pub bot_secret: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub service_account: Option<String>,
+    pub private_key: Option<String>,
+    pub private_key_file: Option<String>,
+    pub webhook_path: String,
+}
+
+impl LineWorksConfig {
+    /// Resolve every field: config value (if set) → `LINEWORKS_*` env →
+    /// default. Same shape as [`LineConfig::resolve`]; empty strings from
+    /// `${}` expansion of unset env vars fall through to the env fallback.
+    pub fn resolve(&self) -> ResolvedLineWorks {
+        let field = |v: &Option<String>, env: &str| {
+            v.as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .or_else(|| std::env::var(env).ok())
+        };
+        ResolvedLineWorks {
+            bot_id: field(&self.bot_id, "LINEWORKS_BOT_ID"),
+            bot_secret: field(&self.bot_secret, "LINEWORKS_BOT_SECRET"),
+            client_id: field(&self.client_id, "LINEWORKS_CLIENT_ID"),
+            client_secret: field(&self.client_secret, "LINEWORKS_CLIENT_SECRET"),
+            service_account: field(&self.service_account, "LINEWORKS_SERVICE_ACCOUNT"),
+            private_key: field(&self.private_key, "LINEWORKS_PRIVATE_KEY"),
+            private_key_file: field(&self.private_key_file, "LINEWORKS_PRIVATE_KEY_FILE"),
+            webhook_path: field(&self.webhook_path, "LINEWORKS_WEBHOOK_PATH")
+                .unwrap_or_else(|| "/webhook/lineworks".into()),
+        }
     }
 }
 

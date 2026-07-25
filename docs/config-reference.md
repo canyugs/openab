@@ -159,6 +159,37 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
 
 ---
 
+## `[lineworks]`
+
+First-class LINE WORKS section — bot credentials and service-account auth (config-first parity, #1375). Each field resolves: config → `LINEWORKS_*` env → default. The adapter is enabled only when `bot_id`, `bot_secret`, `client_id`, `client_secret`, `service_account`, and a private key (inline or file) all resolve to non-empty values; an incomplete section disables the adapter, matching env-only semantics.
+
+LINE WORKS is webhook-only: register the callback URL (`https://<host><webhook_path>`) in the Developer Console — a CA-signed HTTPS certificate is required (no self-signed). Outbound messages authenticate via the OAuth 2.0 service-account JWT flow (RS256 key from the Console).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `bot_id` | string | — | Bot ID, cross-checked against the `X-WORKS-BotId` callback header. Env: `LINEWORKS_BOT_ID`. |
+| `bot_secret` | string | — | Bot Secret for webhook HMAC-SHA256 signature verification (L1). Env: `LINEWORKS_BOT_SECRET`. |
+| `client_id` | string | — | App Client ID (JWT `iss`). Env: `LINEWORKS_CLIENT_ID`. |
+| `client_secret` | string | — | App Client Secret. Env: `LINEWORKS_CLIENT_SECRET`. |
+| `service_account` | string | — | Service account email (JWT `sub`). Env: `LINEWORKS_SERVICE_ACCOUNT`. |
+| `private_key` | string | — | RS256 private key PEM (inline; takes precedence over `private_key_file`). Env: `LINEWORKS_PRIVATE_KEY`. |
+| `private_key_file` | string | — | Path to the RS256 private key PEM. Env: `LINEWORKS_PRIVATE_KEY_FILE`. |
+| `webhook_path` | string | `/webhook/lineworks` | Webhook mount path. Env: `LINEWORKS_WEBHOOK_PATH`. |
+
+Platform limits: no message edit/delete (no streaming), no reactions, no threads, plain-text messages up to 10,000 chars (longer replies are split). Inbound image/file attachments are not downloaded yet (marked unsupported).
+
+```toml
+[lineworks]
+bot_id           = "${LINEWORKS_BOT_ID}"
+bot_secret       = "${LINEWORKS_BOT_SECRET}"
+client_id        = "${LINEWORKS_CLIENT_ID}"
+client_secret    = "${LINEWORKS_CLIENT_SECRET}"
+service_account  = "bot@example.serviceaccount"
+private_key_file = "/etc/openab/lineworks_private_key.pem"
+```
+
+---
+
 ## `[wecom]`
 
 Full first-class WeCom section (config-first parity, #1378) — credentials, connection, and L3 identity trust. Each field resolves: config → `WECOM_*` env → default. The adapter requires all five credentials (`corp_id`, `secret`, `token`, `encoding_aes_key`, `agent_id`); an incomplete section (after env fallback) disables the adapter, matching env-only semantics.

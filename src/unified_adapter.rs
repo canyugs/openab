@@ -78,6 +78,15 @@ impl UnifiedGatewayAdapter {
                     wecom.handle_reply(reply, &self.gw_state.event_tx).await;
                 }
             }
+            #[cfg(feature = "lineworks")]
+            "lineworks" => {
+                if let Some(ref lineworks) = self.gw_state.lineworks {
+                    openab_gateway::adapters::lineworks::dispatch_lineworks_reply(
+                        client, lineworks, reply,
+                    )
+                    .await;
+                }
+            }
             #[cfg(feature = "teams")]
             "teams" => {
                 if let Some(ref teams) = self.gw_state.teams {

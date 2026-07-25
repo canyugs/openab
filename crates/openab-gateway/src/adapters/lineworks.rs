@@ -1,0 +1,966 @@
+//! LINE WORKS bot adapter.
+//!
+//! Webhook-only platform: LINE WORKS POSTs one event object per request to the
+//! registered callback URL, signed with the Bot Secret. Outbound messages go
+//! through the REST API (`https://www.worksapis.com/v1.0`) authenticated with
+//! an OAuth 2.0 service-account JWT flow (same jwt-bearer grant as Google
+//! Chat, see `googlechat::GoogleChatTokenCache`).
+//!
+//! Platform limits that shape this adapter: no message edit/delete (so no
+//! streaming), no reactions, no threads, plain-text only, 10,000-char text
+//! limit, and no reply-token mechanism (push-style sends only).
+
+use crate::schema::*;
+use axum::extract::State;
+use serde::Deserialize;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
+
+/// Base URL for the LINE WORKS REST API. Overridden in tests.
+pub const LINEWORKS_API_BASE: &str = "https://www.worksapis.com/v1.0";
+/// Token endpoint for the service-account JWT exchange. Overridden in tests.
+pub const LINEWORKS_AUTH_BASE: &str = "https://auth.worksmobile.com";
+
+/// Maximum length of one text message. Longer replies are split.
+pub const LINEWORKS_TEXT_LIMIT: usize = 10_000;
+
+/// Channel-id prefix marking a 1:1 conversation (LINE WORKS has separate
+/// send endpoints for users and channels; `GatewayReply` only carries an
+/// opaque channel id, so the distinction is encoded in the id itself).
+const USER_CHANNEL_PREFIX: &str = "user:";
+
+// --- Config ---
+
+pub struct LineWorksConfig {
+    pub bot_id: String,
+    pub bot_secret: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub service_account: String,
+    pub private_key: String,
+    pub webhook_path: String,
+    pub api_base: String,
+    pub auth_base: String,
+}
+
+impl LineWorksConfig {
+    /// Build from `LINEWORKS_*` env vars. Returns `None` (adapter disabled)
+    /// unless bot id, bot secret, and the full auth material are all present.
+    pub fn from_env() -> Option<Self> {
+        Self::from_reader(|k| std::env::var(k).ok())
+    }
+
+    /// Build from any `LINEWORKS_*` key reader. The `[lineworks]` config
+    /// bridge (`apply_lineworks_config`) goes through here too, so config-
+    /// and env-derived adapters share the same validation.
+    pub fn from_reader(read: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let read_nonempty = |k: &str| read(k).filter(|v| !v.is_empty());
+        let bot_id = read_nonempty("LINEWORKS_BOT_ID")?;
+        let bot_secret = read_nonempty("LINEWORKS_BOT_SECRET")?;
+        let client_id = read_nonempty("LINEWORKS_CLIENT_ID")?;
+        let client_secret = read_nonempty("LINEWORKS_CLIENT_SECRET")?;
+        let service_account = read_nonempty("LINEWORKS_SERVICE_ACCOUNT")?;
+        let private_key = match read_nonempty("LINEWORKS_PRIVATE_KEY") {
+            Some(pem) => pem,
+            None => {
+                let path = read_nonempty("LINEWORKS_PRIVATE_KEY_FILE")?;
+                match std::fs::read_to_string(&path) {
+                    Ok(pem) => pem,
+                    Err(e) => {
+                        error!(path = %path, err = %e, "lineworks: cannot read private key file");
+                        return None;
+                    }
+                }
+            }
+        };
+        Some(Self {
+            bot_id,
+            bot_secret,
+            client_id,
+            client_secret,
+            service_account,
+            private_key,
+            webhook_path: read_nonempty("LINEWORKS_WEBHOOK_PATH")
+                .unwrap_or_else(|| "/webhook/lineworks".into()),
+            api_base: LINEWORKS_API_BASE.into(),
+            auth_base: LINEWORKS_AUTH_BASE.into(),
+        })
+    }
+}
+
+pub struct LineWorksAdapter {
+    pub config: LineWorksConfig,
+    token_cache: LineWorksTokenCache,
+}
+
+impl LineWorksAdapter {
+    pub fn new(config: LineWorksConfig) -> Self {
+        Self {
+            token_cache: LineWorksTokenCache::new(),
+            config,
+        }
+    }
+}
+
+// --- Token cache with JWT auto-refresh ---
+
+const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
+
+struct LineWorksTokenCache {
+    token: RwLock<Option<(String, Instant, u64)>>,
+}
+
+impl LineWorksTokenCache {
+    fn new() -> Self {
+        Self {
+            token: RwLock::new(None),
+        }
+    }
+
+    async fn get_token(
+        &self,
+        client: &reqwest::Client,
+        config: &LineWorksConfig,
+    ) -> Result<String, String> {
+        {
+            let guard = self.token.read().await;
+            if let Some((ref tok, ref ts, ttl)) = *guard {
+                if ts.elapsed().as_secs() < ttl.saturating_sub(TOKEN_REFRESH_MARGIN_SECS) {
+                    return Ok(tok.clone());
+                }
+            }
+        }
+        let mut guard = self.token.write().await;
+        if let Some((ref tok, ref ts, ttl)) = *guard {
+            if ts.elapsed().as_secs() < ttl.saturating_sub(TOKEN_REFRESH_MARGIN_SECS) {
+                return Ok(tok.clone());
+            }
+        }
+        let (new_token, expire) = refresh_token(client, config).await?;
+        *guard = Some((new_token.clone(), Instant::now(), expire));
+        info!("lineworks access token refreshed (expires in {expire}s)");
+        Ok(new_token)
+    }
+
+    /// Drop the cached token so the next `get_token` re-fetches. Used when the
+    /// API answers 401 despite a locally-unexpired token (e.g. revoked in the
+    /// Developer Console).
+    async fn invalidate(&self) {
+        *self.token.write().await = None;
+    }
+}
+
+async fn refresh_token(
+    client: &reqwest::Client,
+    config: &LineWorksConfig,
+) -> Result<(String, u64), String> {
+    let jwt = build_jwt(config).map_err(|e| format!("JWT build error: {e}"))?;
+    let resp = client
+        .post(format!("{}/oauth2/v2.0/token", config.auth_base))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", &jwt),
+            ("client_id", &config.client_id),
+            ("client_secret", &config.client_secret),
+            ("scope", "bot"),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("token exchange request failed: {e}"))?;
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("token exchange parse failed: {e}"))?;
+
+    let token = body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            let err = body
+                .get("error_description")
+                .and_then(|v| v.as_str())
+                .or_else(|| body.get("error").and_then(|v| v.as_str()))
+                .unwrap_or("unknown error");
+            format!("token exchange failed: {err}")
+        })?
+        .to_string();
+
+    let expires_in = body
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        // Some responses carry expires_in as a JSON string.
+        .or_else(|| {
+            body.get("expires_in")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(3600);
+
+    Ok((token, expires_in))
+}
+
+fn build_jwt(config: &LineWorksConfig) -> Result<String, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+
+    let claims = serde_json::json!({
+        "iss": config.client_id,
+        "sub": config.service_account,
+        "iat": now,
+        "exp": now + 3600,
+    });
+
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(config.private_key.as_bytes())
+        .map_err(|e| format!("RSA key parse error: {e}"))?;
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    jsonwebtoken::encode(&header, &claims, &key).map_err(|e| format!("JWT encode error: {e}"))
+}
+
+// --- Webhook types (one event object per request) ---
+
+#[derive(Debug, Deserialize)]
+pub struct LineWorksEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    source: Option<LineWorksSource>,
+    content: Option<LineWorksContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LineWorksSource {
+    #[serde(rename = "userId")]
+    user_id: Option<String>,
+    #[serde(rename = "channelId")]
+    channel_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LineWorksContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    text: Option<String>,
+    #[serde(rename = "fileId")]
+    file_id: Option<String>,
+}
+
+// --- Webhook handler ---
+
+/// Verify `X-WORKS-Signature`: Base64(HMAC-SHA256(raw body, Bot Secret)).
+fn verify_signature(bot_secret: &str, body: &[u8], signature: &str) -> bool {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use subtle::ConstantTimeEq;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(bot_secret.as_bytes()).expect("HMAC key");
+    mac.update(body);
+    let expected = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    expected.as_bytes().ct_eq(signature.as_bytes()).into()
+}
+
+pub async fn webhook(
+    State(state): State<Arc<crate::AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::http::StatusCode {
+    let Some(ref adapter) = state.lineworks else {
+        warn!("lineworks webhook hit but adapter not configured");
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+    };
+
+    let signature = headers
+        .get("x-works-signature")
+        .and_then(|v| v.to_str().ok());
+    let Some(signature) = signature else {
+        warn!("lineworks webhook rejected: missing X-WORKS-Signature");
+        return axum::http::StatusCode::UNAUTHORIZED;
+    };
+    if !verify_signature(&adapter.config.bot_secret, &body, signature) {
+        warn!("lineworks webhook rejected: invalid signature");
+        return axum::http::StatusCode::UNAUTHORIZED;
+    }
+
+    // The signature already proves the sender knows this bot's secret; the
+    // bot-id check just catches Console misconfiguration (wrong callback URL).
+    if let Some(bot_id) = headers.get("x-works-botid").and_then(|v| v.to_str().ok()) {
+        if bot_id != adapter.config.bot_id {
+            warn!(
+                got = %bot_id,
+                expected = %adapter.config.bot_id,
+                "lineworks webhook rejected: bot id mismatch"
+            );
+            return axum::http::StatusCode::UNAUTHORIZED;
+        }
+    }
+
+    let event: LineWorksEvent = match serde_json::from_slice(&body) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("lineworks webhook parse error: {e}");
+            return axum::http::StatusCode::BAD_REQUEST;
+        }
+    };
+
+    if let Some(gateway_event) = build_gateway_event(&event) {
+        let json = serde_json::to_string(&gateway_event).unwrap();
+        info!(
+            channel = %gateway_event.channel.id,
+            sender = %gateway_event.sender.id,
+            "lineworks → gateway"
+        );
+        let _ = state.event_tx.send(json);
+    }
+
+    axum::http::StatusCode::OK
+}
+
+fn build_gateway_event(event: &LineWorksEvent) -> Option<GatewayEvent> {
+    if event.event_type != "message" {
+        return None;
+    }
+    let content = event.content.as_ref()?;
+    let source = event.source.as_ref()?;
+
+    let user_id = match source.user_id.as_deref() {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            warn!("lineworks message event missing userId, skipping");
+            return None;
+        }
+    };
+
+    // Group talk events carry channelId; 1:1 events do not. The user: prefix
+    // lets reply dispatch pick the users vs channels send endpoint from the
+    // otherwise-opaque channel id.
+    let (channel_id, channel_type) = match source.channel_id.as_deref() {
+        Some(id) if !id.is_empty() => (id.to_string(), "channel".to_string()),
+        _ => (format!("{USER_CHANNEL_PREFIX}{user_id}"), "user".to_string()),
+    };
+
+    let mut attachments = Vec::new();
+    let text = match content.content_type.as_str() {
+        "text" => content.text.as_deref().unwrap_or(""),
+        "image" | "file" => {
+            // v1: attachment download (separate fileId content API) not wired yet.
+            let file_id = content.file_id.as_deref().unwrap_or("unknown");
+            warn!(file_id = %file_id, kind = %content.content_type, "lineworks attachment not supported yet");
+            attachments.push(Attachment::rejected(
+                if content.content_type == "image" {
+                    "image"
+                } else {
+                    "text_file"
+                },
+                format!("lineworks_{file_id}"),
+                "application/octet-stream",
+                0,
+                "unsupported format: lineworks attachments not supported yet",
+            ));
+            ""
+        }
+        other => {
+            info!(kind = %other, "lineworks: ignoring unsupported message content type");
+            return None;
+        }
+    };
+
+    if text.trim().is_empty() && attachments.is_empty() {
+        return None;
+    }
+
+    let mut gateway_event = GatewayEvent::new(
+        "lineworks",
+        ChannelInfo {
+            id: channel_id,
+            channel_type,
+            thread_id: None,
+        },
+        SenderInfo {
+            id: user_id.into(),
+            name: user_id.into(),
+            display_name: user_id.into(),
+            is_bot: false,
+        },
+        text,
+        // Callback events carry no platform message id; reuse the event id.
+        "",
+        vec![],
+    );
+    gateway_event.message_id = gateway_event.event_id.clone();
+    gateway_event.content.attachments = attachments;
+    Some(gateway_event)
+}
+
+// --- Reply dispatch ---
+
+/// Split text into chunks of at most `limit` chars (char-boundary safe).
+fn split_text(text: &str, limit: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if current.chars().count() >= limit {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn send_endpoint(api_base: &str, bot_id: &str, channel_id: &str) -> String {
+    match channel_id.strip_prefix(USER_CHANNEL_PREFIX) {
+        Some(user_id) => format!("{api_base}/bots/{bot_id}/users/{user_id}/messages"),
+        None => format!("{api_base}/bots/{bot_id}/channels/{channel_id}/messages"),
+    }
+}
+
+pub async fn dispatch_lineworks_reply(
+    client: &reqwest::Client,
+    adapter: &LineWorksAdapter,
+    reply: &GatewayReply,
+) -> bool {
+    // No reactions, threads, or edit/delete on LINE WORKS. Edit/delete are the
+    // streaming path's cosmetic commands (see dispatch_line_reply for the full
+    // rationale) — the final content still arrives as a plain send.
+    if matches!(
+        reply.command.as_deref(),
+        Some("add_reaction")
+            | Some("remove_reaction")
+            | Some("create_topic")
+            | Some("edit_message")
+            | Some("delete_message")
+    ) {
+        info!(command = ?reply.command.as_deref(), "lineworks: ignoring unsupported command");
+        return false;
+    }
+
+    if reply.content.text.trim().is_empty() {
+        return false;
+    }
+
+    let url = send_endpoint(
+        &adapter.config.api_base,
+        &adapter.config.bot_id,
+        &reply.channel.id,
+    );
+
+    let mut all_ok = true;
+    for chunk in split_text(&reply.content.text, LINEWORKS_TEXT_LIMIT) {
+        if !send_text_chunk(client, adapter, &url, &chunk).await {
+            all_ok = false;
+            break;
+        }
+    }
+    if all_ok {
+        info!(to = %reply.channel.id, "gateway → lineworks");
+    }
+    all_ok
+}
+
+/// Send one text message; on 401, invalidate the cached token and retry once.
+async fn send_text_chunk(
+    client: &reqwest::Client,
+    adapter: &LineWorksAdapter,
+    url: &str,
+    text: &str,
+) -> bool {
+    for attempt in 0..2 {
+        let token = match adapter
+            .token_cache
+            .get_token(client, &adapter.config)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                error!(err = %e, "lineworks: cannot obtain access token");
+                return false;
+            }
+        };
+        let resp = client
+            .post(url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "content": {"type": "text", "text": text}
+            }))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => return true,
+            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 => {
+                warn!("lineworks send got 401, refreshing token and retrying");
+                adapter.token_cache.invalidate().await;
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                error!(status = %status, body = %body, "lineworks send error");
+                return false;
+            }
+            Err(e) => {
+                error!(err = %e, "lineworks send network error");
+                return false;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    // Throwaway RSA key generated for these tests only (not a real credential).
+    const TEST_RSA_KEY: &str = include_str!("../../testdata/lineworks_test_key.pem");
+
+    fn test_config(api_base: &str, auth_base: &str) -> LineWorksConfig {
+        LineWorksConfig {
+            bot_id: "12345".into(),
+            bot_secret: "test_bot_secret".into(),
+            client_id: "test_client_id".into(),
+            client_secret: "test_client_secret".into(),
+            service_account: "sa@example.serviceaccount".into(),
+            private_key: TEST_RSA_KEY.into(),
+            webhook_path: "/webhook/lineworks".into(),
+            api_base: api_base.into(),
+            auth_base: auth_base.into(),
+        }
+    }
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        use base64::Engine;
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    }
+
+    async fn mount_token_endpoint(server: &MockServer, token: &str) -> wiremock::MockGuard {
+        Mock::given(method("POST"))
+            .and(path("/oauth2/v2.0/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": token,
+                "token_type": "Bearer",
+                "expires_in": 86400,
+                "scope": "bot"
+            })))
+            .mount_as_scoped(server)
+            .await
+    }
+
+    // --- Token provider ---
+
+    #[tokio::test]
+    async fn token_request_shape_and_caching() {
+        let server = MockServer::start().await;
+        let _guard = mount_token_endpoint(&server, "tok_1").await;
+
+        let config = test_config(&server.uri(), &server.uri());
+        let cache = LineWorksTokenCache::new();
+        let client = reqwest::Client::new();
+
+        let tok = cache.get_token(&client, &config).await.unwrap();
+        assert_eq!(tok, "tok_1");
+        // Second call is served from cache — still exactly one HTTP request.
+        let tok2 = cache.get_token(&client, &config).await.unwrap();
+        assert_eq!(tok2, "tok_1");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+
+        let form: std::collections::HashMap<String, String> =
+            url_decoded_form(&requests[0]);
+        assert_eq!(
+            form["grant_type"],
+            "urn:ietf:params:oauth:grant-type:jwt-bearer"
+        );
+        assert_eq!(form["client_id"], "test_client_id");
+        assert_eq!(form["client_secret"], "test_client_secret");
+        assert_eq!(form["scope"], "bot");
+
+        // The assertion must be a 3-part RS256 JWT with our iss/sub claims.
+        let jwt = &form["assertion"];
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        use base64::Engine;
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[1])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["iss"], "test_client_id");
+        assert_eq!(claims["sub"], "sa@example.serviceaccount");
+        assert!(claims["exp"].as_u64().unwrap() > claims["iat"].as_u64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn token_invalidate_forces_refetch() {
+        let server = MockServer::start().await;
+        let _guard = mount_token_endpoint(&server, "tok_a").await;
+
+        let config = test_config(&server.uri(), &server.uri());
+        let cache = LineWorksTokenCache::new();
+        let client = reqwest::Client::new();
+
+        cache.get_token(&client, &config).await.unwrap();
+        cache.invalidate().await;
+        cache.get_token(&client, &config).await.unwrap();
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    fn url_decoded_form(req: &Request) -> std::collections::HashMap<String, String> {
+        let body = String::from_utf8(req.body.clone()).unwrap();
+        body.split('&')
+            .filter_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                Some((
+                    urlencoding::decode(k).ok()?.into_owned(),
+                    urlencoding::decode(v).ok()?.into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    // --- Signature verification ---
+
+    #[test]
+    fn signature_accept_and_reject() {
+        let body = br#"{"type":"message"}"#;
+        let good = sign("secret_x", body);
+        assert!(verify_signature("secret_x", body, &good));
+        assert!(!verify_signature("secret_x", body, "AAAA"));
+        assert!(!verify_signature("wrong_secret", body, &good));
+        // Signature over different body must not verify.
+        assert!(!verify_signature("secret_x", b"other body", &good));
+    }
+
+    // --- Event mapping ---
+
+    fn parse_event(json: serde_json::Value) -> Option<GatewayEvent> {
+        let event: LineWorksEvent = serde_json::from_value(json).unwrap();
+        build_gateway_event(&event)
+    }
+
+    #[test]
+    fn maps_direct_text_message() {
+        let ev = parse_event(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1", "domainId": 1},
+            "issuedTime": "2026-07-24T10:00:00Z",
+            "content": {"type": "text", "text": "hello"}
+        }))
+        .expect("text message should map");
+        assert_eq!(ev.platform, "lineworks");
+        assert_eq!(ev.channel.id, "user:U1");
+        assert_eq!(ev.channel.channel_type, "user");
+        assert_eq!(ev.sender.id, "U1");
+        assert_eq!(ev.content.text, "hello");
+        assert_eq!(ev.message_id, ev.event_id);
+    }
+
+    #[test]
+    fn maps_channel_text_message() {
+        let ev = parse_event(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U2", "channelId": "C9", "domainId": 1},
+            "content": {"type": "text", "text": "hi all"}
+        }))
+        .expect("channel message should map");
+        assert_eq!(ev.channel.id, "C9");
+        assert_eq!(ev.channel.channel_type, "channel");
+        assert_eq!(ev.sender.id, "U2");
+    }
+
+    #[test]
+    fn image_maps_to_rejected_attachment() {
+        let ev = parse_event(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "image", "fileId": "F123"}
+        }))
+        .expect("image should map with rejected attachment");
+        assert_eq!(ev.content.text, "");
+        assert_eq!(ev.content.attachments.len(), 1);
+        let att = &ev.content.attachments[0];
+        assert_eq!(att.attachment_type, "image");
+        assert!(att.status.as_deref().unwrap().starts_with("unsupported format"));
+    }
+
+    #[test]
+    fn ignores_non_message_and_unsupported_events() {
+        assert!(parse_event(serde_json::json!({
+            "type": "join",
+            "source": {"userId": "U1", "channelId": "C1"}
+        }))
+        .is_none());
+        assert!(parse_event(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "sticker", "packageId": "1", "stickerId": "2"}
+        }))
+        .is_none());
+        // Missing userId → skip
+        assert!(parse_event(serde_json::json!({
+            "type": "message",
+            "source": {"channelId": "C1"},
+            "content": {"type": "text", "text": "x"}
+        }))
+        .is_none());
+    }
+
+    // --- Webhook handler (HTTP-level) ---
+
+    fn test_state(adapter: Option<LineWorksAdapter>) -> (Arc<crate::AppState>, broadcast::Receiver<String>) {
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let mut state = crate::AppState::test_default(event_tx);
+        state.lineworks = adapter.map(Arc::new);
+        (Arc::new(state), event_rx)
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_bad_signature_and_accepts_good() {
+        let config = test_config("http://unused", "http://unused");
+        let secret = config.bot_secret.clone();
+        let (state, mut event_rx) = test_state(Some(LineWorksAdapter::new(config)));
+
+        let body = serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "text", "text": "ping"}
+        })
+        .to_string();
+
+        // Missing signature
+        let status = webhook(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(body.clone()),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+
+        // Bad signature
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-works-signature", "bm9wZQ==".parse().unwrap());
+        let status = webhook(
+            State(state.clone()),
+            headers,
+            axum::body::Bytes::from(body.clone()),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+
+        // Good signature → 200 and event broadcast
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-works-botid", "12345".parse().unwrap());
+        let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let event_json = event_rx.try_recv().expect("event should be broadcast");
+        let ev: GatewayEvent = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(ev.platform, "lineworks");
+        assert_eq!(ev.content.text, "ping");
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_bot_id_mismatch() {
+        let config = test_config("http://unused", "http://unused");
+        let secret = config.bot_secret.clone();
+        let (state, _event_rx) = test_state(Some(LineWorksAdapter::new(config)));
+
+        let body = r#"{"type":"message"}"#.to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-works-botid", "99999".parse().unwrap());
+        let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Reply dispatch ---
+
+    fn text_reply(channel_id: &str, text: &str, command: Option<&str>) -> GatewayReply {
+        GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt_1".into(),
+            platform: "lineworks".into(),
+            channel: ReplyChannel {
+                id: channel_id.into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: text.into(),
+                attachments: vec![],
+            },
+            command: command.map(Into::into),
+            request_id: None,
+            quote_message_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_selects_user_endpoint_and_sends_text() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_send").await;
+        let _send = Mock::given(method("POST"))
+            .and(path("/bots/12345/users/U1/messages"))
+            .and(wiremock::matchers::header("authorization", "Bearer tok_send"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let ok = dispatch_lineworks_reply(
+            &reqwest::Client::new(),
+            &adapter,
+            &text_reply("user:U1", "hello back", None),
+        )
+        .await;
+        assert!(ok);
+
+        let sent = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.path().contains("/messages"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+        assert_eq!(body["content"]["type"], "text");
+        assert_eq!(body["content"]["text"], "hello back");
+    }
+
+    #[tokio::test]
+    async fn dispatch_selects_channel_endpoint() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_send").await;
+        let _send = Mock::given(method("POST"))
+            .and(path("/bots/12345/channels/C9/messages"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let ok = dispatch_lineworks_reply(
+            &reqwest::Client::new(),
+            &adapter,
+            &text_reply("C9", "to the channel", None),
+        )
+        .await;
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn dispatch_splits_long_text() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_send").await;
+        let _send = Mock::given(method("POST"))
+            .and(path("/bots/12345/users/U1/messages"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(2)
+            .mount_as_scoped(&server)
+            .await;
+
+        let long_text = "あ".repeat(LINEWORKS_TEXT_LIMIT + 1);
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let ok = dispatch_lineworks_reply(
+            &reqwest::Client::new(),
+            &adapter,
+            &text_reply("user:U1", &long_text, None),
+        )
+        .await;
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn dispatch_ignores_unsupported_commands() {
+        // No mock server: any HTTP call would fail the test via ok == false.
+        let adapter =
+            LineWorksAdapter::new(test_config("http://unused", "http://unused"));
+        for cmd in [
+            "add_reaction",
+            "remove_reaction",
+            "create_topic",
+            "edit_message",
+            "delete_message",
+        ] {
+            let ok = dispatch_lineworks_reply(
+                &reqwest::Client::new(),
+                &adapter,
+                &text_reply("user:U1", "x", Some(cmd)),
+            )
+            .await;
+            assert!(!ok, "command {cmd} should be a no-op");
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_retries_once_after_401() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_x").await;
+        // First send → 401, second send → 201.
+        let _first = Mock::given(method("POST"))
+            .and(path("/bots/12345/users/U1/messages"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _second = Mock::given(method("POST"))
+            .and(path("/bots/12345/users/U1/messages"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let ok = dispatch_lineworks_reply(
+            &reqwest::Client::new(),
+            &adapter,
+            &text_reply("user:U1", "retry me", None),
+        )
+        .await;
+        assert!(ok);
+
+        // Token endpoint hit twice: initial fetch + post-401 refresh.
+        let token_requests = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/oauth2/v2.0/token")
+            .count();
+        assert_eq!(token_requests, 2);
+    }
+
+    #[test]
+    fn split_text_boundaries() {
+        assert_eq!(split_text("", 5), Vec::<String>::new());
+        assert_eq!(split_text("abc", 5), vec!["abc"]);
+        assert_eq!(split_text("abcde", 5), vec!["abcde"]);
+        assert_eq!(split_text("abcdef", 5), vec!["abcde", "f"]);
+        // Multibyte chars split on char boundary, not bytes.
+        let s = "你好世界你好";
+        assert_eq!(split_text(s, 4), vec!["你好世界", "你好"]);
+    }
+}
