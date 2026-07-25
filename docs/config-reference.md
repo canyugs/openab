@@ -178,6 +178,7 @@ LINE WORKS is webhook-only: register the callback URL (`https://<host><webhook_p
 | `require_mention` | bool | `true` | Channel (group) messages must @-mention the bot; 1:1 always passes. Set `false` for ambient listening. Env: `LINEWORKS_REQUIRE_MENTION`. |
 | `bot_name` | string | — | Bot display name for mention matching (plain-text match; the callback has no structured mention data). When unset, fetched from `GET /bots/{botId}` and cached. Env: `LINEWORKS_BOT_NAME`. |
 | `rich_messages` | bool | `true` | Render markdown replies as flexible-template (flex) messages — headings, lists, inline bold/code, and shaded code blocks. Falls back to plain text when the reply has no markdown, exceeds flex size limits, or the API rejects the payload. Env: `LINEWORKS_RICH_MESSAGES`. |
+| `ack_message` | string | — (disabled) | Short receipt message sent as soon as a user message is accepted (e.g. `"🤔 處理中…"`). LINE WORKS has no reaction or typing-indicator API, so this is the only "working on it" signal; sent fire-and-forget so it never delays the agent. Env: `LINEWORKS_ACK_MESSAGE`. |
 
 Platform limits: no message edit/delete (no streaming), no reactions, no threads, plain-text messages up to 10,000 chars (longer replies are split). Inbound image/file attachments are not downloaded yet (marked unsupported).
 

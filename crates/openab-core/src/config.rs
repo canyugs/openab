@@ -930,6 +930,10 @@ pub struct LineWorksConfig {
     /// fallback on any failure). Env fallback: `LINEWORKS_RICH_MESSAGES`
     /// (default `true`).
     pub rich_messages: Option<bool>,
+    /// Receipt acknowledgement message sent when a user message is accepted
+    /// (LINE WORKS has no reaction/typing APIs). Unset/empty = disabled.
+    /// Env fallback: `LINEWORKS_ACK_MESSAGE`.
+    pub ack_message: Option<String>,
 }
 
 /// Fully resolved LINE WORKS settings (config → env → default applied).
@@ -946,6 +950,7 @@ pub struct ResolvedLineWorks {
     pub require_mention: bool,
     pub bot_name: Option<String>,
     pub rich_messages: bool,
+    pub ack_message: Option<String>,
 }
 
 impl LineWorksConfig {
@@ -984,6 +989,7 @@ impl LineWorksConfig {
                     .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                     .unwrap_or(true)
             }),
+            ack_message: field(&self.ack_message, "LINEWORKS_ACK_MESSAGE"),
         }
     }
 }

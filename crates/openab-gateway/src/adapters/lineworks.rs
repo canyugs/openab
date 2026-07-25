@@ -53,6 +53,11 @@ pub struct LineWorksConfig {
     /// Falls back to plain text when the reply has no markdown, exceeds the
     /// flex size limits, or the API rejects the payload. Default: true.
     pub rich_messages: bool,
+    /// Short acknowledgement message sent immediately when a user message is
+    /// accepted for processing. LINE WORKS has no reaction or typing
+    /// indicator API, so without this the user sees nothing until the full
+    /// reply lands. Unset/empty = disabled.
+    pub ack_message: Option<String>,
 }
 
 impl LineWorksConfig {
@@ -103,6 +108,7 @@ impl LineWorksConfig {
             rich_messages: read_nonempty("LINEWORKS_RICH_MESSAGES")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
+            ack_message: read_nonempty("LINEWORKS_ACK_MESSAGE"),
         })
     }
 }
@@ -411,6 +417,26 @@ pub async fn webhook(
             // Mention stripping can leave an empty prompt ("@Bot" alone).
             return axum::http::StatusCode::OK;
         }
+        // Receipt ack: LINE WORKS has no reactions/typing indicator, so a
+        // short message is the only "working on it" signal. Fire-and-forget
+        // so the ack never delays the event reaching the agent.
+        if let Some(ref ack) = adapter.config.ack_message {
+            let ack = ack.clone();
+            let adapter = adapter.clone();
+            let client = state.client.clone();
+            let url = send_endpoint(
+                &adapter.config.api_base,
+                &adapter.config.bot_id,
+                &gateway_event.channel.id,
+            );
+            tokio::spawn(async move {
+                let body = serde_json::json!({"content": {"type": "text", "text": ack}});
+                if !send_body(&client, &adapter, &url, &body).await {
+                    warn!("lineworks: ack message send failed");
+                }
+            });
+        }
+
         let json = serde_json::to_string(&gateway_event).unwrap();
         info!(
             channel = %gateway_event.channel.id,
@@ -653,6 +679,7 @@ mod tests {
             require_mention: true,
             bot_name: Some("TestBot".into()),
             rich_messages: true,
+            ack_message: None,
         }
     }
 
@@ -896,6 +923,57 @@ mod tests {
         let ev: GatewayEvent = serde_json::from_str(&event_json).unwrap();
         assert_eq!(ev.platform, "lineworks");
         assert_eq!(ev.content.text, "ping");
+    }
+
+    #[tokio::test]
+    async fn webhook_sends_ack_message_when_configured() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_ack").await;
+        let _send = Mock::given(method("POST"))
+            .and(path("/bots/12345/users/U1/messages"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut config = test_config(&server.uri(), &server.uri());
+        config.ack_message = Some("🤔 處理中…".into());
+        let secret = config.bot_secret.clone();
+        let (state, mut event_rx) = test_state(Some(LineWorksAdapter::new(config)));
+
+        let body = serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "text", "text": "ping"}
+        })
+        .to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // The event is still broadcast to the agent path.
+        assert!(event_rx.try_recv().is_ok());
+
+        // The ack lands asynchronously; poll briefly for the mock hit.
+        for _ in 0..40 {
+            if !server.received_requests().await.unwrap().iter().any(|r| {
+                r.url.path().contains("/messages")
+            }) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+        let ack_req = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.path().contains("/messages"))
+            .expect("ack message should be sent");
+        let ack_body: serde_json::Value = serde_json::from_slice(&ack_req.body).unwrap();
+        assert_eq!(ack_body["content"]["text"], "🤔 處理中…");
     }
 
     #[tokio::test]
