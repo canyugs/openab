@@ -1130,6 +1130,8 @@ async fn main() -> anyhow::Result<()> {
                     private_key: r.private_key,
                     private_key_file: r.private_key_file,
                     webhook_path: r.webhook_path,
+                    require_mention: r.require_mention,
+                    bot_name: r.bot_name,
                 });
             }
 

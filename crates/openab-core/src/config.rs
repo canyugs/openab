@@ -919,6 +919,13 @@ pub struct LineWorksConfig {
     /// Webhook mount path. Env fallback: `LINEWORKS_WEBHOOK_PATH`
     /// (default `/webhook/lineworks`).
     pub webhook_path: Option<String>,
+    /// Require an @-mention of the bot in channel (group) messages; 1:1
+    /// always passes. Env fallback: `LINEWORKS_REQUIRE_MENTION`
+    /// (default `true`).
+    pub require_mention: Option<bool>,
+    /// Bot display name for mention matching. When unset, fetched from
+    /// `GET /bots/{botId}`. Env fallback: `LINEWORKS_BOT_NAME`.
+    pub bot_name: Option<String>,
 }
 
 /// Fully resolved LINE WORKS settings (config → env → default applied).
@@ -932,6 +939,8 @@ pub struct ResolvedLineWorks {
     pub private_key: Option<String>,
     pub private_key_file: Option<String>,
     pub webhook_path: String,
+    pub require_mention: bool,
+    pub bot_name: Option<String>,
 }
 
 impl LineWorksConfig {
@@ -955,6 +964,14 @@ impl LineWorksConfig {
             private_key_file: field(&self.private_key_file, "LINEWORKS_PRIVATE_KEY_FILE"),
             webhook_path: field(&self.webhook_path, "LINEWORKS_WEBHOOK_PATH")
                 .unwrap_or_else(|| "/webhook/lineworks".into()),
+            require_mention: self.require_mention.unwrap_or_else(|| {
+                std::env::var("LINEWORKS_REQUIRE_MENTION")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true)
+            }),
+            bot_name: field(&self.bot_name, "LINEWORKS_BOT_NAME"),
         }
     }
 }

@@ -175,6 +175,8 @@ LINE WORKS is webhook-only: register the callback URL (`https://<host><webhook_p
 | `private_key` | string | — | RS256 private key PEM (inline; takes precedence over `private_key_file`). Env: `LINEWORKS_PRIVATE_KEY`. |
 | `private_key_file` | string | — | Path to the RS256 private key PEM. Env: `LINEWORKS_PRIVATE_KEY_FILE`. |
 | `webhook_path` | string | `/webhook/lineworks` | Webhook mount path. Env: `LINEWORKS_WEBHOOK_PATH`. |
+| `require_mention` | bool | `true` | Channel (group) messages must @-mention the bot; 1:1 always passes. Set `false` for ambient listening. Env: `LINEWORKS_REQUIRE_MENTION`. |
+| `bot_name` | string | — | Bot display name for mention matching (plain-text match; the callback has no structured mention data). When unset, fetched from `GET /bots/{botId}` and cached. Env: `LINEWORKS_BOT_NAME`. |
 
 Platform limits: no message edit/delete (no streaming), no reactions, no threads, plain-text messages up to 10,000 chars (longer replies are split). Inbound image/file attachments are not downloaded yet (marked unsupported).
 

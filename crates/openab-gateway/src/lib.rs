@@ -371,6 +371,8 @@ impl AppState {
             "LINEWORKS_PRIVATE_KEY" => cfg.private_key.clone(),
             "LINEWORKS_PRIVATE_KEY_FILE" => cfg.private_key_file.clone(),
             "LINEWORKS_WEBHOOK_PATH" => Some(cfg.webhook_path.clone()),
+            "LINEWORKS_REQUIRE_MENTION" => Some(cfg.require_mention.to_string()),
+            "LINEWORKS_BOT_NAME" => cfg.bot_name.clone(),
             _ => None,
         })
         .map(|config| Arc::new(adapters::lineworks::LineWorksAdapter::new(config)));
@@ -482,6 +484,8 @@ pub struct GatewayLineWorksConfig {
     pub private_key: Option<String>,
     pub private_key_file: Option<String>,
     pub webhook_path: String,
+    pub require_mention: bool,
+    pub bot_name: Option<String>,
 }
 
 /// Parameter object for passing resolved WeCom config across the crate

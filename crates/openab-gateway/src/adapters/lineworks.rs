@@ -43,6 +43,12 @@ pub struct LineWorksConfig {
     pub webhook_path: String,
     pub api_base: String,
     pub auth_base: String,
+    /// Channel (group) messages must @-mention the bot to be forwarded.
+    /// 1:1 messages always pass. Default: true. Set false for ambient mode.
+    pub require_mention: bool,
+    /// Bot display name used for mention matching. When unset, fetched once
+    /// from `GET /bots/{botId}` and cached.
+    pub bot_name: Option<String>,
 }
 
 impl LineWorksConfig {
@@ -86,6 +92,10 @@ impl LineWorksConfig {
                 .unwrap_or_else(|| "/webhook/lineworks".into()),
             api_base: LINEWORKS_API_BASE.into(),
             auth_base: LINEWORKS_AUTH_BASE.into(),
+            require_mention: read_nonempty("LINEWORKS_REQUIRE_MENTION")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
+            bot_name: read_nonempty("LINEWORKS_BOT_NAME"),
         })
     }
 }
@@ -93,15 +103,93 @@ impl LineWorksConfig {
 pub struct LineWorksAdapter {
     pub config: LineWorksConfig,
     token_cache: LineWorksTokenCache,
+    /// Bot display name for mention matching, fetched lazily from the API
+    /// when `config.bot_name` is unset.
+    bot_name_cache: RwLock<Option<String>>,
 }
 
 impl LineWorksAdapter {
     pub fn new(config: LineWorksConfig) -> Self {
         Self {
             token_cache: LineWorksTokenCache::new(),
+            bot_name_cache: RwLock::new(None),
             config,
         }
     }
+
+    /// Resolve the bot display name: config override → cached → fetch from
+    /// `GET /bots/{botId}`. Returns `None` when the name cannot be determined
+    /// (callers fail open so a Console/API hiccup never bricks the bot).
+    async fn bot_name(&self, client: &reqwest::Client) -> Option<String> {
+        if let Some(ref name) = self.config.bot_name {
+            return Some(name.clone());
+        }
+        if let Some(ref name) = *self.bot_name_cache.read().await {
+            return Some(name.clone());
+        }
+        let token = match self.token_cache.get_token(client, &self.config).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(err = %e, "lineworks: cannot get token for bot-name lookup");
+                return None;
+            }
+        };
+        let url = format!("{}/bots/{}", self.config.api_base, self.config.bot_id);
+        let body: serde_json::Value = match client.get(&url).bearer_auth(&token).send().await {
+            Ok(r) if r.status().is_success() => match r.json().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(err = %e, "lineworks: bot info parse failed");
+                    return None;
+                }
+            },
+            Ok(r) => {
+                warn!(status = %r.status(), "lineworks: bot info request failed");
+                return None;
+            }
+            Err(e) => {
+                warn!(err = %e, "lineworks: bot info request error");
+                return None;
+            }
+        };
+        let name = body.get("botName").and_then(|v| v.as_str())?.to_string();
+        info!(bot_name = %name, "lineworks: resolved bot name for mention gating");
+        *self.bot_name_cache.write().await = Some(name.clone());
+        Some(name)
+    }
+}
+
+/// Mention gate for channel (group) messages. Returns `true` when the event
+/// should be forwarded; on a hit, strips the `@BotName` mention from the text.
+/// Fail-open: if the bot name cannot be resolved, the event passes.
+async fn passes_mention_gate(
+    adapter: &LineWorksAdapter,
+    client: &reqwest::Client,
+    event: &mut GatewayEvent,
+) -> bool {
+    if !adapter.config.require_mention || event.channel.channel_type != "channel" {
+        return true;
+    }
+    // Attachment-only events have no text to match; treat like unmentioned.
+    let Some(name) = adapter.bot_name(client).await else {
+        warn!("lineworks: bot name unavailable, mention gate fails open");
+        return true;
+    };
+    let mention = format!("@{name}");
+    if !event.content.text.contains(&mention) {
+        info!(
+            channel = %event.channel.id,
+            "lineworks channel message dropped (mention gating: bot not mentioned)"
+        );
+        return false;
+    }
+    event.content.text = event
+        .content
+        .text
+        .replace(&mention, "")
+        .trim()
+        .to_string();
+    true
 }
 
 // --- Token cache with JWT auto-refresh ---
@@ -306,7 +394,16 @@ pub async fn webhook(
         }
     };
 
-    if let Some(gateway_event) = build_gateway_event(&event) {
+    if let Some(mut gateway_event) = build_gateway_event(&event) {
+        if !passes_mention_gate(adapter, &state.client, &mut gateway_event).await {
+            return axum::http::StatusCode::OK;
+        }
+        if gateway_event.content.text.trim().is_empty()
+            && gateway_event.content.attachments.is_empty()
+        {
+            // Mention stripping can leave an empty prompt ("@Bot" alone).
+            return axum::http::StatusCode::OK;
+        }
         let json = serde_json::to_string(&gateway_event).unwrap();
         info!(
             channel = %gateway_event.channel.id,
@@ -532,6 +629,8 @@ mod tests {
             webhook_path: "/webhook/lineworks".into(),
             api_base: api_base.into(),
             auth_base: auth_base.into(),
+            require_mention: true,
+            bot_name: Some("TestBot".into()),
         }
     }
 
@@ -792,6 +891,82 @@ mod tests {
         headers.insert("x-works-botid", "99999".parse().unwrap());
         let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
         assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Mention gating ---
+
+    fn channel_text_event(text: &str) -> GatewayEvent {
+        parse_event(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1", "channelId": "C1", "domainId": 1},
+            "content": {"type": "text", "text": text}
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mention_gate_drops_unmentioned_channel_message() {
+        let adapter = LineWorksAdapter::new(test_config("http://unused", "http://unused"));
+        let client = reqwest::Client::new();
+        let mut ev = channel_text_event("hello without mention");
+        assert!(!passes_mention_gate(&adapter, &client, &mut ev).await);
+    }
+
+    #[tokio::test]
+    async fn mention_gate_passes_and_strips_mention() {
+        let adapter = LineWorksAdapter::new(test_config("http://unused", "http://unused"));
+        let client = reqwest::Client::new();
+        let mut ev = channel_text_event("@TestBot 幫我查一下");
+        assert!(passes_mention_gate(&adapter, &client, &mut ev).await);
+        assert_eq!(ev.content.text, "幫我查一下");
+    }
+
+    #[tokio::test]
+    async fn mention_gate_skips_dm_and_disabled() {
+        let client = reqwest::Client::new();
+        // 1:1 always passes
+        let adapter = LineWorksAdapter::new(test_config("http://unused", "http://unused"));
+        let mut dm = parse_event(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "text", "text": "no mention"}
+        }))
+        .unwrap();
+        assert!(passes_mention_gate(&adapter, &client, &mut dm).await);
+        // require_mention = false passes channel messages untouched
+        let mut config = test_config("http://unused", "http://unused");
+        config.require_mention = false;
+        let adapter = LineWorksAdapter::new(config);
+        let mut ev = channel_text_event("ambient message");
+        assert!(passes_mention_gate(&adapter, &client, &mut ev).await);
+        assert_eq!(ev.content.text, "ambient message");
+    }
+
+    #[tokio::test]
+    async fn mention_gate_fetches_bot_name_from_api() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_name").await;
+        let _bot = Mock::given(method("GET"))
+            .and(path("/bots/12345"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "botId": 12345,
+                "botName": "Nuphos (Dev)"
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut config = test_config(&server.uri(), &server.uri());
+        config.bot_name = None; // force API lookup
+        let adapter = LineWorksAdapter::new(config);
+        let client = reqwest::Client::new();
+
+        let mut ev = channel_text_event("@Nuphos (Dev) hi");
+        assert!(passes_mention_gate(&adapter, &client, &mut ev).await);
+        assert_eq!(ev.content.text, "hi");
+        // Second call served from cache (expect(1) enforces a single fetch).
+        let mut ev2 = channel_text_event("no mention here");
+        assert!(!passes_mention_gate(&adapter, &client, &mut ev2).await);
     }
 
     // --- Reply dispatch ---
