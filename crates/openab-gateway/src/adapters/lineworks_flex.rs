@@ -44,7 +44,7 @@ fn inline_spans(text: &str) -> Vec<Value> {
     let mut plain = String::new();
     let mut rest = text;
 
-    let mut flush = |plain: &mut String, spans: &mut Vec<Value>| {
+    let flush = |plain: &mut String, spans: &mut Vec<Value>| {
         if !plain.is_empty() {
             spans.push(json!({"type": "span", "text": std::mem::take(plain)}));
         }
