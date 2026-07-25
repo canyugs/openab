@@ -52,17 +52,20 @@ fn inline_spans(text: &str) -> Vec<Value> {
 
     while !rest.is_empty() {
         let (marker, style): (&str, fn(&str) -> Value) = if rest.starts_with("**") {
-            ("**", |t| {
-                json!({"type": "span", "text": t, "weight": "bold"})
-            })
+            (
+                "**",
+                |t| json!({"type": "span", "text": t, "weight": "bold"}),
+            )
         } else if rest.starts_with('`') {
-            ("`", |t| {
-                json!({"type": "span", "text": t, "color": "#D63384"})
-            })
+            (
+                "`",
+                |t| json!({"type": "span", "text": t, "color": "#D63384"}),
+            )
         } else if rest.starts_with('*') {
-            ("*", |t| {
-                json!({"type": "span", "text": t, "style": "italic"})
-            })
+            (
+                "*",
+                |t| json!({"type": "span", "text": t, "style": "italic"}),
+            )
         } else {
             let ch_len = rest.chars().next().map(char::len_utf8).unwrap_or(1);
             plain.push_str(&rest[..ch_len]);
@@ -88,7 +91,9 @@ fn inline_spans(text: &str) -> Vec<Value> {
 fn text_component(line: &str, size: &str) -> Value {
     let spans = inline_spans(line);
     // A single unstyled span collapses to a plain text component.
-    if spans.len() == 1 && spans[0].get("weight").is_none() && spans[0].get("color").is_none()
+    if spans.len() == 1
+        && spans[0].get("weight").is_none()
+        && spans[0].get("color").is_none()
         && spans[0].get("style").is_none()
     {
         return json!({"type": "text", "text": spans[0]["text"], "wrap": true, "size": size});
@@ -188,7 +193,11 @@ pub fn markdown_to_flex(text: &str) -> Option<(String, Value)> {
             "contents": components
         }
     });
-    if serde_json::to_string(&bubble).map(|s| s.len()).unwrap_or(usize::MAX) > MAX_FLEX_BYTES {
+    if serde_json::to_string(&bubble)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+        > MAX_FLEX_BYTES
+    {
         return None;
     }
 
@@ -279,7 +288,10 @@ mod tests {
     #[test]
     fn oversized_input_falls_back() {
         // Hundreds of list items exceed the component ceiling → plain text.
-        let big = (0..500).map(|i| format!("- item {i}")).collect::<Vec<_>>().join("\n");
+        let big = (0..500)
+            .map(|i| format!("- item {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(markdown_to_flex(&big).is_none());
     }
 }

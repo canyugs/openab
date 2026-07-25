@@ -201,12 +201,7 @@ async fn passes_mention_gate(
         );
         return false;
     }
-    event.content.text = event
-        .content
-        .text
-        .replace(&mention, "")
-        .trim()
-        .to_string();
+    event.content.text = event.content.text.replace(&mention, "").trim().to_string();
     true
 }
 
@@ -695,7 +690,10 @@ async fn build_gateway_event(
     // otherwise-opaque channel id.
     let (channel_id, channel_type) = match source.channel_id.as_deref() {
         Some(id) if !id.is_empty() => (id.to_string(), "channel".to_string()),
-        _ => (format!("{USER_CHANNEL_PREFIX}{user_id}"), "user".to_string()),
+        _ => (
+            format!("{USER_CHANNEL_PREFIX}{user_id}"),
+            "user".to_string(),
+        ),
     };
 
     let mut attachments = Vec::new();
@@ -713,7 +711,11 @@ async fn build_gateway_event(
                 None => {
                     warn!(file_id = %file_id, kind = %kind, "lineworks attachment received but adapter not configured");
                     attachments.push(Attachment::rejected(
-                        if kind == "image" { "image" } else { "text_file" },
+                        if kind == "image" {
+                            "image"
+                        } else {
+                            "text_file"
+                        },
                         format!("lineworks_{file_id}"),
                         "application/octet-stream",
                         0,
@@ -814,9 +816,7 @@ pub async fn dispatch_lineworks_reply(
     // Flex first: markdown replies render as a flexible template when they
     // fit in one message. Any failure falls through to plain text so a
     // renderer or API quirk never loses content.
-    if adapter.config.rich_messages
-        && reply.content.text.chars().count() <= LINEWORKS_TEXT_LIMIT
-    {
+    if adapter.config.rich_messages && reply.content.text.chars().count() <= LINEWORKS_TEXT_LIMIT {
         if let Some((alt_text, bubble)) =
             super::lineworks_flex::markdown_to_flex(&reply.content.text)
         {
@@ -853,11 +853,7 @@ async fn send_body(
     body: &serde_json::Value,
 ) -> bool {
     for attempt in 0..2 {
-        let token = match adapter
-            .token_cache
-            .get_token(client, &adapter.config)
-            .await
-        {
+        let token = match adapter.token_cache.get_token(client, &adapter.config).await {
             Ok(t) => t,
             Err(e) => {
                 error!(err = %e, "lineworks: cannot obtain access token");
@@ -956,8 +952,7 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
 
-        let form: std::collections::HashMap<String, String> =
-            url_decoded_form(&requests[0]);
+        let form: std::collections::HashMap<String, String> = url_decoded_form(&requests[0]);
         assert_eq!(
             form["grant_type"],
             "urn:ietf:params:oauth:grant-type:jwt-bearer"
@@ -1076,7 +1071,11 @@ mod tests {
         assert_eq!(ev.content.attachments.len(), 1);
         let att = &ev.content.attachments[0];
         assert_eq!(att.attachment_type, "image");
-        assert!(att.status.as_deref().unwrap().starts_with("configuration error"));
+        assert!(att
+            .status
+            .as_deref()
+            .unwrap()
+            .starts_with("configuration error"));
     }
 
     #[tokio::test]
@@ -1160,7 +1159,11 @@ mod tests {
             .expect("image event should map");
         let att = &ev.content.attachments[0];
         assert_eq!(att.attachment_type, "image");
-        assert!(att.status.is_none(), "download should succeed: {:?}", att.status);
+        assert!(
+            att.status.is_none(),
+            "download should succeed: {:?}",
+            att.status
+        );
         assert!(att.size > 0);
         let path = att.path.clone().expect("stored path");
         let stored = tokio::fs::read(&path).await.unwrap();
@@ -1193,7 +1196,11 @@ mod tests {
         let att = &ev.content.attachments[0];
         assert_eq!(att.attachment_type, "text_file");
         assert_eq!(att.filename, "build.log");
-        assert!(att.status.is_none(), "text file should download: {:?}", att.status);
+        assert!(
+            att.status.is_none(),
+            "text file should download: {:?}",
+            att.status
+        );
         if let Some(p) = att.path.clone() {
             let _ = tokio::fs::remove_file(p).await;
         }
@@ -1237,7 +1244,9 @@ mod tests {
 
     // --- Webhook handler (HTTP-level) ---
 
-    fn test_state(adapter: Option<LineWorksAdapter>) -> (Arc<crate::AppState>, broadcast::Receiver<String>) {
+    fn test_state(
+        adapter: Option<LineWorksAdapter>,
+    ) -> (Arc<crate::AppState>, broadcast::Receiver<String>) {
         let (event_tx, event_rx) = broadcast::channel(16);
         let mut state = crate::AppState::test_default(event_tx);
         state.lineworks = adapter.map(Arc::new);
@@ -1327,9 +1336,13 @@ mod tests {
 
         // The ack lands asynchronously; poll briefly for the mock hit.
         for _ in 0..40 {
-            if !server.received_requests().await.unwrap().iter().any(|r| {
-                r.url.path().contains("/messages")
-            }) {
+            if !server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.url.path().contains("/messages"))
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         }
@@ -1467,7 +1480,10 @@ mod tests {
         let _token = mount_token_endpoint(&server, "tok_send").await;
         let _send = Mock::given(method("POST"))
             .and(path("/bots/12345/users/U1/messages"))
-            .and(wiremock::matchers::header("authorization", "Bearer tok_send"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer tok_send",
+            ))
             .respond_with(ResponseTemplate::new(201))
             .expect(1)
             .mount_as_scoped(&server)
@@ -1540,8 +1556,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_ignores_unsupported_commands() {
         // No mock server: any HTTP call would fail the test via ok == false.
-        let adapter =
-            LineWorksAdapter::new(test_config("http://unused", "http://unused"));
+        let adapter = LineWorksAdapter::new(test_config("http://unused", "http://unused"));
         for cmd in [
             "add_reaction",
             "remove_reaction",
