@@ -10,7 +10,12 @@
 //! streaming), no reactions, no threads, plain-text only, 10,000-char text
 //! limit, and no reply-token mechanism (push-style sends only).
 
+use crate::media::{
+    audio_extension, format_bytes, is_text_extension, resize_and_compress, AUDIO_MAX_DOWNLOAD,
+    FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD,
+};
 use crate::schema::*;
+use crate::store;
 use axum::extract::State;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -347,6 +352,8 @@ struct LineWorksContent {
     text: Option<String>,
     #[serde(rename = "fileId")]
     file_id: Option<String>,
+    #[serde(rename = "fileName")]
+    file_name: Option<String>,
 }
 
 // --- Webhook handler ---
@@ -407,7 +414,7 @@ pub async fn webhook(
         }
     };
 
-    if let Some(mut gateway_event) = build_gateway_event(&event) {
+    if let Some(mut gateway_event) = build_gateway_event(&event, Some(adapter)).await {
         if !passes_mention_gate(adapter, &state.client, &mut gateway_event).await {
             return axum::http::StatusCode::OK;
         }
@@ -449,7 +456,226 @@ pub async fn webhook(
     axum::http::StatusCode::OK
 }
 
-fn build_gateway_event(event: &LineWorksEvent) -> Option<GatewayEvent> {
+/// Fetch attachment bytes from the LINE WORKS content-download API.
+///
+/// `GET /bots/{botId}/attachments/{fileId}` answers 302 with a storage URL
+/// that itself requires the Authorization header, and reqwest strips auth on
+/// cross-host redirects — so redirects are followed manually (bounded).
+async fn fetch_attachment_bytes(
+    adapter: &LineWorksAdapter,
+    file_id: &str,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, String), String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("client build error: {e}"))?;
+    let token = adapter
+        .token_cache
+        .get_token(&client, &adapter.config)
+        .await
+        .map_err(|e| format!("token error: {e}"))?;
+
+    let mut url = format!(
+        "{}/bots/{}/attachments/{}",
+        adapter.config.api_base, adapter.config.bot_id, file_id
+    );
+    for _ in 0..4 {
+        let resp = client
+            .get(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| format!("download request error: {e}"))?;
+        if resp.status().is_redirection() {
+            url = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or("redirect without Location header")?
+                .to_string();
+            continue;
+        }
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status().as_u16()));
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        if let Some(len) = resp.content_length() {
+            if len > max_bytes {
+                return Err(format!(
+                    "size exceeded: {} exceeds {}",
+                    format_bytes(len),
+                    format_bytes(max_bytes)
+                ));
+            }
+        }
+        let mut resp = resp;
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("body read error: {e}"))?
+        {
+            body.extend_from_slice(&chunk);
+            if body.len() as u64 > max_bytes {
+                return Err(format!(
+                    "size exceeded: {} exceeds {}",
+                    format_bytes(body.len() as u64),
+                    format_bytes(max_bytes)
+                ));
+            }
+        }
+        return Ok((body, content_type));
+    }
+    Err("too many redirects".into())
+}
+
+async fn download_attachment(
+    adapter: &LineWorksAdapter,
+    kind: &str,
+    file_id: &str,
+    file_name: Option<&str>,
+) -> Attachment {
+    match kind {
+        "image" => {
+            let filename = format!("lineworks_{file_id}.jpg");
+            match fetch_attachment_bytes(adapter, file_id, IMAGE_MAX_DOWNLOAD).await {
+                Ok((bytes, _ct)) => {
+                    match tokio::task::spawn_blocking(move || resize_and_compress(&bytes)).await {
+                        Ok(Ok((compressed, mime))) => match store::store_media(&compressed).await {
+                            Some(path) => {
+                                let ext = if mime == "image/gif" { "gif" } else { "jpg" };
+                                Attachment {
+                                    attachment_type: "image".into(),
+                                    filename: format!("lineworks_{file_id}.{ext}"),
+                                    mime_type: mime,
+                                    data: String::new(),
+                                    size: compressed.len() as u64,
+                                    path: Some(path),
+                                    status: None,
+                                }
+                            }
+                            None => Attachment::rejected(
+                                "image",
+                                filename,
+                                "image/jpeg",
+                                0,
+                                "processing failed: storage error",
+                            ),
+                        },
+                        _ => Attachment::rejected(
+                            "image",
+                            filename,
+                            "image/jpeg",
+                            0,
+                            "processing failed: image encoding error",
+                        ),
+                    }
+                }
+                Err(reason) => {
+                    warn!(file_id, %reason, "lineworks image download failed");
+                    let reason = if reason.starts_with("size exceeded") {
+                        reason
+                    } else {
+                        format!("download failed: {reason}")
+                    };
+                    Attachment::rejected("image", filename, "image/jpeg", 0, reason)
+                }
+            }
+        }
+        "audio" => {
+            let fallback_name = format!("lineworks_{file_id}.audio");
+            match fetch_attachment_bytes(adapter, file_id, AUDIO_MAX_DOWNLOAD).await {
+                Ok((bytes, ct)) => match store::store_media(&bytes).await {
+                    Some(path) => {
+                        let ext = audio_extension(&ct);
+                        Attachment {
+                            attachment_type: "audio".into(),
+                            filename: format!("lineworks_{file_id}.{ext}"),
+                            mime_type: ct,
+                            data: String::new(),
+                            size: bytes.len() as u64,
+                            path: Some(path),
+                            status: None,
+                        }
+                    }
+                    None => Attachment::rejected(
+                        "audio",
+                        fallback_name,
+                        "audio/ogg",
+                        0,
+                        "processing failed: storage error",
+                    ),
+                },
+                Err(reason) => {
+                    warn!(file_id, %reason, "lineworks audio download failed");
+                    let reason = if reason.starts_with("size exceeded") {
+                        reason
+                    } else {
+                        format!("download failed: {reason}")
+                    };
+                    Attachment::rejected("audio", fallback_name, "audio/ogg", 0, reason)
+                }
+            }
+        }
+        // "file": only whitelisted text extensions are forwarded — binaries
+        // have no representation the agent can consume.
+        _ => {
+            let filename = file_name
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("lineworks_{file_id}"));
+            if !is_text_extension(&filename) {
+                return Attachment::rejected(
+                    "text_file",
+                    filename,
+                    "application/octet-stream",
+                    0,
+                    "unsupported format: only text files are supported",
+                );
+            }
+            match fetch_attachment_bytes(adapter, file_id, FILE_MAX_DOWNLOAD).await {
+                Ok((bytes, _ct)) => match store::store_media(&bytes).await {
+                    Some(path) => Attachment {
+                        attachment_type: "text_file".into(),
+                        filename,
+                        mime_type: "text/plain".into(),
+                        data: String::new(),
+                        size: bytes.len() as u64,
+                        path: Some(path),
+                        status: None,
+                    },
+                    None => Attachment::rejected(
+                        "text_file",
+                        filename,
+                        "text/plain",
+                        0,
+                        "processing failed: storage error",
+                    ),
+                },
+                Err(reason) => {
+                    warn!(file_id, %reason, "lineworks file download failed");
+                    let reason = if reason.starts_with("size exceeded") {
+                        reason
+                    } else {
+                        format!("download failed: {reason}")
+                    };
+                    Attachment::rejected("text_file", filename, "text/plain", 0, reason)
+                }
+            }
+        }
+    }
+}
+
+async fn build_gateway_event(
+    event: &LineWorksEvent,
+    adapter: Option<&LineWorksAdapter>,
+) -> Option<GatewayEvent> {
     if event.event_type != "message" {
         return None;
     }
@@ -475,21 +701,26 @@ fn build_gateway_event(event: &LineWorksEvent) -> Option<GatewayEvent> {
     let mut attachments = Vec::new();
     let text = match content.content_type.as_str() {
         "text" => content.text.as_deref().unwrap_or(""),
-        "image" | "file" => {
-            // v1: attachment download (separate fileId content API) not wired yet.
+        kind @ ("image" | "file" | "audio") => {
             let file_id = content.file_id.as_deref().unwrap_or("unknown");
-            warn!(file_id = %file_id, kind = %content.content_type, "lineworks attachment not supported yet");
-            attachments.push(Attachment::rejected(
-                if content.content_type == "image" {
-                    "image"
-                } else {
-                    "text_file"
-                },
-                format!("lineworks_{file_id}"),
-                "application/octet-stream",
-                0,
-                "unsupported format: lineworks attachments not supported yet",
-            ));
+            match adapter {
+                Some(adapter) => {
+                    attachments.push(
+                        download_attachment(adapter, kind, file_id, content.file_name.as_deref())
+                            .await,
+                    );
+                }
+                None => {
+                    warn!(file_id = %file_id, kind = %kind, "lineworks attachment received but adapter not configured");
+                    attachments.push(Attachment::rejected(
+                        if kind == "image" { "image" } else { "text_file" },
+                        format!("lineworks_{file_id}"),
+                        "application/octet-stream",
+                        0,
+                        "configuration error: service not configured",
+                    ));
+                }
+            }
             ""
         }
         other => {
@@ -795,19 +1026,20 @@ mod tests {
 
     // --- Event mapping ---
 
-    fn parse_event(json: serde_json::Value) -> Option<GatewayEvent> {
+    async fn parse_event(json: serde_json::Value) -> Option<GatewayEvent> {
         let event: LineWorksEvent = serde_json::from_value(json).unwrap();
-        build_gateway_event(&event)
+        build_gateway_event(&event, None).await
     }
 
-    #[test]
-    fn maps_direct_text_message() {
+    #[tokio::test]
+    async fn maps_direct_text_message() {
         let ev = parse_event(serde_json::json!({
             "type": "message",
             "source": {"userId": "U1", "domainId": 1},
             "issuedTime": "2026-07-24T10:00:00Z",
             "content": {"type": "text", "text": "hello"}
         }))
+        .await
         .expect("text message should map");
         assert_eq!(ev.platform, "lineworks");
         assert_eq!(ev.channel.id, "user:U1");
@@ -817,46 +1049,50 @@ mod tests {
         assert_eq!(ev.message_id, ev.event_id);
     }
 
-    #[test]
-    fn maps_channel_text_message() {
+    #[tokio::test]
+    async fn maps_channel_text_message() {
         let ev = parse_event(serde_json::json!({
             "type": "message",
             "source": {"userId": "U2", "channelId": "C9", "domainId": 1},
             "content": {"type": "text", "text": "hi all"}
         }))
+        .await
         .expect("channel message should map");
         assert_eq!(ev.channel.id, "C9");
         assert_eq!(ev.channel.channel_type, "channel");
         assert_eq!(ev.sender.id, "U2");
     }
 
-    #[test]
-    fn image_maps_to_rejected_attachment() {
+    #[tokio::test]
+    async fn image_without_adapter_maps_to_rejected_attachment() {
         let ev = parse_event(serde_json::json!({
             "type": "message",
             "source": {"userId": "U1"},
             "content": {"type": "image", "fileId": "F123"}
         }))
+        .await
         .expect("image should map with rejected attachment");
         assert_eq!(ev.content.text, "");
         assert_eq!(ev.content.attachments.len(), 1);
         let att = &ev.content.attachments[0];
         assert_eq!(att.attachment_type, "image");
-        assert!(att.status.as_deref().unwrap().starts_with("unsupported format"));
+        assert!(att.status.as_deref().unwrap().starts_with("configuration error"));
     }
 
-    #[test]
-    fn ignores_non_message_and_unsupported_events() {
+    #[tokio::test]
+    async fn ignores_non_message_and_unsupported_events() {
         assert!(parse_event(serde_json::json!({
             "type": "join",
             "source": {"userId": "U1", "channelId": "C1"}
         }))
+        .await
         .is_none());
         assert!(parse_event(serde_json::json!({
             "type": "message",
             "source": {"userId": "U1"},
             "content": {"type": "sticker", "packageId": "1", "stickerId": "2"}
         }))
+        .await
         .is_none());
         // Missing userId → skip
         assert!(parse_event(serde_json::json!({
@@ -864,7 +1100,139 @@ mod tests {
             "source": {"channelId": "C1"},
             "content": {"type": "text", "text": "x"}
         }))
+        .await
         .is_none());
+    }
+
+    // --- Attachment download ---
+
+    /// Mount the 302-redirect download flow: attachments endpoint redirects
+    /// to /storage/{fileId}, which serves `bytes` with `content_type`.
+    async fn mount_attachment_download(
+        server: &MockServer,
+        file_id: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> (wiremock::MockGuard, wiremock::MockGuard) {
+        let redirect = Mock::given(method("GET"))
+            .and(path(format!("/bots/12345/attachments/{file_id}")))
+            .and(wiremock::matchers::header("authorization", "Bearer tok_dl"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/storage/{file_id}", server.uri())),
+            )
+            .expect(1)
+            .mount_as_scoped(server)
+            .await;
+        let storage = Mock::given(method("GET"))
+            .and(path(format!("/storage/{file_id}")))
+            .and(wiremock::matchers::header("authorization", "Bearer tok_dl"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", content_type)
+                    .set_body_bytes(bytes),
+            )
+            .expect(1)
+            .mount_as_scoped(server)
+            .await;
+        (redirect, storage)
+    }
+
+    #[tokio::test]
+    async fn image_downloads_via_redirect_and_stores() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_dl").await;
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([0, 255, 0]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let _guards =
+            mount_attachment_download(&server, "F_img", buf.into_inner(), "image/png").await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let event: LineWorksEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "image", "fileId": "F_img"}
+        }))
+        .unwrap();
+        let ev = build_gateway_event(&event, Some(&adapter))
+            .await
+            .expect("image event should map");
+        let att = &ev.content.attachments[0];
+        assert_eq!(att.attachment_type, "image");
+        assert!(att.status.is_none(), "download should succeed: {:?}", att.status);
+        assert!(att.size > 0);
+        let path = att.path.clone().expect("stored path");
+        let stored = tokio::fs::read(&path).await.unwrap();
+        assert!(!stored.is_empty());
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn text_file_downloads_and_binary_rejected() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_dl").await;
+        let _guards = mount_attachment_download(
+            &server,
+            "F_log",
+            b"line one\nline two".to_vec(),
+            "text/plain",
+        )
+        .await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+
+        // Whitelisted text extension downloads and stores.
+        let event: LineWorksEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "file", "fileId": "F_log", "fileName": "build.log"}
+        }))
+        .unwrap();
+        let ev = build_gateway_event(&event, Some(&adapter)).await.unwrap();
+        let att = &ev.content.attachments[0];
+        assert_eq!(att.attachment_type, "text_file");
+        assert_eq!(att.filename, "build.log");
+        assert!(att.status.is_none(), "text file should download: {:?}", att.status);
+        if let Some(p) = att.path.clone() {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+
+        // Binary extension is rejected without hitting the download API.
+        let event: LineWorksEvent = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "file", "fileId": "F_bin", "fileName": "tool.exe"}
+        }))
+        .unwrap();
+        let ev = build_gateway_event(&event, Some(&adapter)).await.unwrap();
+        let att = &ev.content.attachments[0];
+        assert!(att
+            .status
+            .as_deref()
+            .unwrap()
+            .starts_with("unsupported format"));
+    }
+
+    #[tokio::test]
+    async fn oversized_download_rejected() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_dl").await;
+        let _big = Mock::given(method("GET"))
+            .and(path("/bots/12345/attachments/F_big"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(vec![0u8; 64]),
+            )
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let err = fetch_attachment_bytes(&adapter, "F_big", 16)
+            .await
+            .expect_err("64-byte body must exceed the 16-byte cap");
+        assert!(err.starts_with("size exceeded"), "unexpected error: {err}");
     }
 
     // --- Webhook handler (HTTP-level) ---
@@ -995,12 +1363,13 @@ mod tests {
 
     // --- Mention gating ---
 
-    fn channel_text_event(text: &str) -> GatewayEvent {
+    async fn channel_text_event(text: &str) -> GatewayEvent {
         parse_event(serde_json::json!({
             "type": "message",
             "source": {"userId": "U1", "channelId": "C1", "domainId": 1},
             "content": {"type": "text", "text": text}
         }))
+        .await
         .unwrap()
     }
 
@@ -1008,7 +1377,7 @@ mod tests {
     async fn mention_gate_drops_unmentioned_channel_message() {
         let adapter = LineWorksAdapter::new(test_config("http://unused", "http://unused"));
         let client = reqwest::Client::new();
-        let mut ev = channel_text_event("hello without mention");
+        let mut ev = channel_text_event("hello without mention").await;
         assert!(!passes_mention_gate(&adapter, &client, &mut ev).await);
     }
 
@@ -1016,7 +1385,7 @@ mod tests {
     async fn mention_gate_passes_and_strips_mention() {
         let adapter = LineWorksAdapter::new(test_config("http://unused", "http://unused"));
         let client = reqwest::Client::new();
-        let mut ev = channel_text_event("@TestBot 幫我查一下");
+        let mut ev = channel_text_event("@TestBot 幫我查一下").await;
         assert!(passes_mention_gate(&adapter, &client, &mut ev).await);
         assert_eq!(ev.content.text, "幫我查一下");
     }
@@ -1031,13 +1400,14 @@ mod tests {
             "source": {"userId": "U1"},
             "content": {"type": "text", "text": "no mention"}
         }))
+        .await
         .unwrap();
         assert!(passes_mention_gate(&adapter, &client, &mut dm).await);
         // require_mention = false passes channel messages untouched
         let mut config = test_config("http://unused", "http://unused");
         config.require_mention = false;
         let adapter = LineWorksAdapter::new(config);
-        let mut ev = channel_text_event("ambient message");
+        let mut ev = channel_text_event("ambient message").await;
         assert!(passes_mention_gate(&adapter, &client, &mut ev).await);
         assert_eq!(ev.content.text, "ambient message");
     }
@@ -1061,11 +1431,11 @@ mod tests {
         let adapter = LineWorksAdapter::new(config);
         let client = reqwest::Client::new();
 
-        let mut ev = channel_text_event("@Nuphos (Dev) hi");
+        let mut ev = channel_text_event("@Nuphos (Dev) hi").await;
         assert!(passes_mention_gate(&adapter, &client, &mut ev).await);
         assert_eq!(ev.content.text, "hi");
         // Second call served from cache (expect(1) enforces a single fetch).
-        let mut ev2 = channel_text_event("no mention here");
+        let mut ev2 = channel_text_event("no mention here").await;
         assert!(!passes_mention_gate(&adapter, &client, &mut ev2).await);
     }
 
