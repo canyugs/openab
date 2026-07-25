@@ -1132,6 +1132,7 @@ async fn main() -> anyhow::Result<()> {
                     webhook_path: r.webhook_path,
                     require_mention: r.require_mention,
                     bot_name: r.bot_name,
+                    rich_messages: r.rich_messages,
                 });
             }
 

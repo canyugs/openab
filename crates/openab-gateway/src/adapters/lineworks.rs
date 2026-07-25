@@ -49,6 +49,10 @@ pub struct LineWorksConfig {
     /// Bot display name used for mention matching. When unset, fetched once
     /// from `GET /bots/{botId}` and cached.
     pub bot_name: Option<String>,
+    /// Render markdown replies as flexible-template (flex) messages.
+    /// Falls back to plain text when the reply has no markdown, exceeds the
+    /// flex size limits, or the API rejects the payload. Default: true.
+    pub rich_messages: bool,
 }
 
 impl LineWorksConfig {
@@ -96,6 +100,9 @@ impl LineWorksConfig {
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
             bot_name: read_nonempty("LINEWORKS_BOT_NAME"),
+            rich_messages: read_nonempty("LINEWORKS_RICH_MESSAGES")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
         })
     }
 }
@@ -547,9 +554,30 @@ pub async fn dispatch_lineworks_reply(
         &reply.channel.id,
     );
 
+    // Flex first: markdown replies render as a flexible template when they
+    // fit in one message. Any failure falls through to plain text so a
+    // renderer or API quirk never loses content.
+    if adapter.config.rich_messages
+        && reply.content.text.chars().count() <= LINEWORKS_TEXT_LIMIT
+    {
+        if let Some((alt_text, bubble)) =
+            super::lineworks_flex::markdown_to_flex(&reply.content.text)
+        {
+            let body = serde_json::json!({
+                "content": {"type": "flex", "altText": alt_text, "contents": bubble}
+            });
+            if send_body(client, adapter, &url, &body).await {
+                info!(to = %reply.channel.id, kind = "flex", "gateway → lineworks");
+                return true;
+            }
+            warn!(to = %reply.channel.id, "lineworks flex send failed, falling back to text");
+        }
+    }
+
     let mut all_ok = true;
     for chunk in split_text(&reply.content.text, LINEWORKS_TEXT_LIMIT) {
-        if !send_text_chunk(client, adapter, &url, &chunk).await {
+        let body = serde_json::json!({"content": {"type": "text", "text": chunk}});
+        if !send_body(client, adapter, &url, &body).await {
             all_ok = false;
             break;
         }
@@ -560,12 +588,12 @@ pub async fn dispatch_lineworks_reply(
     all_ok
 }
 
-/// Send one text message; on 401, invalidate the cached token and retry once.
-async fn send_text_chunk(
+/// Send one message body; on 401, invalidate the cached token and retry once.
+async fn send_body(
     client: &reqwest::Client,
     adapter: &LineWorksAdapter,
     url: &str,
-    text: &str,
+    body: &serde_json::Value,
 ) -> bool {
     for attempt in 0..2 {
         let token = match adapter
@@ -579,14 +607,7 @@ async fn send_text_chunk(
                 return false;
             }
         };
-        let resp = client
-            .post(url)
-            .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "content": {"type": "text", "text": text}
-            }))
-            .send()
-            .await;
+        let resp = client.post(url).bearer_auth(&token).json(body).send().await;
         match resp {
             Ok(r) if r.status().is_success() => return true,
             Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 => {
@@ -631,6 +652,7 @@ mod tests {
             auth_base: auth_base.into(),
             require_mention: true,
             bot_name: Some("TestBot".into()),
+            rich_messages: true,
         }
     }
 
@@ -1087,6 +1109,114 @@ mod tests {
             .await;
             assert!(!ok, "command {cmd} should be a no-op");
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_sends_flex_for_markdown_reply() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_flex").await;
+        let _send = Mock::given(method("POST"))
+            .and(path("/bots/12345/users/U1/messages"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let ok = dispatch_lineworks_reply(
+            &reqwest::Client::new(),
+            &adapter,
+            &text_reply("user:U1", "# 報告\n- 第一點\n- 第二點", None),
+        )
+        .await;
+        assert!(ok);
+
+        let sent = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.url.path().contains("/messages"))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+        assert_eq!(body["content"]["type"], "flex");
+        assert!(!body["content"]["altText"].as_str().unwrap().is_empty());
+        assert_eq!(body["content"]["contents"]["type"], "bubble");
+    }
+
+    #[tokio::test]
+    async fn dispatch_falls_back_to_text_when_flex_rejected() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_fb").await;
+        // First request (flex) → 400; the retry as plain text → 201.
+        let _flex = Mock::given(method("POST"))
+            .and(path("/bots/12345/users/U1/messages"))
+            .respond_with(ResponseTemplate::new(400))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _text = Mock::given(method("POST"))
+            .and(path("/bots/12345/users/U1/messages"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let ok = dispatch_lineworks_reply(
+            &reqwest::Client::new(),
+            &adapter,
+            &text_reply("user:U1", "# 標題\n內容", None),
+        )
+        .await;
+        assert!(ok);
+
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().contains("/messages"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["content"]["type"], "flex");
+        assert_eq!(bodies[1]["content"]["type"], "text");
+    }
+
+    #[tokio::test]
+    async fn dispatch_plain_text_skips_flex() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_plain").await;
+        let _send = Mock::given(method("POST"))
+            .and(path("/bots/12345/users/U1/messages"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let ok = dispatch_lineworks_reply(
+            &reqwest::Client::new(),
+            &adapter,
+            &text_reply("user:U1", "純文字回覆，沒有任何排版", None),
+        )
+        .await;
+        assert!(ok);
+
+        let body: serde_json::Value = serde_json::from_slice(
+            &server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.url.path().contains("/messages"))
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        assert_eq!(body["content"]["type"], "text");
     }
 
     #[tokio::test]

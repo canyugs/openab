@@ -373,6 +373,7 @@ impl AppState {
             "LINEWORKS_WEBHOOK_PATH" => Some(cfg.webhook_path.clone()),
             "LINEWORKS_REQUIRE_MENTION" => Some(cfg.require_mention.to_string()),
             "LINEWORKS_BOT_NAME" => cfg.bot_name.clone(),
+            "LINEWORKS_RICH_MESSAGES" => Some(cfg.rich_messages.to_string()),
             _ => None,
         })
         .map(|config| Arc::new(adapters::lineworks::LineWorksAdapter::new(config)));
@@ -486,6 +487,7 @@ pub struct GatewayLineWorksConfig {
     pub webhook_path: String,
     pub require_mention: bool,
     pub bot_name: Option<String>,
+    pub rich_messages: bool,
 }
 
 /// Parameter object for passing resolved WeCom config across the crate

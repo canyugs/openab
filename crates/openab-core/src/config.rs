@@ -926,6 +926,10 @@ pub struct LineWorksConfig {
     /// Bot display name for mention matching. When unset, fetched from
     /// `GET /bots/{botId}`. Env fallback: `LINEWORKS_BOT_NAME`.
     pub bot_name: Option<String>,
+    /// Render markdown replies as flexible-template messages (plain-text
+    /// fallback on any failure). Env fallback: `LINEWORKS_RICH_MESSAGES`
+    /// (default `true`).
+    pub rich_messages: Option<bool>,
 }
 
 /// Fully resolved LINE WORKS settings (config → env → default applied).
@@ -941,6 +945,7 @@ pub struct ResolvedLineWorks {
     pub webhook_path: String,
     pub require_mention: bool,
     pub bot_name: Option<String>,
+    pub rich_messages: bool,
 }
 
 impl LineWorksConfig {
@@ -972,6 +977,13 @@ impl LineWorksConfig {
                     .unwrap_or(true)
             }),
             bot_name: field(&self.bot_name, "LINEWORKS_BOT_NAME"),
+            rich_messages: self.rich_messages.unwrap_or_else(|| {
+                std::env::var("LINEWORKS_RICH_MESSAGES")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                    .unwrap_or(true)
+            }),
         }
     }
 }

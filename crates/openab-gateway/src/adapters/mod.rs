@@ -19,3 +19,5 @@ pub mod acp_server;
 pub mod acp_schema;
 #[cfg(feature = "lineworks")]
 pub mod lineworks;
+#[cfg(feature = "lineworks")]
+pub mod lineworks_flex;
