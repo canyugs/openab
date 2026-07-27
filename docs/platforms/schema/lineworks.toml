@@ -217,14 +217,14 @@ pr      = ""
 feature = "multibot"
 status  = "n_a"
 note    = "The platform does not deliver bot messages to other bots' callbacks, so multi-bot coordination cannot trigger."
-source  = ["crates/openab-gateway/src/adapters/lineworks.rs#build_gateway_event"]
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#classify_event"]
 pr      = ""
 
 [[openab_features]]
 feature = "group_routing"
 status  = "implemented"
 note    = "Channel keyed by channelId for group talks; 1:1 talks use a user:{userId} synthetic channel id so reply dispatch can pick the users vs channels endpoint from the otherwise-opaque id."
-source  = ["crates/openab-gateway/src/adapters/lineworks.rs#build_gateway_event", "crates/openab-gateway/src/adapters/lineworks.rs#send_endpoint"]
+source  = ["crates/openab-gateway/src/adapters/lineworks.rs#classify_event", "crates/openab-gateway/src/adapters/lineworks.rs#send_endpoint"]
 pr      = ""
 
 [[openab_features]]
