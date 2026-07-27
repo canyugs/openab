@@ -953,16 +953,34 @@ pub struct ResolvedLineWorks {
     pub ack_message: Option<String>,
 }
 
+impl ResolvedLineWorks {
+    /// The single activation validator: true only when every credential the
+    /// adapter constructor requires is present and non-empty (bot id/secret,
+    /// OAuth client pair, service account, and a private key — inline or
+    /// file path). Startup preflight, cron platform registration, and
+    /// adapter construction must all agree on this definition.
+    pub fn is_complete(&self) -> bool {
+        self.bot_id.is_some()
+            && self.bot_secret.is_some()
+            && self.client_id.is_some()
+            && self.client_secret.is_some()
+            && self.service_account.is_some()
+            && (self.private_key.is_some() || self.private_key_file.is_some())
+    }
+}
+
 impl LineWorksConfig {
     /// Resolve every field: config value (if set) → `LINEWORKS_*` env →
-    /// default. Same shape as [`LineConfig::resolve`]; empty strings from
-    /// `${}` expansion of unset env vars fall through to the env fallback.
+    /// default. Same shape as [`LineConfig::resolve`]; empty strings — from
+    /// `${}` expansion of unset vars OR from empty env values — are treated
+    /// as unset on both layers, so activation checks and adapter
+    /// construction agree on what "configured" means.
     pub fn resolve(&self) -> ResolvedLineWorks {
         let field = |v: &Option<String>, env: &str| {
             v.as_ref()
                 .filter(|s| !s.is_empty())
                 .cloned()
-                .or_else(|| std::env::var(env).ok())
+                .or_else(|| std::env::var(env).ok().filter(|s| !s.is_empty()))
         };
         ResolvedLineWorks {
             bot_id: field(&self.bot_id, "LINEWORKS_BOT_ID"),
@@ -3781,5 +3799,67 @@ cancel_strategy = "noop"
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
+    }
+
+    #[test]
+    fn lineworks_activation_validator() {
+        // Serialized via env hygiene: clear all LINEWORKS_* first (tests in
+        // this binary do not otherwise touch these vars).
+        for var in [
+            "LINEWORKS_BOT_ID",
+            "LINEWORKS_BOT_SECRET",
+            "LINEWORKS_CLIENT_ID",
+            "LINEWORKS_CLIENT_SECRET",
+            "LINEWORKS_SERVICE_ACCOUNT",
+            "LINEWORKS_PRIVATE_KEY",
+            "LINEWORKS_PRIVATE_KEY_FILE",
+        ] {
+            std::env::remove_var(var);
+        }
+
+        let full = LineWorksConfig {
+            bot_id: Some("1".into()),
+            bot_secret: Some("s".into()),
+            client_id: Some("c".into()),
+            client_secret: Some("cs".into()),
+            service_account: Some("sa@x".into()),
+            private_key: Some("pem".into()),
+            ..Default::default()
+        };
+        assert!(full.resolve().is_complete());
+
+        // Empty environment → not activated.
+        assert!(!LineWorksConfig::default().resolve().is_complete());
+
+        // Any missing credential → incomplete (bot id alone must NOT activate).
+        let only_bot_id = LineWorksConfig {
+            bot_id: Some("1".into()),
+            ..Default::default()
+        };
+        assert!(!only_bot_id.resolve().is_complete());
+        let mut partial = full.clone();
+        partial.client_secret = None;
+        assert!(!partial.resolve().is_complete());
+
+        // Empty-string config values are treated as unset.
+        let mut empty_val = full.clone();
+        empty_val.bot_secret = Some(String::new());
+        assert!(!empty_val.resolve().is_complete());
+
+        // Empty-string ENV values are also treated as unset...
+        let mut needs_env = full.clone();
+        needs_env.bot_id = None;
+        std::env::set_var("LINEWORKS_BOT_ID", "");
+        assert!(!needs_env.resolve().is_complete());
+        // ...while a real env value completes the set.
+        std::env::set_var("LINEWORKS_BOT_ID", "99");
+        assert!(needs_env.resolve().is_complete());
+        std::env::remove_var("LINEWORKS_BOT_ID");
+
+        // private_key_file counts as key material.
+        let mut file_key = full.clone();
+        file_key.private_key = None;
+        file_key.private_key_file = Some("/etc/key.pem".into());
+        assert!(file_key.resolve().is_complete());
     }
 }

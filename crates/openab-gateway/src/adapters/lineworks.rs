@@ -122,15 +122,27 @@ pub struct LineWorksAdapter {
     pub config: LineWorksConfig,
     token_cache: LineWorksTokenCache,
     /// Bot display name for mention matching, fetched lazily from the API
-    /// when `config.bot_name` is unset.
-    bot_name_cache: RwLock<Option<String>>,
+    /// when `config.bot_name` is unset. A `Mutex` (not `RwLock`) held across
+    /// the fetch gives single-flight semantics: concurrent first-use events
+    /// wait for one lookup instead of duplicating token + bot-info requests.
+    bot_name_cache: tokio::sync::Mutex<Option<String>>,
+    /// Shared client for attachment downloads: redirects disabled so the
+    /// Authorization header can be re-attached manually on the cross-host
+    /// hop. One client per adapter keeps connection pooling on the hot path.
+    download_client: reqwest::Client,
 }
 
 impl LineWorksAdapter {
     pub fn new(config: LineWorksConfig) -> Self {
+        let download_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("lineworks download client must build");
         Self {
             token_cache: LineWorksTokenCache::new(),
-            bot_name_cache: RwLock::new(None),
+            bot_name_cache: tokio::sync::Mutex::new(None),
+            download_client,
             config,
         }
     }
@@ -142,7 +154,10 @@ impl LineWorksAdapter {
         if let Some(ref name) = self.config.bot_name {
             return Some(name.clone());
         }
-        if let Some(ref name) = *self.bot_name_cache.read().await {
+        // Single-flight: the lock is held across the network fetch so
+        // concurrent callers wait for the first result instead of racing.
+        let mut cache = self.bot_name_cache.lock().await;
+        if let Some(ref name) = *cache {
             return Some(name.clone());
         }
         let token = match self.token_cache.get_token(client, &self.config).await {
@@ -172,7 +187,7 @@ impl LineWorksAdapter {
         };
         let name = body.get("botName").and_then(|v| v.as_str())?.to_string();
         info!(bot_name = %name, "lineworks: resolved bot name for mention gating");
-        *self.bot_name_cache.write().await = Some(name.clone());
+        *cache = Some(name.clone());
         Some(name)
     }
 }
@@ -265,7 +280,10 @@ async fn refresh_token(
             ("assertion", &jwt),
             ("client_id", &config.client_id),
             ("client_secret", &config.client_secret),
-            ("scope", "bot"),
+            // Least-privilege: message send + read-only bot details (the
+            // bot-name lookup for mention gating). Deliberately NOT the
+            // broad read/write `bot` scope.
+            ("scope", "bot.message,bot.read"),
         ])
         .send()
         .await
@@ -388,10 +406,15 @@ pub async fn webhook(
         return axum::http::StatusCode::UNAUTHORIZED;
     }
 
-    // The signature already proves the sender knows this bot's secret; the
-    // bot-id check just catches Console misconfiguration (wrong callback URL).
-    if let Some(bot_id) = headers.get("x-works-botid").and_then(|v| v.to_str().ok()) {
-        if bot_id != adapter.config.bot_id {
+    // The platform contract marks X-WORKS-BotId as a required header — a
+    // signed request without it is malformed/misrouted and is rejected.
+    let bot_id_header = headers.get("x-works-botid").and_then(|v| v.to_str().ok());
+    match bot_id_header {
+        None => {
+            warn!("lineworks webhook rejected: missing X-WORKS-BotId");
+            return axum::http::StatusCode::UNAUTHORIZED;
+        }
+        Some(bot_id) if bot_id != adapter.config.bot_id => {
             warn!(
                 got = %bot_id,
                 expected = %adapter.config.bot_id,
@@ -399,6 +422,7 @@ pub async fn webhook(
             );
             return axum::http::StatusCode::UNAUTHORIZED;
         }
+        Some(_) => {}
     }
 
     let event: LineWorksEvent = match serde_json::from_slice(&body) {
@@ -409,46 +433,107 @@ pub async fn webhook(
         }
     };
 
-    if let Some(mut gateway_event) = build_gateway_event(&event, Some(adapter)).await {
-        if !passes_mention_gate(adapter, &state.client, &mut gateway_event).await {
-            return axum::http::StatusCode::OK;
-        }
-        if gateway_event.content.text.trim().is_empty()
-            && gateway_event.content.attachments.is_empty()
-        {
-            // Mention stripping can leave an empty prompt ("@Bot" alone).
-            return axum::http::StatusCode::OK;
-        }
-        // Receipt ack: LINE WORKS has no reactions/typing indicator, so a
-        // short message is the only "working on it" signal. Fire-and-forget
-        // so the ack never delays the event reaching the agent.
-        if let Some(ref ack) = adapter.config.ack_message {
-            let ack = ack.clone();
-            let adapter = adapter.clone();
-            let client = state.client.clone();
-            let url = send_endpoint(
-                &adapter.config.api_base,
-                &adapter.config.bot_id,
-                &gateway_event.channel.id,
-            );
-            tokio::spawn(async move {
-                let body = serde_json::json!({"content": {"type": "text", "text": ack}});
-                if !send_body(&client, &adapter, &url, &body).await {
-                    warn!("lineworks: ack message send failed");
-                }
-            });
-        }
+    // Cheap, pure classification only — attachment I/O happens post-ack.
+    let Some((gateway_event, pending)) = classify_event(&event) else {
+        return axum::http::StatusCode::OK;
+    };
 
-        let json = serde_json::to_string(&gateway_event).unwrap();
-        info!(
-            channel = %gateway_event.channel.id,
-            sender = %gateway_event.sender.id,
-            "lineworks → gateway"
-        );
-        let _ = state.event_tx.send(json);
+    // An acknowledged callback must correspond to an acceptable event: the
+    // platform does not resend failed callbacks, so if no consumer is
+    // attached the event would be silently lost. Refuse the ack instead.
+    if state.event_tx.receiver_count() == 0 {
+        error!("lineworks webhook refused: no gateway event consumer attached");
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE;
     }
 
+    // Bounded post-ack processing (same pattern as the LINE adapter): the
+    // permit is acquired before the ack so a burst waits for capacity instead
+    // of building an unbounded backlog; mention gating and attachment
+    // download run in the worker, never on the callback response path.
+    let permit = match state
+        .lineworks_webhook_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!("lineworks webhook worker semaphore closed unexpectedly");
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+        }
+    };
+    let adapter = adapter.clone();
+    let background_state = state.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        process_lineworks_event(background_state, adapter, gateway_event, pending).await;
+    });
+
     axum::http::StatusCode::OK
+}
+
+/// Post-ack worker: authorize (mention gate) → download attachments →
+/// broadcast. Runs under the bounded webhook semaphore.
+///
+/// Loss policy: once the callback is acknowledged, a failure here (download
+/// error, closed broadcast channel) drops the event — LINE WORKS does not
+/// resend callbacks. Failures are logged at error level; the pre-ack
+/// receiver check keeps the "acked but nobody listening" window to
+/// consumer restarts only.
+async fn process_lineworks_event(
+    state: Arc<crate::AppState>,
+    adapter: Arc<LineWorksAdapter>,
+    mut gateway_event: GatewayEvent,
+    pending: Option<PendingAttachment>,
+) {
+    // Authorization before any attachment I/O: a dropped event must not
+    // consume downloads, tokens, or storage.
+    if !passes_mention_gate(&adapter, &state.client, &mut gateway_event).await {
+        return;
+    }
+    if pending.is_none() && gateway_event.content.text.trim().is_empty() {
+        // Mention stripping can leave an empty prompt ("@Bot" alone).
+        return;
+    }
+
+    // Receipt ack: LINE WORKS has no reactions/typing indicator, so a short
+    // message is the only "working on it" signal. Sent after the gate (never
+    // for dropped events) and before attachment download (instant feedback).
+    if let Some(ref ack) = adapter.config.ack_message {
+        let ack = ack.clone();
+        let ack_adapter = adapter.clone();
+        let client = state.client.clone();
+        let url = send_endpoint(
+            &adapter.config.api_base,
+            &adapter.config.bot_id,
+            &gateway_event.channel.id,
+        );
+        tokio::spawn(async move {
+            let body = serde_json::json!({"content": {"type": "text", "text": ack}});
+            if !send_body(&client, &ack_adapter, &url, &body).await {
+                warn!("lineworks: ack message send failed");
+            }
+        });
+    }
+
+    if let Some(p) = pending {
+        gateway_event
+            .content
+            .attachments
+            .push(download_attachment(&adapter, &p.kind, &p.file_id, p.file_name.as_deref()).await);
+    }
+
+    let json = serde_json::to_string(&gateway_event).unwrap();
+    info!(
+        channel = %gateway_event.channel.id,
+        sender = %gateway_event.sender.id,
+        "lineworks → gateway"
+    );
+    if let Err(e) = state.event_tx.send(json) {
+        // The pre-ack receiver check makes this a narrow race (consumer went
+        // away mid-processing); surfaced loudly because the event is lost.
+        error!(err = %e, event_id = %gateway_event.event_id, "lineworks: event enqueue failed after ack — event lost");
+    }
 }
 
 /// Fetch attachment bytes from the LINE WORKS content-download API.
@@ -461,14 +546,10 @@ async fn fetch_attachment_bytes(
     file_id: &str,
     max_bytes: u64,
 ) -> Result<(Vec<u8>, String), String> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("client build error: {e}"))?;
+    let client = &adapter.download_client;
     let token = adapter
         .token_cache
-        .get_token(&client, &adapter.config)
+        .get_token(client, &adapter.config)
         .await
         .map_err(|e| format!("token error: {e}"))?;
 
@@ -484,12 +565,30 @@ async fn fetch_attachment_bytes(
             .await
             .map_err(|e| format!("download request error: {e}"))?;
         if resp.status().is_redirection() {
-            url = resp
+            let location = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .ok_or("redirect without Location header")?
                 .to_string();
+            // Defense-in-depth: the bearer token is re-attached on every
+            // hop, so never follow a downgrade to plaintext. Loopback HTTP
+            // is allowed for the test harness only.
+            let parsed =
+                reqwest::Url::parse(&location).map_err(|e| format!("bad redirect URL: {e}"))?;
+            let loopback_http = parsed.scheme() == "http"
+                && matches!(
+                    parsed.host_str(),
+                    Some("127.0.0.1") | Some("localhost") | Some("[::1]")
+                );
+            if parsed.scheme() != "https" && !loopback_http {
+                return Err(format!(
+                    "insecure redirect target refused: {}://{}",
+                    parsed.scheme(),
+                    parsed.host_str().unwrap_or("?")
+                ));
+            }
+            url = location;
             continue;
         }
         if !resp.status().is_success() {
@@ -667,10 +766,19 @@ async fn download_attachment(
     }
 }
 
-async fn build_gateway_event(
-    event: &LineWorksEvent,
-    adapter: Option<&LineWorksAdapter>,
-) -> Option<GatewayEvent> {
+/// A media reference extracted during classification; downloaded only after
+/// the event passes the mention gate (never before authorization).
+#[derive(Debug, Clone)]
+struct PendingAttachment {
+    kind: String,
+    file_id: String,
+    file_name: Option<String>,
+}
+
+/// Cheap, pure event classification — no network I/O. Media events return a
+/// [`PendingAttachment`] descriptor; the download happens post-gate in the
+/// bounded worker.
+fn classify_event(event: &LineWorksEvent) -> Option<(GatewayEvent, Option<PendingAttachment>)> {
     if event.event_type != "message" {
         return None;
     }
@@ -696,44 +804,27 @@ async fn build_gateway_event(
         ),
     };
 
-    let mut attachments = Vec::new();
-    let text = match content.content_type.as_str() {
-        "text" => content.text.as_deref().unwrap_or(""),
-        kind @ ("image" | "file" | "audio") => {
-            let file_id = content.file_id.as_deref().unwrap_or("unknown");
-            match adapter {
-                Some(adapter) => {
-                    attachments.push(
-                        download_attachment(adapter, kind, file_id, content.file_name.as_deref())
-                            .await,
-                    );
-                }
-                None => {
-                    warn!(file_id = %file_id, kind = %kind, "lineworks attachment received but adapter not configured");
-                    attachments.push(Attachment::rejected(
-                        if kind == "image" {
-                            "image"
-                        } else {
-                            "text_file"
-                        },
-                        format!("lineworks_{file_id}"),
-                        "application/octet-stream",
-                        0,
-                        "configuration error: service not configured",
-                    ));
-                }
+    let (text, pending) = match content.content_type.as_str() {
+        "text" => {
+            let text = content.text.as_deref().unwrap_or("");
+            if text.trim().is_empty() {
+                return None;
             }
-            ""
+            (text, None)
         }
+        kind @ ("image" | "file" | "audio") => (
+            "",
+            Some(PendingAttachment {
+                kind: kind.to_string(),
+                file_id: content.file_id.as_deref().unwrap_or("unknown").to_string(),
+                file_name: content.file_name.clone(),
+            }),
+        ),
         other => {
             info!(kind = %other, "lineworks: ignoring unsupported message content type");
             return None;
         }
     };
-
-    if text.trim().is_empty() && attachments.is_empty() {
-        return None;
-    }
 
     let mut gateway_event = GatewayEvent::new(
         "lineworks",
@@ -754,21 +845,25 @@ async fn build_gateway_event(
         vec![],
     );
     gateway_event.message_id = gateway_event.event_id.clone();
-    gateway_event.content.attachments = attachments;
-    Some(gateway_event)
+    Some((gateway_event, pending))
 }
 
 // --- Reply dispatch ---
 
 /// Split text into chunks of at most `limit` chars (char-boundary safe).
+/// Linear: the running char count is tracked incrementally instead of
+/// recounting the chunk per character.
 fn split_text(text: &str, limit: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut current_chars = 0usize;
     for ch in text.chars() {
-        if current.chars().count() >= limit {
+        if current_chars >= limit {
             chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
         }
         current.push(ch);
+        current_chars += 1;
     }
     if !current.is_empty() {
         chunks.push(current);
@@ -959,7 +1054,10 @@ mod tests {
         );
         assert_eq!(form["client_id"], "test_client_id");
         assert_eq!(form["client_secret"], "test_client_secret");
-        assert_eq!(form["scope"], "bot");
+        assert_eq!(
+            form["scope"], "bot.message,bot.read",
+            "least-privilege scope contract"
+        );
 
         // The assertion must be a 3-part RS256 JWT with our iss/sub claims.
         let jwt = &form["assertion"];
@@ -1021,9 +1119,13 @@ mod tests {
 
     // --- Event mapping ---
 
-    async fn parse_event(json: serde_json::Value) -> Option<GatewayEvent> {
+    fn classify(json: serde_json::Value) -> Option<(GatewayEvent, Option<PendingAttachment>)> {
         let event: LineWorksEvent = serde_json::from_value(json).unwrap();
-        build_gateway_event(&event, None).await
+        classify_event(&event)
+    }
+
+    async fn parse_event(json: serde_json::Value) -> Option<GatewayEvent> {
+        classify(json).map(|(ev, _)| ev)
     }
 
     #[tokio::test]
@@ -1058,24 +1160,38 @@ mod tests {
         assert_eq!(ev.sender.id, "U2");
     }
 
-    #[tokio::test]
-    async fn image_without_adapter_maps_to_rejected_attachment() {
-        let ev = parse_event(serde_json::json!({
+    #[test]
+    fn classification_is_pure_and_defers_attachment_download() {
+        // Media events classify to a pending descriptor — no I/O happens here.
+        let (ev, pending) = classify(serde_json::json!({
             "type": "message",
             "source": {"userId": "U1"},
             "content": {"type": "image", "fileId": "F123"}
         }))
-        .await
-        .expect("image should map with rejected attachment");
+        .expect("image should classify");
         assert_eq!(ev.content.text, "");
-        assert_eq!(ev.content.attachments.len(), 1);
-        let att = &ev.content.attachments[0];
-        assert_eq!(att.attachment_type, "image");
-        assert!(att
-            .status
-            .as_deref()
-            .unwrap()
-            .starts_with("configuration error"));
+        assert!(
+            ev.content.attachments.is_empty(),
+            "no download at classify time"
+        );
+        let p = pending.expect("media event carries a pending attachment");
+        assert_eq!(p.kind, "image");
+        assert_eq!(p.file_id, "F123");
+        // Text events carry no pending work.
+        let (_ev, pending) = classify(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "text", "text": "hi"}
+        }))
+        .unwrap();
+        assert!(pending.is_none());
+        // Empty text is dropped at classification.
+        assert!(classify(serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "text", "text": "   "}
+        }))
+        .is_none());
     }
 
     #[tokio::test]
@@ -1148,16 +1264,8 @@ mod tests {
             mount_attachment_download(&server, "F_img", buf.into_inner(), "image/png").await;
 
         let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
-        let event: LineWorksEvent = serde_json::from_value(serde_json::json!({
-            "type": "message",
-            "source": {"userId": "U1"},
-            "content": {"type": "image", "fileId": "F_img"}
-        }))
-        .unwrap();
-        let ev = build_gateway_event(&event, Some(&adapter))
-            .await
-            .expect("image event should map");
-        let att = &ev.content.attachments[0];
+        let att = download_attachment(&adapter, "image", "F_img", None).await;
+        let att = &att;
         assert_eq!(att.attachment_type, "image");
         assert!(
             att.status.is_none(),
@@ -1186,14 +1294,8 @@ mod tests {
         let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
 
         // Whitelisted text extension downloads and stores.
-        let event: LineWorksEvent = serde_json::from_value(serde_json::json!({
-            "type": "message",
-            "source": {"userId": "U1"},
-            "content": {"type": "file", "fileId": "F_log", "fileName": "build.log"}
-        }))
-        .unwrap();
-        let ev = build_gateway_event(&event, Some(&adapter)).await.unwrap();
-        let att = &ev.content.attachments[0];
+        let att = download_attachment(&adapter, "file", "F_log", Some("build.log")).await;
+        let att = &att;
         assert_eq!(att.attachment_type, "text_file");
         assert_eq!(att.filename, "build.log");
         assert!(
@@ -1206,19 +1308,37 @@ mod tests {
         }
 
         // Binary extension is rejected without hitting the download API.
-        let event: LineWorksEvent = serde_json::from_value(serde_json::json!({
-            "type": "message",
-            "source": {"userId": "U1"},
-            "content": {"type": "file", "fileId": "F_bin", "fileName": "tool.exe"}
-        }))
-        .unwrap();
-        let ev = build_gateway_event(&event, Some(&adapter)).await.unwrap();
-        let att = &ev.content.attachments[0];
+        let att = download_attachment(&adapter, "file", "F_bin", Some("tool.exe")).await;
         assert!(att
             .status
             .as_deref()
             .unwrap()
             .starts_with("unsupported format"));
+    }
+
+    #[tokio::test]
+    async fn insecure_redirect_target_refused() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_dl").await;
+        // Redirect to a non-loopback plaintext host must be refused before
+        // the bearer token is forwarded.
+        let _redirect = Mock::given(method("GET"))
+            .and(path("/bots/12345/attachments/F_http"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "http://storage.example.com/F_http"),
+            )
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = LineWorksAdapter::new(test_config(&server.uri(), &server.uri()));
+        let err = fetch_attachment_bytes(&adapter, "F_http", 1024)
+            .await
+            .expect_err("plaintext redirect must be refused");
+        assert!(
+            err.starts_with("insecure redirect target refused"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1286,7 +1406,21 @@ mod tests {
         .await;
         assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
 
-        // Good signature → 200 and event broadcast
+        // Good signature but MISSING X-WORKS-BotId → rejected (required header).
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        let status = webhook(
+            State(state.clone()),
+            headers,
+            axum::body::Bytes::from(body.clone()),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+
+        // Good signature + bot id → 200 and event broadcast (async worker).
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             "x-works-signature",
@@ -1296,10 +1430,126 @@ mod tests {
         let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
         assert_eq!(status, axum::http::StatusCode::OK);
 
-        let event_json = event_rx.try_recv().expect("event should be broadcast");
+        let event_json = recv_event(&mut event_rx)
+            .await
+            .expect("event should be broadcast");
         let ev: GatewayEvent = serde_json::from_str(&event_json).unwrap();
         assert_eq!(ev.platform, "lineworks");
         assert_eq!(ev.content.text, "ping");
+    }
+
+    /// The webhook acks before processing; wait briefly for the async worker
+    /// to broadcast.
+    async fn recv_event(rx: &mut broadcast::Receiver<String>) -> Option<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    }
+
+    #[tokio::test]
+    async fn webhook_refuses_ack_without_event_consumer() {
+        let config = test_config("http://unused", "http://unused");
+        let secret = config.bot_secret.clone();
+        let (state, event_rx) = test_state(Some(LineWorksAdapter::new(config)));
+        // No consumer attached → acking would silently lose the event.
+        drop(event_rx);
+
+        let body = serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "text", "text": "ping"}
+        })
+        .to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-works-botid", "12345".parse().unwrap());
+        let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn webhook_acks_before_slow_attachment_download() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_slow").await;
+        // Attachment endpoint stalls for 5s — far longer than the ack budget.
+        let _slow = Mock::given(method("GET"))
+            .and(path("/bots/12345/attachments/F_slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(vec![0u8; 8])
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount_as_scoped(&server)
+            .await;
+
+        let config = test_config(&server.uri(), &server.uri());
+        let secret = config.bot_secret.clone();
+        let (state, _event_rx) = test_state(Some(LineWorksAdapter::new(config)));
+
+        let body = serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "image", "fileId": "F_slow"}
+        })
+        .to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-works-botid", "12345".parse().unwrap());
+
+        let started = std::time::Instant::now();
+        let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "callback must ack before attachment I/O completes (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn gated_channel_message_never_downloads_attachment() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_gate").await;
+        // Expect ZERO hits on the attachment endpoint: the unmentioned
+        // channel message must be dropped before any download.
+        let _attachment = Mock::given(method("GET"))
+            .and(path("/bots/12345/attachments/F_gated"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 8]))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let config = test_config(&server.uri(), &server.uri());
+        let secret = config.bot_secret.clone();
+        let (state, mut event_rx) = test_state(Some(LineWorksAdapter::new(config)));
+
+        // Channel (group) image event without any mention possibility:
+        // image events have no text, so the mention gate drops them.
+        let body = serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1", "channelId": "C1", "domainId": 1},
+            "content": {"type": "image", "fileId": "F_gated"}
+        })
+        .to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-works-botid", "12345".parse().unwrap());
+        let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // No event may be broadcast, and the scoped mock's expect(0) verifies
+        // no download happened when the guard drops.
+        assert!(recv_event(&mut event_rx).await.is_none());
     }
 
     #[tokio::test]
@@ -1329,10 +1579,11 @@ mod tests {
             "x-works-signature",
             sign(&secret, body.as_bytes()).parse().unwrap(),
         );
+        headers.insert("x-works-botid", "12345".parse().unwrap());
         let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
         assert_eq!(status, axum::http::StatusCode::OK);
-        // The event is still broadcast to the agent path.
-        assert!(event_rx.try_recv().is_ok());
+        // The event is still broadcast to the agent path (async worker).
+        assert!(recv_event(&mut event_rx).await.is_some());
 
         // The ack lands asynchronously; poll briefly for the mock hit.
         for _ in 0..40 {

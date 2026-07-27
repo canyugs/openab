@@ -29,7 +29,10 @@ account required):
    `xxx@yourtenant.serviceaccount` (`service_account`).
 3. **Private Key**: issue and download the PEM (single download — store it
    safely; this signs the RS256 JWT for token exchange).
-4. **OAuth Scopes**: grant the `bot` scope.
+4. **OAuth Scopes**: grant **`bot.message`** (message send) and **`bot.read`**
+   (read-only bot details, used for mention-gating name lookup). The adapter
+   requests exactly `bot.message,bot.read` — the broad read/write `bot` scope
+   is not needed.
 
 ## 2. Create the Bot
 

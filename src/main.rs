@@ -187,25 +187,16 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
             && std::env::var("OPENAB_ACP_ENABLED")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false))
-        || (cfg!(feature = "lineworks")
-            && (std::env::var("LINEWORKS_BOT_ID").is_ok()
-                || has_unified_lineworks_config(cfg.lineworks.as_ref())))
+        || (cfg!(feature = "lineworks") && lineworks_activated(cfg.lineworks.as_ref()))
 }
 
-/// Returns true when the first-class `[lineworks]` section resolves the
-/// credentials required to construct the embedded LINE WORKS adapter. Same
-/// config-first rationale as [`has_unified_wecom_config`].
-fn has_unified_lineworks_config(lineworks: Option<&config::LineWorksConfig>) -> bool {
-    let Some(lw) = lineworks else {
-        return false;
-    };
-    let r = lw.resolve();
-    r.bot_id.is_some()
-        && r.bot_secret.is_some()
-        && r.client_id.is_some()
-        && r.client_secret.is_some()
-        && r.service_account.is_some()
-        && (r.private_key.is_some() || r.private_key_file.is_some())
+/// Single LINE WORKS activation validator: the resolved (config → env →
+/// default) credentials must be complete and non-empty — the same rule the
+/// adapter constructor applies. Used by startup preflight AND cron platform
+/// registration so a partial/empty environment can never register a
+/// platform whose adapter will not construct.
+fn lineworks_activated(lineworks: Option<&config::LineWorksConfig>) -> bool {
+    lineworks.cloned().unwrap_or_default().resolve().is_complete()
 }
 
 /// Returns true when the first-class `[wecom]` section resolves all credentials
@@ -902,9 +893,7 @@ async fn main() -> anyhow::Result<()> {
         configured_platforms.push("googlechat");
     }
     #[cfg(feature = "lineworks")]
-    if std::env::var("LINEWORKS_BOT_ID").is_ok()
-        || has_unified_lineworks_config(cfg.lineworks.as_ref())
-    {
+    if lineworks_activated(cfg.lineworks.as_ref()) {
         configured_platforms.push("lineworks");
     }
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;

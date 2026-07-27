@@ -22,6 +22,9 @@ pub const REPLY_TOKEN_CACHE_MAX: usize = 10_000;
 /// Maximum number of post-ack LINE webhook payloads processed concurrently.
 pub const LINE_WEBHOOK_CONCURRENCY_MAX: usize = 8;
 
+/// Maximum number of post-ack LINE WORKS webhook events processed concurrently.
+pub const LINEWORKS_WEBHOOK_CONCURRENCY_MAX: usize = 8;
+
 // --- App state (shared across all adapters) ---
 
 /// Whether a webhook platform's L1 (transport authentication) is unenforceable:
@@ -68,6 +71,8 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<String>,
     pub reply_token_cache: ReplyTokenCache,
     pub line_webhook_semaphore: Arc<Semaphore>,
+    /// Bounds post-ack LINE WORKS webhook processing (mention gate + attachment download).
+    pub lineworks_webhook_semaphore: Arc<Semaphore>,
     pub client: reqwest::Client,
 }
 
@@ -113,6 +118,7 @@ impl AppState {
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
             client: reqwest::Client::new(),
         }
     }
@@ -228,6 +234,7 @@ impl AppState {
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
             client,
         }
     }
@@ -801,6 +808,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         event_tx,
         reply_token_cache,
         line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
         client,
     });
 
