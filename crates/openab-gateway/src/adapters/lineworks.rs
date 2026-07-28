@@ -65,6 +65,13 @@ pub struct LineWorksConfig {
     pub ack_message: Option<String>,
 }
 
+/// Parse-check RS256 private-key PEM material. Activation and construction
+/// share this so an invalid key fails fast at startup instead of on the
+/// first token exchange.
+pub fn valid_private_key(pem: &str) -> bool {
+    jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).is_ok()
+}
+
 impl LineWorksConfig {
     /// Build from `LINEWORKS_*` env vars. Returns `None` (adapter disabled)
     /// unless bot id, bot secret, and the full auth material are all present.
@@ -95,6 +102,10 @@ impl LineWorksConfig {
                 }
             }
         };
+        if !valid_private_key(&private_key) {
+            error!("lineworks: private key is not valid RS256 PEM material — adapter disabled");
+            return None;
+        }
         Some(Self {
             bot_id,
             bot_secret,
@@ -118,6 +129,15 @@ impl LineWorksConfig {
     }
 }
 
+/// Retry cooldown after a failed bot-name lookup.
+const BOT_NAME_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default)]
+struct BotNameCache {
+    name: Option<String>,
+    last_failure: Option<Instant>,
+}
+
 pub struct LineWorksAdapter {
     pub config: LineWorksConfig,
     token_cache: LineWorksTokenCache,
@@ -125,7 +145,9 @@ pub struct LineWorksAdapter {
     /// when `config.bot_name` is unset. A `Mutex` (not `RwLock`) held across
     /// the fetch gives single-flight semantics: concurrent first-use events
     /// wait for one lookup instead of duplicating token + bot-info requests.
-    bot_name_cache: tokio::sync::Mutex<Option<String>>,
+    /// A failed lookup records `last_failure` so an upstream outage is
+    /// retried at most once per cooldown window instead of on every event.
+    bot_name_cache: tokio::sync::Mutex<BotNameCache>,
     /// Shared client for attachment downloads: redirects disabled so the
     /// Authorization header can be re-attached manually on the cross-host
     /// hop. One client per adapter keeps connection pooling on the hot path.
@@ -141,7 +163,7 @@ impl LineWorksAdapter {
             .expect("lineworks download client must build");
         Self {
             token_cache: LineWorksTokenCache::new(),
-            bot_name_cache: tokio::sync::Mutex::new(None),
+            bot_name_cache: tokio::sync::Mutex::new(BotNameCache::default()),
             download_client,
             config,
         }
@@ -157,13 +179,25 @@ impl LineWorksAdapter {
         // Single-flight: the lock is held across the network fetch so
         // concurrent callers wait for the first result instead of racing.
         let mut cache = self.bot_name_cache.lock().await;
-        if let Some(ref name) = *cache {
+        if let Some(ref name) = cache.name {
             return Some(name.clone());
         }
+        // Negative cache: during an upstream outage, retry at most once per
+        // cooldown window; other events return fast (gate fails open, which
+        // is the documented tradeoff — cheaply, instead of per-event I/O).
+        if let Some(failed_at) = cache.last_failure {
+            if failed_at.elapsed() < BOT_NAME_RETRY_COOLDOWN {
+                return None;
+            }
+        }
+        let fail = |cache: &mut BotNameCache| {
+            cache.last_failure = Some(Instant::now());
+        };
         let token = match self.token_cache.get_token(client, &self.config).await {
             Ok(t) => t,
             Err(e) => {
                 warn!(err = %e, "lineworks: cannot get token for bot-name lookup");
+                fail(&mut cache);
                 return None;
             }
         };
@@ -173,21 +207,32 @@ impl LineWorksAdapter {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(err = %e, "lineworks: bot info parse failed");
+                    fail(&mut cache);
                     return None;
                 }
             },
             Ok(r) => {
                 warn!(status = %r.status(), "lineworks: bot info request failed");
+                fail(&mut cache);
                 return None;
             }
             Err(e) => {
                 warn!(err = %e, "lineworks: bot info request error");
+                fail(&mut cache);
                 return None;
             }
         };
-        let name = body.get("botName").and_then(|v| v.as_str())?.to_string();
+        let Some(name) = body
+            .get("botName")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+        else {
+            fail(&mut cache);
+            return None;
+        };
         info!(bot_name = %name, "lineworks: resolved bot name for mention gating");
-        *cache = Some(name.clone());
+        cache.name = Some(name.clone());
+        cache.last_failure = None;
         Some(name)
     }
 }
@@ -209,15 +254,42 @@ async fn passes_mention_gate(
         return true;
     };
     let mention = format!("@{name}");
-    if !event.content.text.contains(&mention) {
-        info!(
-            channel = %event.channel.id,
-            "lineworks channel message dropped (mention gating: bot not mentioned)"
-        );
-        return false;
+    match strip_boundary_mention(&event.content.text, &mention) {
+        Some(stripped) => {
+            event.content.text = stripped;
+            true
+        }
+        None => {
+            info!(
+                channel = %event.channel.id,
+                "lineworks channel message dropped (mention gating: bot not mentioned)"
+            );
+            false
+        }
     }
-    event.content.text = event.content.text.replace(&mention, "").trim().to_string();
-    true
+}
+
+/// Boundary-aware mention matching: `@Bot` must not match inside `@Bottage`.
+/// A match requires the character after the mention to be absent or
+/// non-alphanumeric. Returns the text with every boundary-valid mention
+/// removed (trimmed), or `None` when no valid mention exists.
+fn strip_boundary_mention(text: &str, mention: &str) -> Option<String> {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut matched = false;
+    while let Some(pos) = rest.find(mention) {
+        let after = rest[pos + mention.len()..].chars().next();
+        if after.is_none_or(|c| !c.is_alphanumeric()) {
+            matched = true;
+            result.push_str(&rest[..pos]);
+        } else {
+            // Not a boundary match ("@Bottage") — keep the text as-is.
+            result.push_str(&rest[..pos + mention.len()]);
+        }
+        rest = &rest[pos + mention.len()..];
+    }
+    result.push_str(rest);
+    matched.then(|| result.trim().to_string())
 }
 
 // --- Token cache with JWT auto-refresh ---
@@ -288,6 +360,18 @@ async fn refresh_token(
         .send()
         .await
         .map_err(|e| format!("token exchange request failed: {e}"))?;
+
+    // Surface upstream HTTP failures as such — parsing a 4xx/5xx body as
+    // JSON first would turn them into misleading parse errors.
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!(
+            "token endpoint HTTP {}: {snippet}",
+            status.as_u16()
+        ));
+    }
 
     let body: serde_json::Value = resp
         .json()
@@ -446,18 +530,24 @@ pub async fn webhook(
         return axum::http::StatusCode::SERVICE_UNAVAILABLE;
     }
 
-    // Bounded post-ack processing (same pattern as the LINE adapter): the
-    // permit is acquired before the ack so a burst waits for capacity instead
-    // of building an unbounded backlog; mention gating and attachment
-    // download run in the worker, never on the callback response path.
+    // Bounded ingress with an EXPLICIT full policy: try_acquire — when all
+    // worker permits are busy the callback answers 503 immediately instead
+    // of accumulating waiting request handlers. LINE WORKS does not resend,
+    // so saturation drops are loud (error log) and bounded by design.
     let permit = match state
         .lineworks_webhook_semaphore
         .clone()
-        .acquire_owned()
-        .await
+        .try_acquire_owned()
     {
         Ok(permit) => permit,
-        Err(_) => {
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            error!(
+                event_id = %gateway_event.event_id,
+                "lineworks webhook refused: worker capacity saturated (event dropped by full policy)"
+            );
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => {
             warn!("lineworks webhook worker semaphore closed unexpectedly");
             return axum::http::StatusCode::SERVICE_UNAVAILABLE;
         }
@@ -486,8 +576,8 @@ async fn process_lineworks_event(
     mut gateway_event: GatewayEvent,
     pending: Option<PendingAttachment>,
 ) {
-    // Authorization before any attachment I/O: a dropped event must not
-    // consume downloads, tokens, or storage.
+    // Authorization before any outbound work: a dropped event must not
+    // consume downloads, tokens, storage — or an ack message.
     if !passes_mention_gate(&adapter, &state.client, &mut gateway_event).await {
         return;
     }
@@ -496,41 +586,40 @@ async fn process_lineworks_event(
         return;
     }
 
+    // Identity trust probe for ALL accepted events (not just attachments):
+    // untrusted senders get no ack and no download; the event still
+    // broadcasts so the core ingress gate can deny + echo request-access.
+    let sender_trusted = state
+        .trust_probe
+        .as_ref()
+        .map(|probe| {
+            probe(
+                "lineworks",
+                &gateway_event.channel.id,
+                &gateway_event.sender.id,
+            )
+        })
+        .unwrap_or(true);
+
     // Receipt ack: LINE WORKS has no reactions/typing indicator, so a short
-    // message is the only "working on it" signal. Sent after the gate (never
-    // for dropped events) and before attachment download (instant feedback).
-    if let Some(ref ack) = adapter.config.ack_message {
-        let ack = ack.clone();
-        let ack_adapter = adapter.clone();
-        let client = state.client.clone();
-        let url = send_endpoint(
-            &adapter.config.api_base,
-            &adapter.config.bot_id,
-            &gateway_event.channel.id,
-        );
-        tokio::spawn(async move {
+    // message is the only "working on it" signal. Awaited inline INSIDE the
+    // bounded worker (after the gates, before the download) so a burst can
+    // never fan out unbounded outbound tasks or ack a denied sender.
+    if sender_trusted {
+        if let Some(ref ack) = adapter.config.ack_message {
+            let url = send_endpoint(
+                &adapter.config.api_base,
+                &adapter.config.bot_id,
+                &gateway_event.channel.id,
+            );
             let body = serde_json::json!({"content": {"type": "text", "text": ack}});
-            if !send_body(&client, &ack_adapter, &url, &body).await {
+            if !send_body(&state.client, &adapter, &url, &body).await {
                 warn!("lineworks: ack message send failed");
             }
-        });
+        }
     }
 
     if let Some(p) = pending {
-        // Identity trust BEFORE download: an untrusted sender must not
-        // consume download bandwidth, tokens, or storage. The event is still
-        // broadcast so the core ingress gate can deny + echo request-access.
-        let sender_trusted = state
-            .trust_probe
-            .as_ref()
-            .map(|probe| {
-                probe(
-                    "lineworks",
-                    &gateway_event.channel.id,
-                    &gateway_event.sender.id,
-                )
-            })
-            .unwrap_or(true);
         if sender_trusted {
             gateway_event.content.attachments.push(
                 download_attachment(&adapter, &p.kind, &p.file_id, p.file_name.as_deref()).await,
@@ -1785,6 +1874,131 @@ mod tests {
         // Second call served from cache (expect(1) enforces a single fetch).
         let mut ev2 = channel_text_event("no mention here").await;
         assert!(!passes_mention_gate(&adapter, &client, &mut ev2).await);
+    }
+
+    // --- Round-3 regression tests ---
+
+    #[test]
+    fn mention_match_is_boundary_aware() {
+        // "@Bot" must not match inside "@Bottage".
+        assert!(strip_boundary_mention("@Bottage hello", "@Bot").is_none());
+        // Word boundary / punctuation / end-of-text all match.
+        assert_eq!(
+            strip_boundary_mention("@Bot hello", "@Bot").as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            strip_boundary_mention("hey @Bot!", "@Bot").as_deref(),
+            Some("hey !")
+        );
+        assert_eq!(
+            strip_boundary_mention("ping @Bot", "@Bot").as_deref(),
+            Some("ping")
+        );
+        // Non-boundary text is left untouched while a later boundary match strips.
+        assert_eq!(
+            strip_boundary_mention("@Bottage and @Bot do it", "@Bot").as_deref(),
+            Some("@Bottage and  do it")
+        );
+        // Names with spaces/parens work as literal strings.
+        assert_eq!(
+            strip_boundary_mention("@Nuphos (Dev) hi", "@Nuphos (Dev)").as_deref(),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn invalid_pem_disables_adapter() {
+        let read = |k: &str| -> Option<String> {
+            match k {
+                "LINEWORKS_BOT_ID" => Some("1".into()),
+                "LINEWORKS_BOT_SECRET" => Some("s".into()),
+                "LINEWORKS_CLIENT_ID" => Some("c".into()),
+                "LINEWORKS_CLIENT_SECRET" => Some("cs".into()),
+                "LINEWORKS_SERVICE_ACCOUNT" => Some("sa@x".into()),
+                "LINEWORKS_PRIVATE_KEY" => Some("not a pem".into()),
+                _ => None,
+            }
+        };
+        assert!(LineWorksConfig::from_reader(read).is_none());
+        assert!(!valid_private_key("not a pem"));
+        assert!(valid_private_key(include_str!(
+            "../../testdata/lineworks_test_key.pem"
+        )));
+    }
+
+    #[tokio::test]
+    async fn saturated_worker_pool_returns_503() {
+        let config = test_config("http://unused", "http://unused");
+        let secret = config.bot_secret.clone();
+        let (state, _event_rx) = test_state(Some(LineWorksAdapter::new(config)));
+
+        // Exhaust every worker permit — the full policy must answer 503.
+        let _held: Vec<_> = (0..crate::LINEWORKS_WEBHOOK_CONCURRENCY_MAX)
+            .map(|_| {
+                state
+                    .lineworks_webhook_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+
+        let body = serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "text", "text": "ping"}
+        })
+        .to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-works-botid", "12345".parse().unwrap());
+        let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_http_error_is_surfaced() {
+        let server = MockServer::start().await;
+        let _bad = Mock::given(method("POST"))
+            .and(path("/oauth2/v2.0/token"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream sad"))
+            .mount_as_scoped(&server)
+            .await;
+        let config = test_config(&server.uri(), &server.uri());
+        let cache = LineWorksTokenCache::new();
+        let err = cache
+            .get_token(&reqwest::Client::new(), &config)
+            .await
+            .expect_err("HTTP 503 must be an error");
+        assert!(
+            err.contains("token endpoint HTTP 503"),
+            "status must be surfaced, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_bot_name_lookup_is_negatively_cached() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_nc").await;
+        // Bot-info endpoint fails; it must be hit exactly once — the second
+        // gate call inside the cooldown window returns fast without I/O.
+        let _bot = Mock::given(method("GET"))
+            .and(path("/bots/12345"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut config = test_config(&server.uri(), &server.uri());
+        config.bot_name = None; // force API lookup
+        let adapter = LineWorksAdapter::new(config);
+        let client = reqwest::Client::new();
+        assert!(adapter.bot_name(&client).await.is_none());
+        assert!(adapter.bot_name(&client).await.is_none());
     }
 
     // --- Reply dispatch ---

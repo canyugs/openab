@@ -196,8 +196,21 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
 /// adapter constructor applies. Used by startup preflight AND cron platform
 /// registration so a partial/empty environment can never register a
 /// platform whose adapter will not construct.
+#[cfg(feature = "lineworks")]
 fn lineworks_activated(lineworks: Option<&config::LineWorksConfig>) -> bool {
-    lineworks.cloned().unwrap_or_default().resolve().is_complete()
+    let r = lineworks.cloned().unwrap_or_default().resolve();
+    if !r.is_complete() {
+        return false;
+    }
+    // Same key-material rule as adapter construction: the PEM must parse,
+    // not merely exist — an invalid key must not report a healthy startup.
+    let pem = r.private_key.or_else(|| {
+        r.private_key_file
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+    });
+    pem.as_deref()
+        .is_some_and(openab_gateway::adapters::lineworks::valid_private_key)
 }
 
 /// Returns true when the first-class `[wecom]` section resolves all credentials

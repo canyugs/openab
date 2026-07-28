@@ -1048,12 +1048,19 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             #[cfg(feature = "lineworks")]
                             "lineworks" => {
                                 if let Some(ref lineworks) = state_for_recv.lineworks {
-                                    adapters::lineworks::dispatch_lineworks_reply(
+                                    let ok = adapters::lineworks::dispatch_lineworks_reply(
                                         &client,
                                         lineworks,
                                         &reply,
                                     )
                                     .await;
+                                    if !ok {
+                                        tracing::error!(
+                                            channel = %reply.channel.id,
+                                            command = ?reply.command.as_deref(),
+                                            "lineworks reply delivery failed — reply lost"
+                                        );
+                                    }
                                 } else {
                                     warn!("reply for lineworks but adapter not configured");
                                 }

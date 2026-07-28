@@ -81,10 +81,17 @@ impl UnifiedGatewayAdapter {
             #[cfg(feature = "lineworks")]
             "lineworks" => {
                 if let Some(ref lineworks) = self.gw_state.lineworks {
-                    openab_gateway::adapters::lineworks::dispatch_lineworks_reply(
+                    let ok = openab_gateway::adapters::lineworks::dispatch_lineworks_reply(
                         client, lineworks, reply,
                     )
                     .await;
+                    if !ok {
+                        tracing::error!(
+                            channel = %reply.channel.id,
+                            command = ?reply.command.as_deref(),
+                            "lineworks reply delivery failed — reply lost"
+                        );
+                    }
                 }
             }
             #[cfg(feature = "teams")]
