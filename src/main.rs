@@ -196,6 +196,14 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
 /// adapter constructor applies. Used by startup preflight AND cron platform
 /// registration so a partial/empty environment can never register a
 /// platform whose adapter will not construct.
+/// Feature-off stub: `has_unified_platform` calls this through a runtime
+/// `cfg!` check, so the symbol must exist (and answer "not activated") even
+/// when the lineworks feature is compiled out.
+#[cfg(not(feature = "lineworks"))]
+fn lineworks_activated(_lineworks: Option<&config::LineWorksConfig>) -> bool {
+    false
+}
+
 #[cfg(feature = "lineworks")]
 fn lineworks_activated(lineworks: Option<&config::LineWorksConfig>) -> bool {
     let r = lineworks.cloned().unwrap_or_default().resolve();
