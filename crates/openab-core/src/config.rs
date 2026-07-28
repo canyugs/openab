@@ -965,7 +965,11 @@ impl ResolvedLineWorks {
             && self.client_id.is_some()
             && self.client_secret.is_some()
             && self.service_account.is_some()
-            && (self.private_key.is_some() || self.private_key_file.is_some())
+            && (self.private_key.is_some()
+                || self
+                    .private_key_file
+                    .as_deref()
+                    .is_some_and(|p| std::fs::read(p).is_ok()))
     }
 }
 
@@ -3856,10 +3860,16 @@ cancel_strategy = "noop"
         assert!(needs_env.resolve().is_complete());
         std::env::remove_var("LINEWORKS_BOT_ID");
 
-        // private_key_file counts as key material.
+        // private_key_file counts as key material only when READABLE —
+        // activation must match adapter construction, which reads the file.
         let mut file_key = full.clone();
         file_key.private_key = None;
-        file_key.private_key_file = Some("/etc/key.pem".into());
+        file_key.private_key_file = Some("/nonexistent/lineworks_key.pem".into());
+        assert!(!file_key.resolve().is_complete());
+        let tmp = std::env::temp_dir().join("lineworks_test_key_validator.pem");
+        std::fs::write(&tmp, "-----BEGIN PRIVATE KEY-----").unwrap();
+        file_key.private_key_file = Some(tmp.to_string_lossy().into_owned());
         assert!(file_key.resolve().is_complete());
+        let _ = std::fs::remove_file(&tmp);
     }
 }

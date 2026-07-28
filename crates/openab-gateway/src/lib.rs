@@ -27,6 +27,14 @@ pub const LINEWORKS_WEBHOOK_CONCURRENCY_MAX: usize = 8;
 
 // --- App state (shared across all adapters) ---
 
+/// Pre-download identity probe installed by the unified binary: maps
+/// `(platform, channel_id, sender_id)` to "may this sender consume adapter
+/// resources?". Lets adapters apply the core L3 identity gate BEFORE
+/// expensive work (attachment download) without a crate dependency on
+/// openab-core. `None` = probe unavailable (standalone gateway) — adapters
+/// proceed and the core-side ingress gate still applies after broadcast.
+pub type IngressTrustProbe = Arc<dyn Fn(&str, &str, &str) -> bool + Send + Sync>;
+
 /// Whether a webhook platform's L1 (transport authentication) is unenforceable:
 /// the platform is active (configured to receive traffic) but its verification
 /// secret is not configured, so it accepts unauthenticated POSTs. See #1356.
@@ -73,6 +81,8 @@ pub struct AppState {
     pub line_webhook_semaphore: Arc<Semaphore>,
     /// Bounds post-ack LINE WORKS webhook processing (mention gate + attachment download).
     pub lineworks_webhook_semaphore: Arc<Semaphore>,
+    /// Optional pre-download identity probe (see [`IngressTrustProbe`]).
+    pub trust_probe: Option<IngressTrustProbe>,
     pub client: reqwest::Client,
 }
 
@@ -119,6 +129,7 @@ impl AppState {
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        trust_probe: None,
             client: reqwest::Client::new(),
         }
     }
@@ -235,6 +246,7 @@ impl AppState {
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        trust_probe: None,
             client,
         }
     }
@@ -809,6 +821,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         reply_token_cache,
         line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        trust_probe: None,
         client,
     });
 

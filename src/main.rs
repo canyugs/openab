@@ -7,6 +7,7 @@ mod ctl;
     feature = "wecom",
     feature = "teams",
     feature = "acp",
+    feature = "lineworks",
 ))]
 mod unified_adapter;
 use openab_core::acp;
@@ -457,6 +458,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
         feature = "acp",
+        feature = "lineworks",
     ))]
     let unified_platform_enabled = has_unified_platform(&cfg);
 
@@ -1038,6 +1040,7 @@ async fn main() -> anyhow::Result<()> {
         feature = "wecom",
         feature = "teams",
         feature = "acp",
+        feature = "lineworks",
     ))]
     let (_unified_handle, shared_unified_adapter) = {
         use openab_core::gateway::{process_gateway_event, GatewayEventContext};
@@ -1070,6 +1073,20 @@ async fn main() -> anyhow::Result<()> {
 
             // Build gateway AppState from env vars (shared factory with standalone gateway)
             let mut gw_state_inner = openab_gateway::AppState::from_env(event_tx.clone(), None);
+
+            // Pre-download identity probe: lets adapters consult the shared
+            // L3 identity gate BEFORE spending resources on attachment
+            // download. Mirrors gate_gateway_event (is_dm = false, Phase 1).
+            {
+                let probe_router = router.clone();
+                gw_state_inner.trust_probe = Some(std::sync::Arc::new(
+                    move |platform: &str, channel_id: &str, sender_id: &str| {
+                        probe_router
+                            .gate_incoming(platform, channel_id, false, sender_id)
+                            .is_allowed()
+                    },
+                ));
+            }
 
 
             // First-class `[telegram]` config overrides env-derived values

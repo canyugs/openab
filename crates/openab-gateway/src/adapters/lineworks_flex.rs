@@ -23,6 +23,13 @@ const MAX_COMPONENTS: usize = 120;
 /// altText is capped at 400 chars by the API.
 const ALT_TEXT_MAX: usize = 400;
 
+/// Ordered-list line prefix: 1–3 leading digits followed by ". " (matches
+/// GitHub-flavored markdown lists like "1. x" and "10. x").
+fn ordered_list_prefix(t: &str) -> bool {
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    (1..=3).contains(&digits) && t[digits..].starts_with(". ")
+}
+
 /// Quick scan: does this text contain markdown the flex renderer improves?
 fn has_markdown(text: &str) -> bool {
     text.lines().any(|l| {
@@ -32,7 +39,7 @@ fn has_markdown(text: &str) -> bool {
             || t.starts_with("- ")
             || t.starts_with("* ")
             || t.starts_with("> ")
-            || (t.len() > 2 && t.as_bytes()[0].is_ascii_digit() && t[1..].starts_with(". "))
+            || ordered_list_prefix(t)
     }) || text.contains("**")
         || text.contains('`')
 }
@@ -164,10 +171,7 @@ pub fn markdown_to_flex(text: &str) -> Option<(String, Value)> {
             .or_else(|| trimmed.strip_prefix("* "))
         {
             components.push(text_component(&format!("• {item}"), "sm"));
-        } else if trimmed.len() > 2
-            && trimmed.as_bytes()[0].is_ascii_digit()
-            && trimmed[1..].starts_with(". ")
-        {
+        } else if ordered_list_prefix(trimmed) {
             components.push(text_component(trimmed, "sm"));
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
             components.push(json!({
@@ -257,6 +261,21 @@ mod tests {
         assert_eq!(body[0]["text"], "• 甲");
         assert_eq!(body[1]["text"], "• 乙");
         assert_eq!(body[2]["text"], "1. 丙");
+    }
+
+    #[test]
+    fn multi_digit_ordered_lists_render_rich() {
+        // "10. item" must be detected as markdown and rendered as a list line.
+        let (_alt, bubble) =
+            markdown_to_flex("9. nine\n10. ten\n123. many").expect("multi-digit list is markdown");
+        let body = &bubble["body"]["contents"];
+        assert_eq!(body[0]["text"], "9. nine");
+        assert_eq!(body[1]["text"], "10. ten");
+        assert_eq!(body[2]["text"], "123. many");
+        // 4+ digits is not treated as a list prefix (matches GFM practice).
+        assert!(!ordered_list_prefix("1234. nope"));
+        assert!(ordered_list_prefix("10. yes"));
+        assert!(!ordered_list_prefix("10.no-space"));
     }
 
     #[test]

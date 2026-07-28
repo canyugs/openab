@@ -517,10 +517,41 @@ async fn process_lineworks_event(
     }
 
     if let Some(p) = pending {
-        gateway_event
-            .content
-            .attachments
-            .push(download_attachment(&adapter, &p.kind, &p.file_id, p.file_name.as_deref()).await);
+        // Identity trust BEFORE download: an untrusted sender must not
+        // consume download bandwidth, tokens, or storage. The event is still
+        // broadcast so the core ingress gate can deny + echo request-access.
+        let sender_trusted = state
+            .trust_probe
+            .as_ref()
+            .map(|probe| {
+                probe(
+                    "lineworks",
+                    &gateway_event.channel.id,
+                    &gateway_event.sender.id,
+                )
+            })
+            .unwrap_or(true);
+        if sender_trusted {
+            gateway_event.content.attachments.push(
+                download_attachment(&adapter, &p.kind, &p.file_id, p.file_name.as_deref()).await,
+            );
+        } else {
+            info!(
+                sender = %gateway_event.sender.id,
+                "lineworks: sender not trusted — attachment download skipped"
+            );
+            gateway_event.content.attachments.push(Attachment::rejected(
+                if p.kind == "image" {
+                    "image"
+                } else {
+                    "text_file"
+                },
+                format!("lineworks_{}", p.file_id),
+                "application/octet-stream",
+                0,
+                "security rejected: sender not authorized; attachment not downloaded",
+            ));
+        }
     }
 
     let json = serde_json::to_string(&gateway_event).unwrap();
@@ -1512,6 +1543,59 @@ mod tests {
             "callback must ack before attachment I/O completes (took {:?})",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn untrusted_sender_never_downloads_attachment() {
+        let server = MockServer::start().await;
+        let _token = mount_token_endpoint(&server, "tok_trust").await;
+        // Deny-all probe: the download endpoint must never be hit.
+        let _attachment = Mock::given(method("GET"))
+            .and(path("/bots/12345/attachments/F_untrusted"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 8]))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let config = test_config(&server.uri(), &server.uri());
+        let secret = config.bot_secret.clone();
+        let (state, mut event_rx) = {
+            let (event_tx, event_rx) = broadcast::channel(16);
+            let mut state = crate::AppState::test_default(event_tx);
+            state.lineworks = Some(Arc::new(LineWorksAdapter::new(config)));
+            state.trust_probe = Some(Arc::new(|_platform, _channel, _sender| false));
+            (Arc::new(state), event_rx)
+        };
+
+        // 1:1 image event: passes the mention gate, fails the trust probe.
+        let body = serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U_untrusted"},
+            "content": {"type": "image", "fileId": "F_untrusted"}
+        })
+        .to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-works-botid", "12345".parse().unwrap());
+        let status = webhook(State(state), headers, axum::body::Bytes::from(body)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        // The event is still broadcast (core deny-echo path needs it) with a
+        // security-rejected attachment instead of downloaded content.
+        let event_json = recv_event(&mut event_rx)
+            .await
+            .expect("event still broadcast");
+        let ev: GatewayEvent = serde_json::from_str(&event_json).unwrap();
+        let att = &ev.content.attachments[0];
+        assert!(att
+            .status
+            .as_deref()
+            .unwrap()
+            .starts_with("security rejected"));
+        assert!(att.path.is_none());
     }
 
     #[tokio::test]
