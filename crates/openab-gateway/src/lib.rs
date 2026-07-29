@@ -25,6 +25,12 @@ pub const LINE_WEBHOOK_CONCURRENCY_MAX: usize = 8;
 /// Maximum number of post-ack LINE WORKS webhook events processed concurrently.
 pub const LINEWORKS_WEBHOOK_CONCURRENCY_MAX: usize = 8;
 
+/// Maximum number of accepted LINE WORKS callbacks allowed to wait for a
+/// worker permit. Bursts up to this depth are acknowledged and queued instead
+/// of rejected (LINE WORKS does not resend callbacks); beyond it the webhook
+/// answers 503 — a loud, bounded overflow.
+pub const LINEWORKS_INGRESS_QUEUE_MAX: usize = 64;
+
 // --- App state (shared across all adapters) ---
 
 /// Pre-download identity probe installed by the unified binary: maps
@@ -81,6 +87,9 @@ pub struct AppState {
     pub line_webhook_semaphore: Arc<Semaphore>,
     /// Bounds post-ack LINE WORKS webhook processing (mention gate + attachment download).
     pub lineworks_webhook_semaphore: Arc<Semaphore>,
+    /// Bounds LINE WORKS callbacks accepted but still waiting for a worker
+    /// permit — burst absorption (see [`LINEWORKS_INGRESS_QUEUE_MAX`]).
+    pub lineworks_ingress_queue: Arc<Semaphore>,
     /// Optional pre-download identity probe (see [`IngressTrustProbe`]).
     pub trust_probe: Option<IngressTrustProbe>,
     pub client: reqwest::Client,
@@ -129,6 +138,7 @@ impl AppState {
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
         trust_probe: None,
             client: reqwest::Client::new(),
         }
@@ -246,6 +256,7 @@ impl AppState {
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
         trust_probe: None,
             client,
         }
@@ -821,6 +832,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         reply_token_cache,
         line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
+        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
         trust_probe: None,
         client,
     });

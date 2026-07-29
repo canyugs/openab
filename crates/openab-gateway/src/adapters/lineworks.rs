@@ -332,11 +332,16 @@ impl LineWorksTokenCache {
         Ok(new_token)
     }
 
-    /// Drop the cached token so the next `get_token` re-fetches. Used when the
-    /// API answers 401 despite a locally-unexpired token (e.g. revoked in the
-    /// Developer Console).
-    async fn invalidate(&self) {
-        *self.token.write().await = None;
+    /// Drop the cached token only if it is still the one that failed, so a
+    /// delayed 401 from an old token cannot clear a token another concurrent
+    /// task just refreshed (which would force an avoidable serialized token
+    /// exchange). Used when the API answers 401 despite a locally-unexpired
+    /// token (e.g. revoked in the Developer Console).
+    async fn invalidate_if(&self, failed_token: &str) {
+        let mut guard = self.token.write().await;
+        if matches!(*guard, Some((ref tok, _, _)) if tok == failed_token) {
+            *guard = None;
+        }
     }
 }
 
@@ -530,31 +535,47 @@ pub async fn webhook(
         return axum::http::StatusCode::SERVICE_UNAVAILABLE;
     }
 
-    // Bounded ingress with an EXPLICIT full policy: try_acquire — when all
-    // worker permits are busy the callback answers 503 immediately instead
-    // of accumulating waiting request handlers. LINE WORKS does not resend,
-    // so saturation drops are loud (error log) and bounded by design.
-    let permit = match state
-        .lineworks_webhook_semaphore
-        .clone()
-        .try_acquire_owned()
-    {
-        Ok(permit) => permit,
+    // Bounded two-tier ingress: the worker pool bounds concurrent slow work
+    // (ack message + attachment download), while a larger queue absorbs
+    // bursts so a signed, valid callback is never rejected merely because
+    // every worker is busy — LINE WORKS does not resend callbacks. Only
+    // queue overflow (LINEWORKS_INGRESS_QUEUE_MAX callbacks already waiting)
+    // answers 503, and that drop is loud (error log) and bounded by design.
+    let queue_slot = match state.lineworks_ingress_queue.clone().try_acquire_owned() {
+        Ok(slot) => slot,
         Err(tokio::sync::TryAcquireError::NoPermits) => {
             error!(
                 event_id = %gateway_event.event_id,
-                "lineworks webhook refused: worker capacity saturated (event dropped by full policy)"
+                "lineworks webhook refused: ingress queue overflow (event dropped by full policy)"
             );
             return axum::http::StatusCode::SERVICE_UNAVAILABLE;
         }
         Err(tokio::sync::TryAcquireError::Closed) => {
-            warn!("lineworks webhook worker semaphore closed unexpectedly");
+            warn!("lineworks webhook ingress queue closed unexpectedly");
             return axum::http::StatusCode::SERVICE_UNAVAILABLE;
         }
     };
     let adapter = adapter.clone();
     let background_state = state.clone();
     tokio::spawn(async move {
+        // Wait for a worker permit (bounded by the held queue slot), then
+        // release the queue slot so the next callback can be accepted.
+        let permit = match background_state
+            .lineworks_webhook_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) => {
+                error!(
+                    event_id = %gateway_event.event_id,
+                    "lineworks worker semaphore closed; queued event dropped"
+                );
+                return;
+            }
+        };
+        drop(queue_slot);
         let _permit = permit;
         process_lineworks_event(background_state, adapter, gateway_event, pending).await;
     });
@@ -1080,7 +1101,7 @@ async fn send_body(
             Ok(r) if r.status().is_success() => return true,
             Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 => {
                 warn!("lineworks send got 401, refreshing token and retrying");
-                adapter.token_cache.invalidate().await;
+                adapter.token_cache.invalidate_if(&token).await;
             }
             Ok(r) => {
                 let status = r.status();
@@ -1204,11 +1225,61 @@ mod tests {
         let cache = LineWorksTokenCache::new();
         let client = reqwest::Client::new();
 
-        cache.get_token(&client, &config).await.unwrap();
-        cache.invalidate().await;
+        let tok = cache.get_token(&client, &config).await.unwrap();
+        cache.invalidate_if(&tok).await;
         cache.get_token(&client, &config).await.unwrap();
 
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delayed_401_does_not_clear_refreshed_token() {
+        // Interleaving under test: task A sends with tok_old → another task
+        // refreshes the cache to tok_new → A's DELAYED 401 arrives and
+        // invalidates. The invalidation must be a no-op (tok_new survives)
+        // and the next get_token must not hit the token endpoint at all.
+        // The barrier guarantees the refresh is published before the delayed
+        // invalidation runs.
+        let cache = Arc::new(LineWorksTokenCache::new());
+        *cache.token.write().await = Some(("tok_old".to_string(), Instant::now(), 3600));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let refresher = {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                // Concurrent task refreshes the token (as a successful
+                // get_token re-exchange would).
+                *cache.token.write().await =
+                    Some(("tok_new".to_string(), Instant::now(), 3600));
+                barrier.wait().await;
+            })
+        };
+        let delayed_401 = {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                // Delayed 401 from the OLD token arrives after the refresh.
+                cache.invalidate_if("tok_old").await;
+            })
+        };
+        refresher.await.unwrap();
+        delayed_401.await.unwrap();
+
+        // tok_new must survive; an unroutable auth base proves get_token
+        // serves it from cache without a serialized re-exchange.
+        let config = test_config("http://unused", "http://127.0.0.1:1");
+        let tok = cache
+            .get_token(&reqwest::Client::new(), &config)
+            .await
+            .expect("newer token must survive a delayed stale 401");
+        assert_eq!(tok, "tok_new");
+
+        // A 401 from the CURRENT token still clears the cache.
+        cache.invalidate_if("tok_new").await;
+        assert!(cache.token.read().await.is_none());
     }
 
     fn url_decoded_form(req: &Request) -> std::collections::HashMap<String, String> {
@@ -1928,16 +1999,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saturated_worker_pool_returns_503() {
+    async fn saturated_workers_queue_callback_then_drain() {
+        let config = test_config("http://unused", "http://unused");
+        let secret = config.bot_secret.clone();
+        let (state, mut event_rx) = test_state(Some(LineWorksAdapter::new(config)));
+
+        // Exhaust every worker permit — the callback must still be ACCEPTED
+        // (queued for burst absorption), not rejected: LINE WORKS does not
+        // resend callbacks, so a 503 here would permanently drop the message.
+        let held: Vec<_> = (0..crate::LINEWORKS_WEBHOOK_CONCURRENCY_MAX)
+            .map(|_| {
+                state
+                    .lineworks_webhook_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+
+        let body = serde_json::json!({
+            "type": "message",
+            "source": {"userId": "U1"},
+            "content": {"type": "text", "text": "ping"}
+        })
+        .to_string();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-works-signature",
+            sign(&secret, body.as_bytes()).parse().unwrap(),
+        );
+        headers.insert("x-works-botid", "12345".parse().unwrap());
+        let status = webhook(State(state.clone()), headers, axum::body::Bytes::from(body)).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        // While every worker is busy the queued event must not process yet.
+        assert!(
+            event_rx.try_recv().is_err(),
+            "queued event must wait for a worker permit"
+        );
+
+        // Free the workers — the queued event must drain and broadcast.
+        drop(held);
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("queued event must be processed after a worker frees")
+            .expect("broadcast channel must stay open");
+        assert!(
+            received.contains("ping"),
+            "drained event must carry the message"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_queue_overflow_returns_503() {
         let config = test_config("http://unused", "http://unused");
         let secret = config.bot_secret.clone();
         let (state, _event_rx) = test_state(Some(LineWorksAdapter::new(config)));
 
-        // Exhaust every worker permit — the full policy must answer 503.
-        let _held: Vec<_> = (0..crate::LINEWORKS_WEBHOOK_CONCURRENCY_MAX)
+        // Fill the entire ingress queue — only then may the full policy
+        // answer 503 (loud, bounded overflow).
+        let _queued: Vec<_> = (0..crate::LINEWORKS_INGRESS_QUEUE_MAX)
             .map(|_| {
                 state
-                    .lineworks_webhook_semaphore
+                    .lineworks_ingress_queue
                     .clone()
                     .try_acquire_owned()
                     .unwrap()
