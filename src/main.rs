@@ -262,8 +262,9 @@ fn gateway_section_trust(gw: &config::GatewayConfig) -> openab_core::trust::Trus
 /// Apply a platform's first-class trust section to the registry, or — when the
 /// platform is active but still trust-driven by the deprecated uniform
 /// `GATEWAY_ALLOW_ALL_USERS`/`GATEWAY_ALLOWED_USERS` env — log the Phase 1
-/// deprecation warning (#1356). Shared by the `[wecom]`/`[googlechat]`/`[teams]`
-/// overrides; same override shape as the bespoke `[telegram]`/`[line]` blocks.
+/// deprecation warning (#1356). Shared by the `[wecom]`/`[googlechat]`/`[teams]`/
+/// `[feishu]`/`[lineworks]` overrides; same override shape as the bespoke
+/// `[telegram]`/`[line]` blocks.
 ///
 /// L2 (channels) stays on the shared gateway values passed in; L3 mirrors the
 /// resolved section (config → `{env_prefix}_*` env → deny-all).
@@ -765,6 +766,15 @@ async fn main() -> anyhow::Result<()> {
             &cfg.feishu.as_ref().map(|f| f.trust_config()),
             "FEISHU",
             cfg!(feature = "feishu") && std::env::var("FEISHU_APP_ID").is_ok(),
+            allow_all_channels,
+            &allowed_channels,
+        );
+        platform_trust_override(
+            &mut reg,
+            "lineworks",
+            &cfg.lineworks.as_ref().map(|lw| lw.trust_config()),
+            "LINEWORKS",
+            lineworks_activated(cfg.lineworks.as_ref()),
             allow_all_channels,
             &allowed_channels,
         );

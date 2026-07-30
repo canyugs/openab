@@ -188,7 +188,7 @@ pr      = ""
 [[openab_features]]
 feature = "trust_gate"
 status  = "implemented"
-note    = "L1 signature (constant-time HMAC compare + bot-id cross-check) at the webhook; shared L2 scope / L3 identity gate applies in the gateway ingress path keyed by platform (seeded from GATEWAY_* env for gateway platforms)."
+note    = "L1 signature (constant-time HMAC compare + bot-id cross-check) at the webhook; shared L2 scope / L3 identity gate applies in the gateway ingress path keyed by platform. L3 is first-class on [lineworks] (allow_all_users/allowed_users, LINEWORKS_* env fallback; deprecated uniform GATEWAY_* seed as last resort)."
 source  = ["crates/openab-gateway/src/adapters/lineworks.rs#verify_signature", "crates/openab-core/src/gateway.rs#process_gateway_event"]
 pr      = ""
 

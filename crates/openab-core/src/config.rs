@@ -934,6 +934,14 @@ pub struct LineWorksConfig {
     /// (LINE WORKS has no reaction/typing APIs). Unset/empty = disabled.
     /// Env fallback: `LINEWORKS_ACK_MESSAGE`.
     pub ack_message: Option<String>,
+    /// Explicit flag: true = allow all users, false = check `allowed_users`.
+    /// When not set, defaults to `false` (deny-all, per identity-trust-none
+    /// ADR). Env fallback: `LINEWORKS_ALLOW_ALL_USERS` (empty string = unset).
+    pub allow_all_users: Option<bool>,
+    /// LINE WORKS userIds (UUIDs, as carried in callback events) allowed to
+    /// interact. Only checked when `allow_all_users` resolves to `false`.
+    /// Env fallback: `LINEWORKS_ALLOWED_USERS` (comma-separated).
+    pub allowed_users: Option<Vec<String>>,
 }
 
 /// Fully resolved LINE WORKS settings (config → env → default applied).
@@ -1012,6 +1020,15 @@ impl LineWorksConfig {
                     .unwrap_or(true)
             }),
             ack_message: field(&self.ack_message, "LINEWORKS_ACK_MESSAGE"),
+        }
+    }
+
+    /// Trust-fields view for the shared registry override path, preserving
+    /// the semantics the section had as a [`PlatformTrustConfig`].
+    pub fn trust_config(&self) -> PlatformTrustConfig {
+        PlatformTrustConfig {
+            allow_all_users: self.allow_all_users,
+            allowed_users: self.allowed_users.clone(),
         }
     }
 }
@@ -3103,6 +3120,10 @@ allowed_users = ["users/123456789"]
 [teams]
 app_id = "app-1"
 allow_all_users = true
+
+[lineworks]
+bot_id = "123"
+allowed_users = ["uuid-a", "uuid-b"]
 "#;
         let cfg = parse_config_str(toml_str, "test").unwrap();
         let wecom = cfg.wecom.expect("wecom section");
@@ -3122,12 +3143,28 @@ allow_all_users = true
         let teams = cfg.teams.expect("teams section");
         assert_eq!(teams.app_id.as_deref(), Some("app-1"));
         assert_eq!(teams.allow_all_users, Some(true));
+        let lw = cfg.lineworks.expect("lineworks section");
+        assert_eq!(lw.bot_id.as_deref(), Some("123"));
+        assert_eq!(lw.allow_all_users, None);
+        assert_eq!(
+            lw.allowed_users.as_deref(),
+            Some(&["uuid-a".to_string(), "uuid-b".to_string()][..])
+        );
+        // trust_config() preserves the section's fields for the shared
+        // registry override path (platform_trust_override, prefix LINEWORKS).
+        let tc = lw.trust_config();
+        assert_eq!(tc.allow_all_users, None);
+        assert_eq!(
+            tc.allowed_users.as_deref(),
+            Some(&["uuid-a".to_string(), "uuid-b".to_string()][..])
+        );
 
         // Absent sections → None (trust falls back to legacy GATEWAY_* seed).
         let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
         assert!(cfg.wecom.is_none());
         assert!(cfg.googlechat.is_none());
         assert!(cfg.teams.is_none());
+        assert!(cfg.lineworks.is_none());
     }
 
     /// All `WECOM_*` env scenarios in ONE test — std::env is process-global and

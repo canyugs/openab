@@ -97,6 +97,8 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # private_key_file = "/etc/openab/lineworks_key.pem" # RS256 key from Developer Console
 #                                       # env fallback: LINEWORKS_PRIVATE_KEY_FILE (inline: LINEWORKS_PRIVATE_KEY)
 # webhook_path = "/webhook/lineworks"   # env fallback: LINEWORKS_WEBHOOK_PATH (default /webhook/lineworks)
+# allow_all_users = false               # L3 identity trust; default deny-all. env fallback: LINEWORKS_ALLOW_ALL_USERS
+# allowed_users = ["userId-uuid"]       # userIds admitted when allow_all_users=false. env fallback: LINEWORKS_ALLOWED_USERS
 
 # --- WeCom / Google Chat / MS Teams (first-class trust sections) ---
 # Same shape as [line]: L3 identity trust per platform, replacing the uniform

@@ -98,8 +98,18 @@ message  = "Summarize yesterday's merged PRs"
 
 ## Trust
 
-Identity trust for gateway platforms is seeded from the `GATEWAY_*` env vars
-(`GATEWAY_ALLOW_ALL_USERS`, `GATEWAY_ALLOWED_USERS` — comma-separated
-userIds). Default is deny-all: unlisted senders get a throttled
-"request access" echo carrying their ID, which is also the easiest way to
-discover a user's UUID.
+Identity trust (L3) is first-class on the `[lineworks]` section:
+
+```toml
+[lineworks]
+# allow_all_users = false            # default: deny-all (identity-trust-none ADR)
+allowed_users = ["userId-uuid-1"]    # env fallback: LINEWORKS_ALLOWED_USERS (comma-separated)
+```
+
+Default is deny-all: unlisted senders get a throttled "request access" echo
+carrying their userId, which is also the easiest way to discover a user's
+UUID. When neither `[lineworks]` trust fields nor `LINEWORKS_ALLOW_ALL_USERS`
+/ `LINEWORKS_ALLOWED_USERS` env vars are set, trust falls back to the
+deprecated uniform `GATEWAY_ALLOW_ALL_USERS` / `GATEWAY_ALLOWED_USERS` seed
+(a Phase-1 deprecation warning is logged; the fallback becomes a startup
+error in Phase 2, #1356).
