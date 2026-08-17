@@ -510,8 +510,20 @@ impl AdapterRouter {
                                         } else {
                                             content.clone()
                                         };
-                                        let _ =
-                                            edit_adapter.edit_message(&edit_msg, &display).await;
+                                        // Skip intermediate updates that end with a done-signal.
+                                        // The control-plane closes the session on the first
+                                        // edit_message that ends with [done]/🆗, so sending it
+                                        // mid-stream would close the session before the model has
+                                        // finished — all subsequent streaming edits would then be
+                                        // rejected. The final edit (after prompt_done) is the
+                                        // correct place to deliver [done].
+                                        let is_done_signal = display.trim_end().ends_with("[done]")
+                                            || display.trim_end().ends_with('\u{1F197}');
+                                        if !is_done_signal {
+                                            let _ = edit_adapter
+                                                .edit_message(&edit_msg, &display)
+                                                .await;
+                                        }
                                         last = content;
                                     }
                                 }
