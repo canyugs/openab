@@ -101,6 +101,7 @@ struct ThreadHandle {
     generation: u64,
     channel_id: String,
     adapter_kind: String,
+    channel_platform: String,
 }
 
 impl ThreadHandle {
@@ -370,6 +371,7 @@ impl Dispatcher {
                     generation: next_g,
                     channel_id: thread_channel.channel_id.clone(),
                     adapter_kind: adapter.platform().to_string(),
+                    channel_platform: thread_channel.platform.clone(),
                 }
             });
             (entry.tx.clone(), entry.generation)
@@ -414,6 +416,7 @@ impl Dispatcher {
                         generation: retry_g,
                         channel_id: thread_channel.channel_id.clone(),
                         adapter_kind: adapter.platform().to_string(),
+                        channel_platform: thread_channel.platform.clone(),
                     }
                 });
                 (entry.tx.clone(), entry.generation)
@@ -518,8 +521,11 @@ impl Dispatcher {
             let pending = handle.pending_count();
             if pending > 0 {
                 warn!(
-                    thread_id = %thread_id,
-                    channel   = %handle.channel_id,
+                    thread_id = %crate::redact::redact_session_ids_if_safe(thread_id),
+                    channel   = %crate::redact::redact_platform_identity_if_safe(
+                        &handle.channel_platform,
+                        &handle.channel_id,
+                    ),
                     adapter   = %handle.adapter_kind,
                     buffered_lost = pending,
                     "shutdown dropped pending messages without dispatch",
@@ -566,8 +572,11 @@ async fn consumer_loop(
                 }
                 Err(_elapsed) => {
                     debug!(
-                        thread_key = %thread_key,
-                        channel = %thread_channel.channel_id,
+                        thread_key = %crate::redact::redact_session_ids_if_safe(&thread_key),
+                        channel = %crate::redact::redact_platform_identity_if_safe(
+                            &thread_channel.platform,
+                            &thread_channel.channel_id,
+                        ),
                         "consumer idle timeout, exiting"
                     );
                     break;
@@ -642,7 +651,15 @@ async fn dispatch_batch(
         .iter()
         .map(|m| m.arrived_at.elapsed().as_millis())
         .collect();
-    let senders: Vec<String> = batch.iter().map(|m| m.sender_name.clone()).collect();
+    let sender_tags: Vec<String> = batch
+        .iter()
+        .map(|message| {
+            crate::redact::redact_platform_identity_if_safe(
+                &thread_channel.platform,
+                &message.sender_name,
+            )
+        })
+        .collect();
 
     // Native-streaming recipient is bound to the turn (captured per-message). A
     // batch attributes to the most recent sender; None for non-Slack/bot turns.
@@ -729,7 +746,11 @@ async fn dispatch_batch(
                     let _ = adapter
                         .send_message(&dispatch_channel, &format!("⚠️ {e}"))
                         .await;
-                    error!(session_key, error = %e, "workspace directive rejected");
+                    error!(
+                        session_key = %crate::redact::redact_session_ids_if_safe(&session_key),
+                        error = %e,
+                        "workspace directive rejected"
+                    );
                     return;
                 }
 
@@ -742,7 +763,11 @@ async fn dispatch_batch(
                 if let Some(ref title) = title_to_apply {
                     if !title.is_empty() {
                         if let Err(e) = adapter.rename_thread(&dispatch_channel, title).await {
-                            warn!(session_key, error = %e, "failed to apply title directive");
+                            warn!(
+                                session_key = %crate::redact::redact_session_ids_if_safe(&session_key),
+                                error = %e,
+                                "failed to apply title directive"
+                            );
                         }
                     }
                 }
@@ -810,18 +835,21 @@ async fn dispatch_batch(
     let agent_dispatch_ms = dispatch_start.elapsed().as_millis();
     let span = info_span!(
         "dispatch",
-        channel = %thread_channel.channel_id,
+        channel = %crate::redact::redact_platform_identity_if_safe(
+            &thread_channel.platform,
+            &thread_channel.channel_id,
+        ),
         adapter = adapter.platform(),
     );
     let _enter = span.enter();
     info!(
-        thread_key         = %thread_key,
+        thread_key         = %crate::redact::redact_session_ids_if_safe(thread_key),
         events_per_dispatch = batch_size,
         packed_block_count  = packed_block_count,
         agent_dispatch_ms   = agent_dispatch_ms,
         tokens_per_event    = ?tokens_per_event,
         wait_ms             = ?wait_ms,
-        senders             = ?senders,
+        senders             = ?sender_tags,
         "batch dispatched",
     );
 }
@@ -1152,6 +1180,7 @@ mod tests {
             generation,
             channel_id: "C".into(),
             adapter_kind: "discord".into(),
+            channel_platform: "discord".into(),
         }
     }
 
@@ -1241,6 +1270,7 @@ mod tests {
             generation: 0,
             channel_id: "c".into(),
             adapter_kind: "discord".into(),
+            channel_platform: "discord".into(),
         };
         d.per_thread.lock().unwrap().insert(key.to_string(), handle);
     }
@@ -1296,6 +1326,7 @@ mod tests {
             generation: 0,
             channel_id: "c".into(),
             adapter_kind: "discord".into(),
+            channel_platform: "discord".into(),
         }
     }
 
@@ -1708,6 +1739,7 @@ mod tests {
                 generation: 999,
                 channel_id: "T".into(),
                 adapter_kind: "mock".into(),
+                channel_platform: "mock".into(),
             };
             d.per_thread.lock().unwrap().insert(key.clone(), handle);
             abort

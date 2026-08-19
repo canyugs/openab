@@ -987,7 +987,10 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                     Ok(reply) => {
                         info!(
                             platform = %reply.platform,
-                            channel = %redact_channel(&reply.channel.id),
+                            channel = %redact_channel_for_platform(
+                                &reply.platform,
+                                &reply.channel.id,
+                            ),
                             command = ?reply.command.as_deref(),
                             "OAB → gateway reply"
                         );
@@ -1327,10 +1330,107 @@ fn redact_channel(id: &str) -> String {
     else {
         return id.to_string();
     };
+    hash_tag(uuid)
+}
+
+fn redact_channel_for_platform(platform: &str, id: &str) -> String {
+    if matches!(platform, "line" | "telegram") {
+        redact_platform_identity(id)
+    } else {
+        redact_channel(id)
+    }
+}
+
+/// Render a messaging-platform identity for operator logs.
+///
+/// Unlike [`redact_channel`], which preserves public channel ids for existing
+/// operator workflows, this helper is for user and conversation identifiers
+/// received from private messaging platforms. Those identifiers are personal
+/// data. With safe observability explicitly enabled, keeping a short stable tag
+/// preserves the ability to correlate ingress and egress events without
+/// retaining the original identity verbatim. The disabled default preserves
+/// legacy operator behavior. This is log minimization, not cryptographic
+/// anonymization: low-entropy numeric ids may still be guessable.
+pub(crate) fn redact_platform_identity(id: &str) -> String {
+    redact_platform_identity_with_mode(id, safe_observability_enabled())
+}
+
+/// Keep a legacy operator label while disabled, but correlate by the stable
+/// private identity after safe observability is enabled.
+pub(crate) fn private_identity_or_legacy(id: &str, legacy: &str) -> String {
+    if safe_observability_enabled() {
+        redact_platform_identity_with_mode(id, true)
+    } else {
+        legacy.to_string()
+    }
+}
+
+fn redact_platform_identity_with_mode(id: &str, safe_observability: bool) -> String {
+    if !safe_observability {
+        return id.to_string();
+    }
+    hash_tag(id)
+}
+
+fn hash_tag(id: &str) -> String {
     use sha2::{Digest as _, Sha256};
-    let digest = Sha256::digest(uuid.as_bytes());
+    let digest = Sha256::digest(id.as_bytes());
     let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
     format!("#{short}")
+}
+
+pub(crate) fn safe_observability_enabled() -> bool {
+    std::env::var("OPENAB_SAFE_OBSERVABILITY")
+        .map(|value| matches!(value.as_str(), "1" | "true"))
+        .unwrap_or(false)
+}
+
+/// Reduce a request failure to a bounded class before writing it to logs.
+/// `reqwest::Error` display text can include the request URL; Telegram embeds
+/// the bot token in that URL, so logging the full error would expose a secret.
+pub(crate) fn request_error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "other"
+    }
+}
+
+/// Preserve legacy error detail by default. In safe observability mode, emit
+/// only the bounded class because a reqwest error may contain a credentialed
+/// request URL (Telegram embeds the bot token in its URL path).
+pub(crate) fn request_error_for_log(error: &reqwest::Error) -> String {
+    if safe_observability_enabled() {
+        request_error_class(error).to_string()
+    } else {
+        error.to_string()
+    }
+}
+
+/// Preserve the legacy upstream response text unless safe observability was
+/// explicitly enabled for this deployment.
+pub(crate) fn upstream_error_for_log(raw: &str, bounded_class: &str) -> String {
+    upstream_error_for_log_with_mode(raw, bounded_class, safe_observability_enabled())
+}
+
+pub(crate) fn upstream_error_for_log_with_mode(
+    raw: &str,
+    bounded_class: &str,
+    safe_observability: bool,
+) -> String {
+    if safe_observability {
+        bounded_class.to_string()
+    } else {
+        raw.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1381,5 +1481,35 @@ mod redact_channel_tests {
                 "redact_channel and redact_id must tag {id} identically"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod redact_platform_identity_tests {
+    use super::{redact_platform_identity_with_mode, upstream_error_for_log_with_mode};
+
+    #[test]
+    fn platform_identity_is_stable_distinct_and_does_not_contain_the_raw_id() {
+        let raw = "U1234567890abcdef";
+        let tag = redact_platform_identity_with_mode(raw, true);
+
+        assert_eq!(tag, redact_platform_identity_with_mode(raw, true));
+        assert_ne!(
+            tag,
+            redact_platform_identity_with_mode("Ufedcba0987654321", true)
+        );
+        assert!(!tag.contains(raw));
+        assert_eq!(tag.len(), 9, "# followed by eight lowercase hex digits");
+        assert_eq!(redact_platform_identity_with_mode(raw, false), raw);
+    }
+
+    #[test]
+    fn upstream_error_detail_is_bounded_only_after_opt_in() {
+        let raw = "Bad Request: chat not found for user 123456789";
+        assert_eq!(upstream_error_for_log_with_mode(raw, "not_found", false), raw);
+        assert_eq!(
+            upstream_error_for_log_with_mode(raw, "not_found", true),
+            "not_found"
+        );
     }
 }

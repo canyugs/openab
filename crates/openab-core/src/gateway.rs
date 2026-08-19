@@ -81,17 +81,26 @@ struct EventFilterParams<'a> {
 fn should_skip_event(event: &GatewayEvent, filter: &EventFilterParams) -> bool {
     // Bot filter
     if event.sender.is_bot && !filter.allow_bot_messages && !filter.trusted_bot_ids.contains(&event.sender.id) {
-        tracing::info!(sender = %event.sender.id, "gateway: bot not in trusted_bot_ids, skipping");
+        tracing::info!(
+            sender = %redact_channel(&event.platform, &event.sender.id),
+            "gateway: bot not in trusted_bot_ids, skipping"
+        );
         return true;
     }
     // Channel allowlist
     if !filter.allow_all_channels && !filter.allowed_channels.contains(&event.channel.id) {
-        tracing::info!(channel = %redact_channel(&event.channel.id), "gateway: channel not in allowed_channels, skipping");
+        tracing::info!(
+            channel = %redact_channel(&event.platform, &event.channel.id),
+            "gateway: channel not in allowed_channels, skipping"
+        );
         return true;
     }
     // User allowlist
     if !filter.allow_all_users && !filter.allowed_users.contains(&event.sender.id) {
-        tracing::info!(sender = %event.sender.id, "gateway: user not in allowed_users, skipping");
+        tracing::info!(
+            sender = %redact_channel(&event.platform, &event.sender.id),
+            "gateway: user not in allowed_users, skipping"
+        );
         return true;
     }
     // @mention gating: in groups, only respond if bot is mentioned
@@ -912,8 +921,8 @@ pub async fn run_gateway_adapter(
 
                                     info!(
                                         platform = %event.platform,
-                                        sender = %event.sender.name,
-                                        channel = %redact_channel(&event.channel.id),
+                                        sender = %redact_channel(&event.platform, &event.sender.name),
+                                        channel = %redact_channel(&event.platform, &event.channel.id),
                                         "gateway event received"
                                     );
 
@@ -1314,8 +1323,8 @@ fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEve
             // (should_skip_event handles bot admission; L3 is human-only).
             tracing::info!(
                 platform = %event.platform,
-                sender = %event.sender.id,
-                channel = %redact_channel(&event.channel.id),
+                sender = %redact_channel(&event.platform, &event.sender.id),
+                channel = %redact_channel(&event.platform, &event.channel.id),
                 "gateway event denied (identity); echoing request-access"
             );
             let throttle_key = format!("{}:{}", event.platform, event.sender.id);
@@ -1342,8 +1351,8 @@ fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEve
         _ => {
             tracing::info!(
                 platform = %event.platform,
-                sender = %event.sender.id,
-                channel = %redact_channel(&event.channel.id),
+                sender = %redact_channel(&event.platform, &event.sender.id),
+                channel = %redact_channel(&event.platform, &event.channel.id),
                 ?decision,
                 "gateway event denied (scope); silent"
             );
@@ -1392,8 +1401,8 @@ pub async fn process_gateway_event(
 
     tracing::info!(
         platform = %event.platform,
-        sender = %event.sender.name,
-        channel = %redact_channel(&event.channel.id),
+        sender = %redact_channel(&event.platform, &event.sender.name),
+        channel = %redact_channel(&event.platform, &event.channel.id),
         "gateway event received (unified)"
     );
 
@@ -1877,7 +1886,7 @@ mod tests {
     }
 }
 
-/// Render a channel id for logs, hashing it when it is an ACP channel or session id.
+/// Render a gateway identity for logs using the platform-aware core policy.
 ///
 /// An ACP `channel_id` is `acp_<uuid>` and the session id is `sess_<same uuid>`, so the two are
 /// mutually derivable: either form printed in full IS a resume credential. Anyone reading operator
@@ -1891,24 +1900,15 @@ mod tests {
 /// redacting would, and it has already read as zero overlap between two logs describing the same
 /// session.
 ///
-/// Only ACP ids are hashed. A Discord or Slack channel id is a public identifier that operators
-/// legitimately grep for, and redacting it would cost real debuggability to protect nothing.
+/// With safe observability enabled, LINE and Telegram identities are also pseudonymized because
+/// they identify private messaging users or conversations. Discord and Slack channel ids keep
+/// their existing operator semantics.
 ///
 /// Copies of this function live in `openab-gateway` and `openab-mcp` because those crates
 /// deliberately do not depend on this one. Each is pinned to the same vector; where a crate has a
 /// redactor of its own, its test compares against that rather than against a copied literal.
-fn redact_channel(id: &str) -> String {
-    let Some(uuid) = id
-        .strip_prefix("acp_")
-        .or_else(|| id.strip_prefix("sess_"))
-        .filter(|uuid| !uuid.is_empty())
-    else {
-        return id.to_string();
-    };
-    use sha2::{Digest as _, Sha256};
-    let digest = Sha256::digest(uuid.as_bytes());
-    let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    format!("#{short}")
+fn redact_channel(platform: &str, id: &str) -> String {
+    crate::redact::redact_platform_identity(platform, id)
 }
 
 #[cfg(test)]
@@ -1929,34 +1929,50 @@ mod redact_channel_tests {
     #[test]
     fn an_acp_id_hashes_its_uuid_to_the_shared_vector_and_others_pass_through() {
         assert_eq!(
-            super::redact_channel(CHANNEL),
+            super::redact_channel("acp", CHANNEL),
             "#12b9377c",
             "ACP channel ids must hash to the tag the other crates produce for the same session"
         );
         assert_eq!(
-            super::redact_channel(SESSION),
+            super::redact_channel("acp", SESSION),
             "#12b9377c",
             "both forms of one session must share a tag — hashing the prefix is what split them"
         );
         assert_eq!(
-            super::redact_channel(CHANNEL),
+            super::redact_channel("acp", CHANNEL),
             crate::redact::redact_session_ids(CHANNEL),
             "this crate's two redactors must agree without relying on a copied literal"
         );
         assert_eq!(
-            super::redact_channel(SESSION),
+            super::redact_channel("acp", SESSION),
             crate::redact::redact_session_ids(SESSION),
             "including on the session form, which used to pass through here unredacted"
         );
         assert_eq!(
-            super::redact_channel("1234567890"),
+            super::redact_channel("discord", "1234567890"),
             "1234567890",
             "a non-ACP channel id is a public identifier and must stay greppable"
         );
         assert_eq!(
-            super::redact_channel("-"),
+            super::redact_channel("discord", "-"),
             "-",
             "the no-session sentinel must not be hashed into something that looks like a session"
+        );
+        assert!(
+            !crate::redact::redact_platform_identity_with_mode(
+                "telegram",
+                "1234567890",
+                true,
+            )
+            .contains("1234567890")
+        );
+        assert!(
+            !crate::redact::redact_platform_identity_with_mode(
+                "line",
+                "U1234567890abcdef",
+                true,
+            )
+            .contains("U1234567890abcdef")
         );
     }
 }

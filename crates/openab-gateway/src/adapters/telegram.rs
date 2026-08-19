@@ -228,7 +228,12 @@ pub async fn webhook(
     }
 
     let json = serde_json::to_string(&event).unwrap();
-    info!(chat_id = %msg.chat.id, sender = %sender_name, "telegram → gateway");
+    let sender_id = from.map(|user| user.id.to_string()).unwrap_or_default();
+    info!(
+        chat_id = %crate::redact_platform_identity(&msg.chat.id.to_string()),
+        sender = %crate::private_identity_or_legacy(&sender_id, sender_name),
+        "telegram → gateway"
+    );
     let _ = state.event_tx.send(json);
     axum::http::StatusCode::OK
 }
@@ -291,6 +296,38 @@ fn is_markdown_parse_error(description: &str) -> bool {
     desc_lower.contains("can't find end")
         || desc_lower.contains("can't parse")
         || desc_lower.contains("parse entities")
+}
+
+fn telegram_api_error_class(description: &str) -> &'static str {
+    let description = description.to_lowercase();
+    if is_markdown_parse_error(&description) {
+        "markdown_parse"
+    } else if description.contains("unauthorized") {
+        "unauthorized"
+    } else if description.contains("forbidden") {
+        "forbidden"
+    } else if description.contains("not found") {
+        "not_found"
+    } else if description.contains("too many requests") {
+        "rate_limited"
+    } else {
+        "api_error"
+    }
+}
+
+fn telegram_api_error_for_log(description: &str) -> String {
+    telegram_api_error_for_log_with_mode(description, crate::safe_observability_enabled())
+}
+
+fn telegram_api_error_for_log_with_mode(
+    description: &str,
+    safe_observability: bool,
+) -> String {
+    crate::upstream_error_for_log_with_mode(
+        description,
+        telegram_api_error_class(description),
+        safe_observability,
+    )
 }
 
 /// Returns true if the content is complex enough to benefit from sendRichMessage.
@@ -360,12 +397,22 @@ async fn send_rich_message(
         "message_thread_id": thread_id,
         "rich_message": { "markdown": text },
     });
-    let resp = client.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| crate::request_error_for_log(&error))?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|error| crate::request_error_for_log(&error))?;
     if json["ok"].as_bool() == Some(true) {
         Ok(json)
     } else {
-        Err(json["description"].as_str().unwrap_or("unknown error").to_string())
+        Err(telegram_api_error_for_log(
+            json["description"].as_str().unwrap_or("unknown error"),
+        ))
     }
 }
 
@@ -391,12 +438,22 @@ async fn send_rich_message_draft(
         "draft_id": draft_id,
         "rich_message": if text.contains("<tg-") { serde_json::json!({ "html": text }) } else { serde_json::json!({ "markdown": text }) },
     });
-    let resp = client.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
-    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| crate::request_error_for_log(&error))?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|error| crate::request_error_for_log(&error))?;
     if json["ok"].as_bool() == Some(true) {
         Ok(())
     } else {
-        Err(json["description"].as_str().unwrap_or("unknown error").to_string())
+        Err(telegram_api_error_for_log(
+            json["description"].as_str().unwrap_or("unknown error"),
+        ))
     }
 }
 
@@ -413,7 +470,10 @@ pub async fn handle_reply(
     // Handle create_topic command
     if reply.command.as_deref() == Some("create_topic") {
         let req_id = reply.request_id.clone().unwrap_or_default();
-        info!(chat_id = %reply.channel.id, "creating forum topic");
+        info!(
+            chat_id = %crate::redact_platform_identity(&reply.channel.id),
+            "creating forum topic"
+        );
         let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/createForumTopic");
         let resp = client
             .post(&url)
@@ -427,7 +487,10 @@ pub async fn handle_reply(
                     let tid = body["result"]["message_thread_id"]
                         .as_i64()
                         .map(|id| id.to_string());
-                    info!(thread_id = ?tid, "forum topic created");
+                    let thread_tag = tid
+                        .as_deref()
+                        .map(crate::redact_platform_identity);
+                    info!(thread_id = ?thread_tag, "forum topic created");
                     GatewayResponse {
                         schema: "openab.gateway.response.v1".into(),
                         request_id: req_id,
@@ -441,24 +504,27 @@ pub async fn handle_reply(
                         .as_str()
                         .unwrap_or("unknown error")
                         .to_string();
-                    warn!(err = %err, "createForumTopic failed");
+                    warn!(
+                        err = %telegram_api_error_for_log(&err),
+                        "createForumTopic failed"
+                    );
                     GatewayResponse {
                         schema: "openab.gateway.response.v1".into(),
                         request_id: req_id,
                         success: false,
                         thread_id: None,
                         message_id: None,
-                        error: Some(err),
+                        error: Some(telegram_api_error_for_log(&err)),
                     }
                 }
             }
-            Err(e) => GatewayResponse {
+            Err(error) => GatewayResponse {
                 schema: "openab.gateway.response.v1".into(),
                 request_id: req_id,
                 success: false,
                 thread_id: None,
                 message_id: None,
-                error: Some(e.to_string()),
+                error: Some(crate::request_error_for_log(&error)),
             },
         };
         let json = serde_json::to_string(&gw_resp).unwrap();
@@ -543,8 +609,13 @@ pub async fn handle_reply(
         let url = format!("{TELEGRAM_API_BASE}/bot{bot_token}/setMessageReaction");
         let msg_id: i64 = match reply.reply_to.parse() {
             Ok(id) => id,
-            Err(e) => {
-                warn!(reply_to = %reply.reply_to, chat_id = %reply.channel.id, error = %e, "invalid message_id for reaction, skipping");
+            Err(error) => {
+                warn!(
+                    reply_to = %crate::redact_platform_identity(&reply.reply_to),
+                    chat_id = %crate::redact_platform_identity(&reply.channel.id),
+                    error = %error,
+                    "invalid message_id for reaction, skipping"
+                );
                 return;
             }
         };
@@ -554,7 +625,7 @@ pub async fn handle_reply(
             "reaction": current,
         });
         debug!(
-            chat_id = %reply.channel.id,
+            chat_id = %crate::redact_platform_identity(&reply.channel.id),
             message_id = msg_id,
             emoji = %tg_emoji,
             is_add,
@@ -564,19 +635,31 @@ pub async fn handle_reply(
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    warn!(status = %status, body = %text, "setMessageReaction failed");
+                    let body = resp.text().await.unwrap_or_default();
+                    warn!(
+                        status = %status,
+                        body = %crate::upstream_error_for_log(&body, "api_error"),
+                        "setMessageReaction failed"
+                    );
                 }
             }
-            Err(e) => error!("telegram reaction error: {e}"),
+            Err(error) => error!(
+                "telegram reaction error: {}",
+                crate::request_error_for_log(&error)
+            ),
         }
         return;
     }
 
     // Normal send_message
+    let thread_tag = reply
+        .channel
+        .thread_id
+        .as_deref()
+        .map(crate::redact_platform_identity);
     info!(
-        chat_id = %reply.channel.id,
-        thread_id = ?reply.channel.thread_id,
+        chat_id = %crate::redact_platform_identity(&reply.channel.id),
+        thread_id = ?thread_tag,
         "gateway → telegram"
     );
 
@@ -594,7 +677,9 @@ pub async fn handle_reply(
         };
         match send_rich_message(client, bot_token, &reply.channel.id, &reply.channel.thread_id, &rich_text).await {
             Ok(_) => return,
-            Err(e) => warn!("sendRichMessage failed ({e}), falling back to sendMessage"),
+            Err(error) => warn!(
+                "sendRichMessage failed ({error}), falling back to sendMessage"
+            ),
         }
     }
 
@@ -619,7 +704,10 @@ pub async fn handle_reply(
                 if body["ok"].as_bool() != Some(true) {
                     let desc = body["description"].as_str().unwrap_or("unknown error");
                     if is_markdown_parse_error(desc) {
-                        warn!("Markdown send failed: {desc}, retrying as plain text");
+                        warn!(
+                            "Markdown send failed: {}, retrying as plain text",
+                            telegram_api_error_for_log(desc)
+                        );
                         match client
                             .post(&url)
                             .json(&serde_json::json!({
@@ -636,20 +724,28 @@ pub async fn handle_reply(
                                 if retry_body["ok"].as_bool() != Some(true) {
                                     error!(
                                         "telegram plain-text retry failed: {}",
-                                        retry_body["description"]
-                                            .as_str()
-                                            .unwrap_or("unknown error")
+                                        telegram_api_error_for_log(
+                                            retry_body["description"]
+                                                .as_str()
+                                                .unwrap_or("unknown error")
+                                        )
                                     );
                                 }
                             }
-                            Err(e) => error!("telegram plain-text send error: {e}"),
+                            Err(error) => error!(
+                                "telegram plain-text send error: {}",
+                                crate::request_error_for_log(&error)
+                            ),
                         }
                     } else {
-                        error!("telegram send failed: {desc}");
+                        error!("telegram send failed: {}", telegram_api_error_for_log(desc));
                     }
                 }
             }
-            Err(e) => error!("telegram send error: {e}"),
+            Err(error) => error!(
+                "telegram send error: {}",
+                crate::request_error_for_log(&error)
+            ),
         }
     }
 }
@@ -682,15 +778,25 @@ async fn download_telegram_media(
     let get_file_url = format!("{TELEGRAM_API_BASE}/bot{}/getFile", bot_token);
     let resp = match client.get(&get_file_url).query(&[("file_id", file_id)]).send().await {
         Ok(r) => r,
-        Err(e) => {
-            warn!(file_id, error = %e, kind = ?kind, "Telegram getFile request failed");
+        Err(error) => {
+            warn!(
+                file_id,
+                error = %crate::request_error_for_log(&error),
+                kind = ?kind,
+                "Telegram getFile request failed"
+            );
             return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error");
         }
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => {
-            warn!(file_id, error = %e, kind = ?kind, "Telegram getFile JSON parse failed");
+        Err(error) => {
+            warn!(
+                file_id,
+                error = %crate::request_error_for_log(&error),
+                kind = ?kind,
+                "Telegram getFile JSON parse failed"
+            );
             return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: invalid API response");
         }
     };
@@ -705,8 +811,13 @@ async fn download_telegram_media(
     let download_url = format!("{TELEGRAM_API_BASE}/file/bot{}/{}", bot_token, file_path);
     let resp = match client.get(&download_url).send().await {
         Ok(r) => r,
-        Err(e) => {
-            warn!(file_id, error = %e, kind = ?kind, "Telegram media download request failed");
+        Err(error) => {
+            warn!(
+                file_id,
+                error = %crate::request_error_for_log(&error),
+                kind = ?kind,
+                "Telegram media download request failed"
+            );
             return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error");
         }
     };
@@ -747,8 +858,13 @@ async fn download_telegram_media(
 
     let bytes = match resp.bytes().await {
         Ok(b) => b,
-        Err(e) => {
-            warn!(file_id, error = %e, kind = ?kind, "Telegram media body read failed");
+        Err(error) => {
+            warn!(
+                file_id,
+                error = %crate::request_error_for_log(&error),
+                kind = ?kind,
+                "Telegram media body read failed"
+            );
             return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: body read error");
         }
     };
@@ -821,15 +937,23 @@ async fn download_telegram_document(
     let get_file_url = format!("{TELEGRAM_API_BASE}/bot{}/getFile", bot_token);
     let resp = match client.get(&get_file_url).query(&[("file_id", file_id)]).send().await {
         Ok(r) => r,
-        Err(e) => {
-            warn!(file_id, error = %e, "Telegram document getFile request failed");
+        Err(error) => {
+            warn!(
+                file_id,
+                error = %crate::request_error_for_log(&error),
+                "Telegram document getFile request failed"
+            );
             return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
         }
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(e) => {
-            warn!(file_id, error = %e, "Telegram document getFile JSON parse failed");
+        Err(error) => {
+            warn!(
+                file_id,
+                error = %crate::request_error_for_log(&error),
+                "Telegram document getFile JSON parse failed"
+            );
             return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: invalid API response");
         }
     };
@@ -844,8 +968,12 @@ async fn download_telegram_document(
     let download_url = format!("{TELEGRAM_API_BASE}/file/bot{}/{}", bot_token, file_path);
     let resp = match client.get(&download_url).send().await {
         Ok(r) => r,
-        Err(e) => {
-            warn!(file_id, err = %e, "Telegram document network error");
+        Err(error) => {
+            warn!(
+                file_id,
+                err = %crate::request_error_for_log(&error),
+                "Telegram document network error"
+            );
             return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
         }
     };
@@ -878,8 +1006,12 @@ async fn download_telegram_document(
 
     let bytes = match resp.bytes().await {
         Ok(b) => b,
-        Err(e) => {
-            warn!(file_id, error = %e, "Telegram document body read failed");
+        Err(error) => {
+            warn!(
+                file_id,
+                error = %crate::request_error_for_log(&error),
+                "Telegram document body read failed"
+            );
             return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: body read error");
         }
     };
@@ -954,6 +1086,26 @@ mod tests {
         assert!(is_markdown_parse_error("can't parse entities in message text"));
         assert!(!is_markdown_parse_error("Unauthorized"));
         assert!(!is_markdown_parse_error("Bad Request: chat not found"));
+    }
+
+    #[test]
+    fn api_errors_are_reduced_to_bounded_classes() {
+        let sensitive = "Bad Request: chat not found for user 123456789";
+        assert_eq!(telegram_api_error_class(sensitive), "not_found");
+        assert!(!telegram_api_error_class(sensitive).contains("123456789"));
+        assert_eq!(telegram_api_error_for_log_with_mode(sensitive, false), sensitive);
+        assert_eq!(
+            telegram_api_error_for_log_with_mode(sensitive, true),
+            "not_found"
+        );
+        assert_eq!(
+            telegram_api_error_class("Too Many Requests: retry after 30"),
+            "rate_limited"
+        );
+        assert_eq!(
+            telegram_api_error_class("can't parse entities in message text"),
+            "markdown_parse"
+        );
     }
 
     #[test]

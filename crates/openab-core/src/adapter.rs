@@ -1073,6 +1073,13 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
+                    let turn_duration_ms =
+                        u64::try_from(prompt_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    emit_turn_completed(
+                        turn_duration_ms,
+                        response_error.as_deref(),
+                        &turn_result,
+                    );
                     // Stop the cosmetic edit loop before the finalize write path
                     // issues its authoritative edit. Dropping buf_tx closes the watch
                     // channel so the loop breaks on its next check, but it may be
@@ -1118,13 +1125,23 @@ impl AdapterRouter {
                         display_for(platform_is_acp, &tool_lines, &text_buf, false, tool_display);
                     let final_content = if final_content.is_empty() {
                         if turn_result.is_silent_failure() {
-                            warn!(
-                                stop_reason = ?turn_result.stop_reason,
-                                input_tokens = ?turn_result.input_tokens,
-                                output_tokens = ?turn_result.output_tokens,
-                                total_tokens = ?turn_result.total_tokens,
-                                "agent returned empty turn (0 output tokens) — likely provider/model/auth failure"
-                            );
+                            if crate::redact::safe_observability_enabled() {
+                                warn!(
+                                    stop_reason = bounded_stop_reason(&turn_result),
+                                    input_tokens = ?turn_result.input_tokens,
+                                    output_tokens = ?turn_result.output_tokens,
+                                    total_tokens = ?turn_result.total_tokens,
+                                    "agent returned empty turn (0 output tokens) — likely provider/model/auth failure"
+                                );
+                            } else {
+                                warn!(
+                                    stop_reason = ?turn_result.stop_reason,
+                                    input_tokens = ?turn_result.input_tokens,
+                                    output_tokens = ?turn_result.output_tokens,
+                                    total_tokens = ?turn_result.total_tokens,
+                                    "agent returned empty turn (0 output tokens) — likely provider/model/auth failure"
+                                );
+                            }
                         }
                         classify_empty_turn(response_error.as_deref(), &turn_result)
                     } else if let Some(err) = response_error {
@@ -1501,6 +1518,77 @@ pub(crate) fn classify_empty_turn(
     } else {
         "_(no response)_".to_string()
     }
+}
+
+/// Classify a terminal agent turn for the bounded operational telemetry event.
+///
+/// The classification intentionally depends only on protocol status and token
+/// counts. Message content, session ids, and platform identities never enter
+/// the telemetry event.
+pub(crate) fn classify_turn_outcome(
+    response_error: Option<&str>,
+    turn_result: &TurnResult,
+) -> &'static str {
+    if response_error.is_some() {
+        "error"
+    } else if turn_result.is_silent_failure() {
+        "silent_failure"
+    } else {
+        "completed"
+    }
+}
+
+/// Keep the protocol stop reason useful for aggregation without trusting an
+/// arbitrary agent-provided string as log-safe text.
+pub(crate) fn bounded_stop_reason(turn_result: &TurnResult) -> &'static str {
+    match turn_result.stop_reason.as_deref() {
+        Some("end_turn") => "end_turn",
+        Some("max_tokens") => "max_tokens",
+        Some("max_turn_requests") => "max_turn_requests",
+        Some("refusal") => "refusal",
+        Some("cancelled") => "cancelled",
+        Some(_) => "other",
+        None => "unknown",
+    }
+}
+
+fn emit_turn_completed(
+    duration_ms: u64,
+    response_error: Option<&str>,
+    turn_result: &TurnResult,
+) {
+    emit_turn_completed_with_mode(
+        duration_ms,
+        response_error,
+        turn_result,
+        crate::redact::safe_observability_enabled(),
+    );
+}
+
+fn emit_turn_completed_with_mode(
+    duration_ms: u64,
+    response_error: Option<&str>,
+    turn_result: &TurnResult,
+    safe_observability: bool,
+) {
+    if !safe_observability {
+        return;
+    }
+
+    let token_usage_reported = turn_result.input_tokens.is_some()
+        && turn_result.output_tokens.is_some()
+        && turn_result.total_tokens.is_some();
+    tracing::info!(
+        event_type = "agent.turn_completed",
+        outcome = classify_turn_outcome(response_error, turn_result),
+        duration_ms,
+        stop_reason = bounded_stop_reason(turn_result),
+        input_tokens = turn_result.input_tokens.unwrap_or_default(),
+        output_tokens = turn_result.output_tokens.unwrap_or_default(),
+        total_tokens = turn_result.total_tokens.unwrap_or_default(),
+        token_usage_reported,
+        "agent turn completed"
+    );
 }
 
 /// Content to stream/deliver for a reply. ACP gets the raw append-only answer `text`
@@ -2332,7 +2420,10 @@ mod tests {
 #[cfg(test)]
 mod directive_tests {
     use super::parse_output_directives;
-    use super::{classify_empty_turn, SILENT_FAILURE_MSG};
+    use super::{
+        bounded_stop_reason, classify_empty_turn, classify_turn_outcome,
+        emit_turn_completed_with_mode, SILENT_FAILURE_MSG,
+    };
     use crate::acp::TurnResult;
 
     #[test]
@@ -2553,5 +2644,106 @@ mod directive_tests {
         };
         let result = classify_empty_turn(None, &tr);
         assert_eq!(result, "_(no response)_");
+    }
+
+    #[test]
+    fn turn_outcome_reports_completed_error_and_silent_failure_without_content() {
+        let completed = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            total_tokens: Some(15),
+        };
+        assert_eq!(classify_turn_outcome(None, &completed), "completed");
+
+        assert_eq!(
+            classify_turn_outcome(Some("provider unavailable"), &completed),
+            "error"
+        );
+
+        let silent = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            input_tokens: Some(10),
+            output_tokens: Some(0),
+            total_tokens: Some(10),
+        };
+        assert_eq!(classify_turn_outcome(None, &silent), "silent_failure");
+        assert_eq!(
+            classify_turn_outcome(Some("provider unavailable"), &silent),
+            "error",
+            "explicit protocol errors take precedence over silent-failure inference"
+        );
+    }
+
+    #[test]
+    fn stop_reason_is_bounded_before_logging() {
+        for reason in [
+            "end_turn",
+            "max_tokens",
+            "max_turn_requests",
+            "refusal",
+            "cancelled",
+        ] {
+            let turn = TurnResult {
+                stop_reason: Some(reason.into()),
+                ..TurnResult::default()
+            };
+            assert_eq!(bounded_stop_reason(&turn), reason);
+        }
+
+        let untrusted = TurnResult {
+            stop_reason: Some("user content must not reach logs".into()),
+            ..TurnResult::default()
+        };
+        assert_eq!(bounded_stop_reason(&untrusted), "other");
+        assert_eq!(bounded_stop_reason(&TurnResult::default()), "unknown");
+    }
+
+    #[test]
+    fn turn_completion_json_has_numeric_token_fields() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let capture = Capture(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || capture.clone())
+            .finish();
+        let turn = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            total_tokens: Some(15),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_turn_completed_with_mode(41, None, &turn, false);
+            emit_turn_completed_with_mode(42, None, &turn, true);
+        });
+
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let fields = &event["fields"];
+        assert_eq!(fields["event_type"], "agent.turn_completed");
+        assert_eq!(fields["input_tokens"], 10);
+        assert_eq!(fields["output_tokens"], 5);
+        assert_eq!(fields["total_tokens"], 15);
+        assert_eq!(fields["token_usage_reported"], true);
+        assert_eq!(output.lines().count(), 1, "disabled mode must emit no event");
     }
 }

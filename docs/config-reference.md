@@ -24,6 +24,32 @@ openab run -c s3://my-bucket/path/to/config.toml
 
 Remote config is fetched via HTTP GET with a 10-second timeout and a 1 MiB response size limit. Environment variable expansion (`${VAR}`) works identically on both local and remote config content.
 
+### Safe observability (opt-in)
+
+Set `OPENAB_SAFE_OBSERVABILITY=true` on both the OpenAB process and a separately
+deployed `openab-gateway` process to enable bounded operational telemetry for
+private messaging deployments. It is disabled by default, so existing
+deployments keep their current logs and do not emit the new terminal-turn event.
+
+When enabled:
+
+- each terminal agent prompt emits one structured `agent.turn_completed` event
+  with outcome, bounded stop reason, duration, numeric token counters, and a
+  `token_usage_reported` flag;
+- LINE and Telegram user, conversation, thread, and composite dispatch
+  identifiers in the affected operator logs become stable short pseudonymous
+  tags; and
+- affected LINE and Telegram upstream failures log bounded error classes rather
+  than response bodies or credential-bearing request URLs.
+
+Migration note: dashboards and searches must use the pseudonymous tags instead
+of raw LINE or Telegram identifiers, and detailed upstream error text is no
+longer available from these logs. Disable the variable to restore legacy
+logging while diagnosing an incident, understanding that doing so can place
+private identifiers, upstream response text, or credential-bearing URLs in the
+log sink. The short tags are for correlation and log minimization, not
+cryptographic anonymization; low-entropy identifiers may still be guessable.
+
 > **Security best practice:** Never hardcode secrets in remote config files. Use environment variable references like `bot_token = "${DISCORD_BOT_TOKEN}"` and inject the actual values via local environment variables or Kubernetes Secrets. For centralized secret management with rotation and audit, use `[secrets.refs]` with AWS Secrets Manager or an exec provider — see [secrets-management.md](secrets-management.md). OpenAB expands `${VAR}` identically for both local and remote config.
 
 ### `s3://` config source

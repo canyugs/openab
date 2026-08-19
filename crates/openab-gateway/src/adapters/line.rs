@@ -189,7 +189,11 @@ async fn process_line_webhook_events(
         }
 
         let json = serde_json::to_string(&gateway_event).unwrap();
-        info!(channel = %gateway_event.channel.id, sender = %gateway_event.sender.id, "line → gateway");
+        info!(
+            channel = %crate::redact_platform_identity(&gateway_event.channel.id),
+            sender = %crate::redact_platform_identity(&gateway_event.sender.id),
+            "line → gateway"
+        );
         let _ = state.event_tx.send(json);
     }
 }
@@ -371,7 +375,7 @@ async fn build_gateway_event_from_line_event(
     let is_group = channel_type == "group" || channel_type == "room";
     if is_group && !mentionees.iter().any(|m| m.is_self) {
         info!(
-            channel = %channel_id,
+            channel = %crate::redact_platform_identity(&channel_id),
             "line group message dropped (@mention gating: bot not mentioned)"
         );
         return None;
@@ -692,7 +696,10 @@ pub async fn dispatch_line_reply(
     // Try Reply API first (free, no quota consumed)
     let mut used_reply = false;
     if let Some(reply_token) = cached_token {
-        info!(to = %reply.channel.id, "gateway → line (reply API)");
+        info!(
+            to = %crate::redact_platform_identity(&reply.channel.id),
+            "gateway → line (reply API)"
+        );
         let resp = client
             .post(format!("{}/v2/bot/message/reply", api_base))
             .bearer_auth(access_token)
@@ -714,14 +721,25 @@ pub async fn dispatch_line_reply(
                     && ((body_lower.contains("invalid") && body_lower.contains("reply token"))
                         || body_lower.contains("expired"));
                 if token_unusable {
-                    warn!(status = %status, body = %body, "LINE reply token unusable, falling back to Push");
+                    warn!(
+                        status = %status,
+                        body = %crate::upstream_error_for_log(&body, "reply_token_unusable"),
+                        "LINE reply token unusable, falling back to Push"
+                    );
                 } else {
-                    error!(status = %status, body = %body, "LINE Reply API error, NOT falling back to Push (possible duplicate risk)");
+                    error!(
+                        status = %status,
+                        body = %crate::upstream_error_for_log(&body, "api_error"),
+                        "LINE Reply API error, NOT falling back to Push (possible duplicate risk)"
+                    );
                     used_reply = true;
                 }
             }
             Err(e) => {
-                error!(err = %e, "LINE Reply API network error, NOT falling back to Push (possible duplicate risk)");
+                error!(
+                    err = %crate::request_error_for_log(&e),
+                    "LINE Reply API network error, NOT falling back to Push (possible duplicate risk)"
+                );
                 used_reply = true;
             }
         }
@@ -729,7 +747,10 @@ pub async fn dispatch_line_reply(
 
     // Fallback to Push API
     if !used_reply {
-        info!(to = %reply.channel.id, "gateway → line (push API)");
+        info!(
+            to = %crate::redact_platform_identity(&reply.channel.id),
+            "gateway → line (push API)"
+        );
         let _ = client
             .post(format!("{}/v2/bot/message/push", api_base))
             .bearer_auth(access_token)
@@ -739,7 +760,9 @@ pub async fn dispatch_line_reply(
             }))
             .send()
             .await
-            .map_err(|e| error!("line push error: {e}"));
+            .map_err(|e| {
+                error!("line push error: {}", crate::request_error_for_log(&e))
+            });
     }
 
     used_reply
