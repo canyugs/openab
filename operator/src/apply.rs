@@ -1115,8 +1115,7 @@ async fn apply_ecs(
     let mut webhook_urls = Vec::new();
     if let (Some(ingress), Some(cm)) = (&m.spec.ingress, &cloud_map) {
         eprintln!("  🌐 Reconciling ingress (VPC Link + API Gateway)...");
-        let gateway_controls =
-            GatewayControlsTransition::from_manifest(previously_had_guard, m);
+        let gateway_controls = GatewayControlsTransition::from_manifest(previously_had_guard, m);
         let gateway = crate::ingress::ensure_gateway(
             config,
             crate::ingress::GatewayApply {

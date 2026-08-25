@@ -200,21 +200,21 @@ pub struct TaskIngressGuard {
 impl TaskIngressGuard {
     fn validate(&self) -> anyhow::Result<()> {
         if !is_sha256_digest_pinned(&self.image) {
-            anyhow::bail!(
-                "ingress.taskIngressGuard.image must be pinned by sha256 digest"
-            );
+            anyhow::bail!("ingress.taskIngressGuard.image must be pinned by sha256 digest");
         }
         Ok(())
     }
 }
 
 fn is_sha256_digest_pinned(image: &str) -> bool {
-    image.split_once("@sha256:").is_some_and(|(repository, digest)| {
-        !repository.is_empty()
-            && !repository.contains('@')
-            && digest.len() == 64
-            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
+    image
+        .split_once("@sha256:")
+        .is_some_and(|(repository, digest)| {
+            !repository.is_empty()
+                && !repository.contains('@')
+                && digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 fn default_ingress_type() -> String {
@@ -385,9 +385,7 @@ impl OABServiceManifest {
                     "spec.ingress is only supported with ECS runtime (use native Kubernetes Ingress otherwise)"
                 );
             }
-            if ingress.task_ingress_guard.is_some()
-                && !is_sha256_digest_pinned(&self.spec.image)
-            {
+            if ingress.task_ingress_guard.is_some() && !is_sha256_digest_pinned(&self.spec.image) {
                 anyhow::bail!(
                     "spec.image must be pinned by sha256 digest when taskIngressGuard is enabled"
                 );

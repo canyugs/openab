@@ -28,10 +28,7 @@ impl GatewayControlsPlan {
             throttling_rate_limit: 5.0,
             throttling_burst_limit: 10,
             detailed_metrics_enabled: true,
-            alarm_name: Self::alarm_name(
-                &manifest.metadata.namespace,
-                &manifest.metadata.name,
-            ),
+            alarm_name: Self::alarm_name(&manifest.metadata.namespace, &manifest.metadata.name),
             metric_name: "4xx",
             method: "POST",
             resource: "/webhook/line",
@@ -51,10 +48,7 @@ pub enum GatewayControlsTransition {
 }
 
 impl GatewayControlsTransition {
-    pub fn from_manifest(
-        previously_had_guard: bool,
-        manifest: &OABServiceManifest,
-    ) -> Self {
+    pub fn from_manifest(previously_had_guard: bool, manifest: &OABServiceManifest) -> Self {
         if let Some(plan) = GatewayControlsPlan::from_manifest(manifest) {
             return Self::Ensure(plan);
         }

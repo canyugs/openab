@@ -1144,10 +1144,7 @@ async fn ensure_stage(
     if let Some(controls) = controls {
         create = create.route_settings(&controls.route_key, route_settings(controls));
     }
-    create
-        .send()
-        .await
-        .context("failed to create stage")?;
+    create.send().await.context("failed to create stage")?;
     eprintln!("  ⊕ Created stage: {STAGE_NAME} (auto-deploy)");
     Ok(())
 }
