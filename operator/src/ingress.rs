@@ -167,17 +167,8 @@ pub async fn ensure_gateway(
     // ── Prune routes for paths no longer in the manifest (rename/removal) ───
     warnings.extend(prune_stale_routes(&api, &api_id, &ingress.paths).await?);
 
-    // ── Stage (auto-deploy) ────────────────────────────────────────────────
-    ensure_stage(&api, &api_id, controls).await?;
-    match controls {
-        GatewayControlsTransition::Ensure(controls) => {
-            ensure_gateway_alarm(config, &api_id, controls).await?;
-        }
-        GatewayControlsTransition::Remove { alarm_name } => {
-            remove_gateway_alarm(config, alarm_name).await?;
-        }
-        GatewayControlsTransition::Unchanged => {}
-    }
+    // ── Stage (auto-deploy) + guarded route controls and alarm ─────────────
+    reconcile_gateway_controls(config, &api, &api_id, controls).await?;
 
     Ok(GatewayResult {
         webhook_urls: webhook_urls(&api_endpoint, &ingress.paths),
@@ -1109,7 +1100,7 @@ fn route_settings(controls: &GatewayControlsPlan) -> aws_sdk_apigatewayv2::types
 async fn ensure_stage(
     api: &aws_sdk_apigatewayv2::Client,
     api_id: &str,
-    controls: &GatewayControlsTransition,
+    controls: Option<&GatewayControlsPlan>,
 ) -> Result<()> {
     let mut next: Option<String> = None;
     loop {
@@ -1120,35 +1111,22 @@ async fn ensure_stage(
         let resp = req.send().await.context("failed to list stages")?;
         for s in resp.items() {
             if s.stage_name() == Some(STAGE_NAME) {
-                match controls {
-                    GatewayControlsTransition::Ensure(controls) => {
-                        api.update_stage()
-                            .api_id(api_id)
-                            .stage_name(STAGE_NAME)
-                            .route_settings(&controls.route_key, route_settings(controls))
-                            .send()
-                            .await
-                            .context("failed to reconcile guarded LINE route settings")?;
-                        eprintln!(
-                            "  ✓ Stage exists: {STAGE_NAME} ({} rate {}/s, burst {})",
-                            controls.route_key,
-                            controls.throttling_rate_limit,
-                            controls.throttling_burst_limit
-                        );
-                    }
-                    GatewayControlsTransition::Remove { .. } => {
-                        api.update_stage()
-                            .api_id(api_id)
-                            .stage_name(STAGE_NAME)
-                            .set_route_settings(Some(HashMap::new()))
-                            .send()
-                            .await
-                            .context("failed to remove guarded LINE route settings")?;
-                        eprintln!("  ✓ Removed guarded LINE route settings from {STAGE_NAME}");
-                    }
-                    GatewayControlsTransition::Unchanged => {
-                        eprintln!("  ✓ Stage exists: {STAGE_NAME}");
-                    }
+                if let Some(controls) = controls {
+                    api.update_stage()
+                        .api_id(api_id)
+                        .stage_name(STAGE_NAME)
+                        .route_settings(&controls.route_key, route_settings(controls))
+                        .send()
+                        .await
+                        .context("failed to reconcile guarded LINE route settings")?;
+                    eprintln!(
+                        "  ✓ Stage exists: {STAGE_NAME} ({} rate {}/s, burst {})",
+                        controls.route_key,
+                        controls.throttling_rate_limit,
+                        controls.throttling_burst_limit
+                    );
+                } else {
+                    eprintln!("  ✓ Stage exists: {STAGE_NAME}");
                 }
                 return Ok(());
             }
@@ -1163,7 +1141,7 @@ async fn ensure_stage(
         .api_id(api_id)
         .stage_name(STAGE_NAME)
         .auto_deploy(true);
-    if let GatewayControlsTransition::Ensure(controls) = controls {
+    if let Some(controls) = controls {
         create = create.route_settings(&controls.route_key, route_settings(controls));
     }
     create
@@ -1172,6 +1150,33 @@ async fn ensure_stage(
         .context("failed to create stage")?;
     eprintln!("  ⊕ Created stage: {STAGE_NAME} (auto-deploy)");
     Ok(())
+}
+
+async fn reconcile_gateway_controls(
+    config: &aws_config::SdkConfig,
+    api: &aws_sdk_apigatewayv2::Client,
+    api_id: &str,
+    controls: &GatewayControlsTransition,
+) -> Result<()> {
+    match controls {
+        GatewayControlsTransition::Ensure(plan) => {
+            ensure_stage(api, api_id, Some(plan)).await?;
+            ensure_gateway_alarm(config, api_id, plan).await
+        }
+        GatewayControlsTransition::Remove { alarm_name } => {
+            ensure_stage(api, api_id, None).await?;
+            api.update_stage()
+                .api_id(api_id)
+                .stage_name(STAGE_NAME)
+                .set_route_settings(Some(HashMap::new()))
+                .send()
+                .await
+                .context("failed to remove guarded LINE route settings")?;
+            eprintln!("  ✓ Removed guarded LINE route settings from {STAGE_NAME}");
+            remove_gateway_alarm(config, alarm_name).await
+        }
+        GatewayControlsTransition::Unchanged => ensure_stage(api, api_id, None).await,
+    }
 }
 
 async fn ensure_gateway_alarm(
