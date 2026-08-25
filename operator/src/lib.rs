@@ -55,19 +55,23 @@ mod create;
 mod delete;
 mod get;
 mod ingress;
+mod ingress_controls;
 pub mod manifest;
 mod scale;
 mod secrets;
+mod task_definition;
 
 pub use apply::{
     apply_manifests, AppliedService, ApplyAction, ApplyError, ApplyErrorKind, ApplyOptions,
     ApplyReport, ServiceTarget,
 };
+pub use ingress_controls::GatewayControlsPlan;
 pub use manifest::{
     AgentOverride, EcsNetworking, EcsRuntime, FleetMetadata, FleetSpec, FleetTemplate, Ingress,
     KubernetesRuntime, Metadata, OABFleetManifest, OABServiceManifest, RawManifest, Resources,
-    Runtime, Spec,
+    Runtime, Spec, TaskIngressGuard,
 };
+pub use task_definition::TaskIngressPlan;
 
 #[doc(hidden)]
 pub use cli::run_cli;

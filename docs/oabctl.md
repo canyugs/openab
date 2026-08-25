@@ -246,11 +246,39 @@ spec:
   ingress:
     type: apigateway          # only supported type (default)
     cloudMapNamespace: oab    # reused across bots in the VPC (default: oab)
-    containerPort: 8080       # OpenAB listen port (default: 8080)
+    containerPort: 8080       # Externally registered task port (default: 8080)
     paths:
       - /webhook/telegram
       - /webhook/line
 ```
+
+For the bounded LINE pilot, enable the Task-local ingress guard and pin both
+images by digest:
+
+```yaml
+spec:
+  image: public.ecr.aws/example/openab@sha256:<64-hex-digest>
+  # resources, configFrom, and FARGATE_SPOT runtime omitted here
+  ingress:
+    paths: [/webhook/line]
+    containerPort: 8080
+    taskIngressGuard:
+      image: public.ecr.aws/example/task-ingress-guard@sha256:<64-hex-digest>
+```
+
+`taskIngressGuard` is opt-in and valid only when `paths` is exactly
+`[/webhook/line]`. It changes the ECS Task to two essential containers. The
+guard alone is registered on `containerPort`; OpenAB binds to Task-local
+loopback and the guard forwards only to the exact loopback
+`/webhook/line` endpoint. Existing manifests without this field retain their
+single-container topology.
+
+For guarded LINE ingress, `apply` also reconciles the exact
+`POST /webhook/line` stage route to 5 requests/second with burst 10 and enables
+detailed metrics. It creates a one-minute CloudWatch alarm on any route-level
+`4xx`. HTTP APIs do not publish a distinct native `429` metric, so this is a
+conservative pilot-stop signal: every reported throttling `429` triggers it,
+and another client-side error on that exact route can trigger it too.
 
 #### Minimal working manifest: Telegram on AWS
 
@@ -294,7 +322,9 @@ On `apply` this reconciles (idempotently, reused by name):
 2. **ECS service registry** wiring (attached at service creation)
 3. **VPC Link** (`oab-vpc-link-<vpc-id>`, shared per-VPC), waits until `AVAILABLE`
 4. **API Gateway HTTP API** (`oab-webhook-<ns>-<name>`, one per bot) + `HTTP_PROXY` integration over the VPC Link, with an `overwrite:path` request parameter mapping so the backend receives the raw path (e.g. `/webhook/telegram`) instead of the stage-prefixed one (e.g. `/prod/webhook/telegram`) — see caveat below
-5. One **route** per path + a `prod` auto-deploy **stage**
+5. One **route** per path + a `prod` auto-deploy **stage**; guarded LINE
+   ingress additionally reconciles exact-route 5 requests/second, burst 10,
+   detailed metrics, and a route-level `4xx` CloudWatch alarm
 6. A self-referencing **security-group** inbound rule on `containerPort`
 
 `apply` then prints the stable webhook URL(s):
@@ -685,7 +715,8 @@ any manifest sets `spec.ingress`, the **caller of `oabctl apply`/`delete`**
 | Service | Actions |
 |---------|---------|
 | Cloud Map | `servicediscovery:CreatePrivateDnsNamespace`, `CreateService`, `DeleteService`, `ListNamespaces`, `ListServices`, `GetOperation` |
-| API Gateway | `apigateway:CreateVpcLink`, `CreateApi`, `CreateIntegration`, `CreateRoute`, `CreateStage`, `DeleteRoute`, `DeleteIntegration`, `DeleteStage`, `DeleteApi`, `GetVpcLinks`, `GetVpcLink`, `GetApis`, `GetIntegrations`, `GetRoutes`, `GetStages` |
+| API Gateway | `apigateway:CreateVpcLink`, `CreateApi`, `CreateIntegration`, `CreateRoute`, `CreateStage`, `UpdateStage`, `DeleteRoute`, `DeleteIntegration`, `DeleteStage`, `DeleteApi`, `GetVpcLinks`, `GetVpcLink`, `GetApis`, `GetIntegrations`, `GetRoutes`, `GetStages` |
+| CloudWatch | `cloudwatch:PutMetricAlarm` for guarded LINE ingress |
 | EC2 | `ec2:DescribeSubnets`, `AuthorizeSecurityGroupIngress` |
 | ECS | `ecs:UpdateService` with `serviceRegistries` (requires the `AWSServiceRoleForECS` service-linked role, which ECS creates automatically the first time any service in the account uses service discovery) |
 

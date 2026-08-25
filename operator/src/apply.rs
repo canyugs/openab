@@ -1,5 +1,6 @@
 use crate::bootstrap::BootstrapState;
 use crate::manifest::{OABFleetManifest, OABServiceManifest, RawManifest, Runtime};
+use crate::{GatewayControlsPlan, TaskIngressPlan};
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
@@ -674,6 +675,13 @@ async fn apply_ecs(
         );
     }
 
+    let task_ingress_plan = TaskIngressPlan::from_manifest(m);
+    if let Some(plan) = &task_ingress_plan {
+        for (name, value) in plan.openab_environment() {
+            env_vars.push(KeyValuePair::builder().name(name).value(value).build());
+        }
+    }
+
     let mut container = ContainerDefinition::builder()
         .name("openab")
         .image(&m.spec.image)
@@ -719,18 +727,61 @@ async fn apply_ecs(
         }
     }
 
-    // Ingress needs the container port exposed so ECS can register an SRV record
-    // (Cloud Map + API Gateway learn the target port from it).
-    if let Some(ingress) = &m.spec.ingress {
+    // Unguarded ingress terminates directly at OpenAB. Guarded ingress keeps
+    // OpenAB loopback-only and exposes the guard container below instead.
+    if let Some(TaskIngressPlan::Direct { external_port }) = &task_ingress_plan {
         container = container.port_mappings(
             aws_sdk_ecs::types::PortMapping::builder()
-                .container_port(ingress.container_port as i32)
+                .container_port(*external_port as i32)
                 .protocol(aws_sdk_ecs::types::TransportProtocol::Tcp)
                 .build(),
         );
     }
 
-    let container = container.build();
+    let mut containers = vec![container.build()];
+    if let Some(
+        plan @ TaskIngressPlan::Guarded {
+            external_port,
+            guard_image,
+            ..
+        },
+    ) = &task_ingress_plan
+    {
+        let guard_environment = plan
+            .guard_environment()
+            .expect("guarded task ingress plan must contain guard environment")
+            .into_iter()
+            .map(|(name, value)| KeyValuePair::builder().name(name).value(value).build())
+            .collect();
+        let mut guard = ContainerDefinition::builder()
+            .name(plan.external_container_name())
+            .image(guard_image)
+            .essential(true)
+            .set_environment(Some(guard_environment))
+            .port_mappings(
+                aws_sdk_ecs::types::PortMapping::builder()
+                    .container_port(*external_port as i32)
+                    .protocol(aws_sdk_ecs::types::TransportProtocol::Tcp)
+                    .build(),
+            );
+        if let Some(log_group) = bootstrap_state.as_ref().map(|s| &s.resources.log_group) {
+            if let Some(ref region) = effective_region {
+                guard = guard.log_configuration(
+                    aws_sdk_ecs::types::LogConfiguration::builder()
+                        .log_driver(aws_sdk_ecs::types::LogDriver::Awslogs)
+                        .options("awslogs-group", log_group.as_str())
+                        .options("awslogs-region", region.as_str())
+                        .options(
+                            "awslogs-stream-prefix",
+                            format!("{service_name}-task-ingress-guard"),
+                        )
+                        .options("awslogs-create-group", "true")
+                        .build()?,
+                );
+            }
+        }
+        containers.push(guard.build());
+    }
 
     // ECS requires executionRoleArn whenever the task definition uses
     // container secrets (or a private registry) — resolve it from bootstrap
@@ -773,7 +824,7 @@ async fn apply_ecs(
         .network_mode(aws_sdk_ecs::types::NetworkMode::Awsvpc)
         .cpu(&m.spec.resources.cpu)
         .memory(&m.spec.resources.memory)
-        .container_definitions(container);
+        .set_container_definitions(Some(containers));
     if let Some(arn) = &execution_role_arn {
         register_req = register_req.execution_role_arn(arn);
     } else if !m.spec.secrets.is_empty() {
@@ -890,7 +941,12 @@ async fn apply_ecs(
                     aws_sdk_ecs::types::ServiceRegistry::builder().registry_arn(&cm.registry_arn);
                 if let Some(ingress) = &m.spec.ingress {
                     registry = registry
-                        .container_name("openab")
+                        .container_name(
+                            task_ingress_plan
+                                .as_ref()
+                                .map(TaskIngressPlan::external_container_name)
+                                .unwrap_or("openab"),
+                        )
                         .container_port(ingress.container_port as i32);
                 }
                 update_req = update_req.service_registries(registry.build());
@@ -948,7 +1004,12 @@ async fn apply_ecs(
             // task's port alongside its IP.
             if let Some(ingress) = &m.spec.ingress {
                 registry = registry
-                    .container_name("openab")
+                    .container_name(
+                        task_ingress_plan
+                            .as_ref()
+                            .map(TaskIngressPlan::external_container_name)
+                            .unwrap_or("openab"),
+                    )
                     .container_port(ingress.container_port as i32);
             }
             create_req = create_req.service_registries(registry.build());
@@ -1016,14 +1077,18 @@ async fn apply_ecs(
     let mut webhook_urls = Vec::new();
     if let (Some(ingress), Some(cm)) = (&m.spec.ingress, &cloud_map) {
         eprintln!("  🌐 Reconciling ingress (VPC Link + API Gateway)...");
+        let gateway_controls = GatewayControlsPlan::from_manifest(m);
         let gateway = crate::ingress::ensure_gateway(
             config,
-            &m.metadata.namespace,
-            &m.metadata.name,
-            ingress,
-            &ecs_rt.networking.subnets,
-            &ecs_rt.networking.security_groups,
-            &cm.registry_arn,
+            crate::ingress::GatewayApply {
+                namespace: &m.metadata.namespace,
+                name: &m.metadata.name,
+                ingress,
+                subnets: &ecs_rt.networking.subnets,
+                security_groups: &ecs_rt.networking.security_groups,
+                cloud_map_service_arn: &cm.registry_arn,
+                controls: gateway_controls.as_ref(),
+            },
         )
         .await?;
         webhook_urls = gateway.webhook_urls;

@@ -25,6 +25,7 @@
 //!      + security-group inbound rule. Runs AFTER the task is wired up.
 
 use crate::manifest::{Ingress, OABServiceManifest};
+use crate::GatewayControlsPlan;
 use anyhow::{Context, Result};
 use aws_sdk_apigatewayv2::types::{ConnectionType, IntegrationType, ProtocolType};
 use aws_sdk_servicediscovery::types::{DnsConfig, DnsRecord, RecordType};
@@ -74,6 +75,16 @@ pub struct GatewayResult {
     pub warnings: Vec<String>,
 }
 
+pub(crate) struct GatewayApply<'a> {
+    pub namespace: &'a str,
+    pub name: &'a str,
+    pub ingress: &'a Ingress,
+    pub subnets: &'a [String],
+    pub security_groups: &'a [String],
+    pub cloud_map_service_arn: &'a str,
+    pub controls: Option<&'a GatewayControlsPlan>,
+}
+
 /// Step 1: ensure the Cloud Map private DNS namespace and service exist.
 ///
 /// Returns the registry ARN to attach to the ECS service and the DNS name the
@@ -114,13 +125,17 @@ pub async fn ensure_cloud_map(
 /// disabled.
 pub async fn ensure_gateway(
     config: &aws_config::SdkConfig,
-    namespace: &str,
-    name: &str,
-    ingress: &Ingress,
-    subnets: &[String],
-    security_groups: &[String],
-    cloud_map_service_arn: &str,
+    request: GatewayApply<'_>,
 ) -> Result<GatewayResult> {
+    let GatewayApply {
+        namespace,
+        name,
+        ingress,
+        subnets,
+        security_groups,
+        cloud_map_service_arn,
+        controls,
+    } = request;
     let api = aws_sdk_apigatewayv2::Client::new(config);
     let ec2 = aws_sdk_ec2::Client::new(config);
     let api_name = api_name(namespace, name);
@@ -153,7 +168,10 @@ pub async fn ensure_gateway(
     warnings.extend(prune_stale_routes(&api, &api_id, &ingress.paths).await?);
 
     // ── Stage (auto-deploy) ────────────────────────────────────────────────
-    ensure_stage(&api, &api_id).await?;
+    ensure_stage(&api, &api_id, controls).await?;
+    if let Some(controls) = controls {
+        ensure_gateway_alarm(config, &api_id, controls).await?;
+    }
 
     Ok(GatewayResult {
         webhook_urls: webhook_urls(&api_endpoint, &ingress.paths),
@@ -1067,7 +1085,19 @@ async fn prune_stale_routes(
     Ok(warnings)
 }
 
-async fn ensure_stage(api: &aws_sdk_apigatewayv2::Client, api_id: &str) -> Result<()> {
+fn route_settings(controls: &GatewayControlsPlan) -> aws_sdk_apigatewayv2::types::RouteSettings {
+    aws_sdk_apigatewayv2::types::RouteSettings::builder()
+        .detailed_metrics_enabled(controls.detailed_metrics_enabled)
+        .throttling_burst_limit(controls.throttling_burst_limit)
+        .throttling_rate_limit(controls.throttling_rate_limit)
+        .build()
+}
+
+async fn ensure_stage(
+    api: &aws_sdk_apigatewayv2::Client,
+    api_id: &str,
+    controls: Option<&GatewayControlsPlan>,
+) -> Result<()> {
     let mut next: Option<String> = None;
     loop {
         let mut req = api.get_stages().api_id(api_id);
@@ -1077,7 +1107,23 @@ async fn ensure_stage(api: &aws_sdk_apigatewayv2::Client, api_id: &str) -> Resul
         let resp = req.send().await.context("failed to list stages")?;
         for s in resp.items() {
             if s.stage_name() == Some(STAGE_NAME) {
-                eprintln!("  ✓ Stage exists: {STAGE_NAME}");
+                if let Some(controls) = controls {
+                    api.update_stage()
+                        .api_id(api_id)
+                        .stage_name(STAGE_NAME)
+                        .route_settings(&controls.route_key, route_settings(controls))
+                        .send()
+                        .await
+                        .context("failed to reconcile guarded LINE route settings")?;
+                    eprintln!(
+                        "  ✓ Stage exists: {STAGE_NAME} ({} rate {}/s, burst {})",
+                        controls.route_key,
+                        controls.throttling_rate_limit,
+                        controls.throttling_burst_limit
+                    );
+                } else {
+                    eprintln!("  ✓ Stage exists: {STAGE_NAME}");
+                }
                 return Ok(());
             }
         }
@@ -1086,14 +1132,61 @@ async fn ensure_stage(api: &aws_sdk_apigatewayv2::Client, api_id: &str) -> Resul
             None => break,
         }
     }
-    api.create_stage()
+    let mut create = api
+        .create_stage()
         .api_id(api_id)
         .stage_name(STAGE_NAME)
-        .auto_deploy(true)
+        .auto_deploy(true);
+    if let Some(controls) = controls {
+        create = create.route_settings(&controls.route_key, route_settings(controls));
+    }
+    create
         .send()
         .await
         .context("failed to create stage")?;
     eprintln!("  ⊕ Created stage: {STAGE_NAME} (auto-deploy)");
+    Ok(())
+}
+
+async fn ensure_gateway_alarm(
+    config: &aws_config::SdkConfig,
+    api_id: &str,
+    controls: &GatewayControlsPlan,
+) -> Result<()> {
+    use aws_sdk_cloudwatch::types::{ComparisonOperator, Dimension, Statistic};
+
+    let cloudwatch = aws_sdk_cloudwatch::Client::new(config);
+    let dimensions = [
+        ("ApiId", api_id),
+        ("Method", controls.method),
+        ("Resource", controls.resource),
+        ("Stage", controls.stage),
+    ]
+    .into_iter()
+    .map(|(name, value)| Dimension::builder().name(name).value(value).build())
+    .collect::<Vec<_>>();
+
+    cloudwatch
+        .put_metric_alarm()
+        .alarm_name(&controls.alarm_name)
+        .alarm_description(
+            "Pilot stop signal: guarded LINE route returned at least one API Gateway 4xx, including throttling 429",
+        )
+        .actions_enabled(true)
+        .namespace("AWS/ApiGateway")
+        .metric_name(controls.metric_name)
+        .set_dimensions(Some(dimensions))
+        .statistic(Statistic::Sum)
+        .period(60)
+        .evaluation_periods(1)
+        .datapoints_to_alarm(1)
+        .threshold(controls.alarm_threshold)
+        .comparison_operator(ComparisonOperator::GreaterThanOrEqualToThreshold)
+        .treat_missing_data("notBreaching")
+        .send()
+        .await
+        .context("failed to reconcile guarded LINE 4xx alarm")?;
+    eprintln!("  ✓ CloudWatch alarm active: {}", controls.alarm_name);
     Ok(())
 }
 

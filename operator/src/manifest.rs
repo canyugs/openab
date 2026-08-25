@@ -185,6 +185,36 @@ pub struct Ingress {
     /// Container port the OpenAB binary listens on. Defaults to `8080`.
     #[serde(default = "default_container_port")]
     pub container_port: u16,
+    /// Optional bounded proxy that becomes the only externally reachable
+    /// container for the guarded LINE pilot.
+    #[serde(default)]
+    pub task_ingress_guard: Option<TaskIngressGuard>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TaskIngressGuard {
+    /// Digest-pinned image containing the task-local ingress guard binary.
+    pub image: String,
+}
+
+impl TaskIngressGuard {
+    fn validate(&self) -> anyhow::Result<()> {
+        if !is_sha256_digest_pinned(&self.image) {
+            anyhow::bail!(
+                "ingress.taskIngressGuard.image must be pinned by sha256 digest"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn is_sha256_digest_pinned(image: &str) -> bool {
+    image.split_once("@sha256:").is_some_and(|(repository, digest)| {
+        !repository.is_empty()
+            && !repository.contains('@')
+            && digest.len() == 64
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 fn default_ingress_type() -> String {
@@ -224,6 +254,14 @@ impl Ingress {
         }
         if self.container_port == 0 {
             anyhow::bail!("ingress.containerPort must be non-zero");
+        }
+        if let Some(guard) = &self.task_ingress_guard {
+            guard.validate()?;
+            if self.paths != ["/webhook/line"] {
+                anyhow::bail!(
+                    "taskIngressGuard requires ingress.paths to be exactly ['/webhook/line']"
+                );
+            }
         }
         Ok(())
     }
@@ -347,6 +385,13 @@ impl OABServiceManifest {
                     "spec.ingress is only supported with ECS runtime (use native Kubernetes Ingress otherwise)"
                 );
             }
+            if ingress.task_ingress_guard.is_some()
+                && !is_sha256_digest_pinned(&self.spec.image)
+            {
+                anyhow::bail!(
+                    "spec.image must be pinned by sha256 digest when taskIngressGuard is enabled"
+                );
+            }
         }
         Ok(())
     }
@@ -420,6 +465,7 @@ spec:
             cloud_map_namespace: "oab".into(),
             paths: vec!["/webhook".into()],
             container_port: 8080,
+            task_ingress_guard: None,
         };
         assert!(ing.validate().is_err());
     }
@@ -431,6 +477,7 @@ spec:
             cloud_map_namespace: "oab".into(),
             paths: vec![],
             container_port: 8080,
+            task_ingress_guard: None,
         };
         assert!(ing.validate().is_err());
     }
@@ -442,6 +489,7 @@ spec:
             cloud_map_namespace: "oab".into(),
             paths: vec!["webhook/telegram".into()],
             container_port: 8080,
+            task_ingress_guard: None,
         };
         assert!(ing.validate().is_err());
     }
