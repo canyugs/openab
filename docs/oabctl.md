@@ -275,12 +275,13 @@ single-container topology.
 
 For guarded LINE ingress, `apply` also reconciles the exact
 `POST /webhook/line` stage route to 5 requests/second with burst 10 and enables
-detailed metrics. It creates a one-minute CloudWatch alarm on any route-level
-`4xx`. HTTP APIs do not publish a distinct native `429` metric, so this is a
-conservative pilot-stop signal: every reported throttling `429` triggers it,
-and another client-side error on that exact route can trigger it too. Removing
-the guard clears these route settings and deletes the alarm; removing ingress
-or deleting the service also removes the alarm during ingress teardown.
+detailed metrics. HTTP APIs do not publish a distinct native `429` metric, so
+`apply` enables JSON access logging with seven-day retention and creates a
+CloudWatch Logs metric filter for status `429` on that exact route. A one-minute
+alarm on the resulting per-bot custom metric is the pilot-stop signal. Removing
+the guard clears the route and access-log settings, then deletes the alarm,
+metric filter, and per-bot log group; ingress teardown performs the same
+telemetry cleanup after deleting the stage.
 
 #### Minimal working manifest: Telegram on AWS
 
@@ -326,7 +327,8 @@ On `apply` this reconciles (idempotently, reused by name):
 4. **API Gateway HTTP API** (`oab-webhook-<ns>-<name>`, one per bot) + `HTTP_PROXY` integration over the VPC Link, with an `overwrite:path` request parameter mapping so the backend receives the raw path (e.g. `/webhook/telegram`) instead of the stage-prefixed one (e.g. `/prod/webhook/telegram`) — see caveat below
 5. One **route** per path + a `prod` auto-deploy **stage**; guarded LINE
    ingress additionally reconciles exact-route 5 requests/second, burst 10,
-   detailed metrics, and a route-level `4xx` CloudWatch alarm
+   detailed metrics, seven-day JSON access logs, an exact-429 metric filter,
+   and a CloudWatch alarm on the resulting per-bot custom metric
 6. A self-referencing **security-group** inbound rule on `containerPort`
 
 `apply` then prints the stable webhook URL(s):
@@ -717,7 +719,8 @@ any manifest sets `spec.ingress`, the **caller of `oabctl apply`/`delete`**
 | Service | Actions |
 |---------|---------|
 | Cloud Map | `servicediscovery:CreatePrivateDnsNamespace`, `CreateService`, `DeleteService`, `ListNamespaces`, `ListServices`, `GetOperation` |
-| API Gateway | `apigateway:CreateVpcLink`, `CreateApi`, `CreateIntegration`, `CreateRoute`, `CreateStage`, `UpdateStage`, `DeleteRoute`, `DeleteIntegration`, `DeleteStage`, `DeleteApi`, `GetVpcLinks`, `GetVpcLink`, `GetApis`, `GetIntegrations`, `GetRoutes`, `GetStages` |
+| API Gateway | `apigateway:CreateVpcLink`, `CreateApi`, `CreateIntegration`, `CreateRoute`, `CreateStage`, `UpdateStage`, `DeleteAccessLogSettings`, `DeleteRoute`, `DeleteIntegration`, `DeleteStage`, `DeleteApi`, `GetVpcLinks`, `GetVpcLink`, `GetApis`, `GetIntegrations`, `GetRoutes`, `GetStages` |
+| CloudWatch Logs | `logs:CreateLogGroup`, `DescribeLogGroups`, `PutRetentionPolicy`, `PutMetricFilter`, `DeleteMetricFilter`, `DeleteLogGroup`; activating HTTP API access logging also requires the log-delivery/resource-policy actions documented by AWS (`CreateLogDelivery`, `PutResourcePolicy`, `UpdateLogDelivery`, `DeleteLogDelivery`, `DescribeResourcePolicies`, `GetLogDelivery`, `ListLogDeliveries`) |
 | CloudWatch | `cloudwatch:PutMetricAlarm`, `cloudwatch:DeleteAlarms` for guarded LINE ingress and its cleanup |
 | EC2 | `ec2:DescribeSubnets`, `AuthorizeSecurityGroupIngress` |
 | ECS | `ecs:UpdateService` with `serviceRegistries` (requires the `AWSServiceRoleForECS` service-linked role, which ECS creates automatically the first time any service in the account uses service discovery) |

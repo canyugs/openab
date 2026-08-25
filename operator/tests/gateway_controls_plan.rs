@@ -28,7 +28,7 @@ spec:
 }
 
 #[test]
-fn guarded_line_manifest_plans_route_throttle_and_conservative_429_alarm() {
+fn guarded_line_manifest_plans_route_throttle_and_exact_429_telemetry() {
     let manifest: OABServiceManifest = serde_yaml::from_str(
         r#"
 apiVersion: oab.dev/v2
@@ -63,11 +63,26 @@ spec:
     assert_eq!(plan.throttling_rate_limit, 5.0);
     assert_eq!(plan.throttling_burst_limit, 10);
     assert!(plan.detailed_metrics_enabled);
-    assert_eq!(plan.alarm_name, "oab-webhook-prod-line-pilot-line-4xx");
-    assert_eq!(plan.metric_name, "4xx");
-    assert_eq!(plan.method, "POST");
-    assert_eq!(plan.resource, "/webhook/line");
-    assert_eq!(plan.stage, "prod");
+    assert_eq!(plan.alarm_name, "oab-webhook-prod-line-pilot-line-429");
+    assert_eq!(
+        plan.access_log_group_name,
+        "/aws/apigateway/oab-webhook-prod-line-pilot"
+    );
+    assert_eq!(plan.access_log_retention_days, 7);
+    assert_eq!(
+        plan.access_log_format,
+        r#"{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":$context.status}"#
+    );
+    assert_eq!(
+        plan.metric_filter_name,
+        "oab-webhook-prod-line-pilot-line-429"
+    );
+    assert_eq!(
+        plan.metric_filter_pattern,
+        r#"{ ($.status = 429) && ($.routeKey = "POST /webhook/line") }"#
+    );
+    assert_eq!(plan.metric_namespace, "OAB/Pilot");
+    assert_eq!(plan.metric_name, "oab-webhook-prod-line-pilot-line-429");
     assert_eq!(plan.alarm_threshold, 1.0);
 
     assert_eq!(
@@ -77,13 +92,15 @@ spec:
 }
 
 #[test]
-fn removing_guard_plans_route_control_and_alarm_cleanup() {
+fn removing_guard_plans_route_control_and_exact_429_telemetry_cleanup() {
     let transition = GatewayControlsTransition::from_manifest(true, &unguarded_manifest());
 
     assert_eq!(
         transition,
         GatewayControlsTransition::Remove {
-            alarm_name: "oab-webhook-prod-line-pilot-line-4xx".to_string(),
+            alarm_name: "oab-webhook-prod-line-pilot-line-429".to_string(),
+            access_log_group_name: "/aws/apigateway/oab-webhook-prod-line-pilot".to_string(),
+            metric_filter_name: "oab-webhook-prod-line-pilot-line-429".to_string(),
         }
     );
 }

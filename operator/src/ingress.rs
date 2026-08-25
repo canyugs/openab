@@ -320,13 +320,7 @@ pub async fn teardown(
     let mut warnings = Vec::new();
     let service_name = format!("oab-{namespace}-{name}");
     let api = aws_sdk_apigatewayv2::Client::new(config);
-
-    let alarm_name = GatewayControlsPlan::alarm_name(namespace, name);
-    if let Err(error) = remove_gateway_alarm(config, &alarm_name).await {
-        let warning = format!("failed to delete guarded LINE alarm {alarm_name}: {error}");
-        eprintln!("  ⚠ {warning}");
-        warnings.push(warning);
-    }
+    let mut stage_removed = true;
 
     // ── API Gateway: strip routes + integration + stage, keep the API itself ─
     if let Some((api_id, _)) = find_api(&api, &api_name(namespace, name)).await? {
@@ -401,18 +395,26 @@ pub async fn teardown(
             }
         }
 
-        if let Err(error) = api
+        use aws_sdk_apigatewayv2::error::ProvideErrorMetadata;
+        match api
             .delete_stage()
             .api_id(&api_id)
             .stage_name(STAGE_NAME)
             .send()
             .await
         {
-            let warning = format!(
-                "failed to delete ingress stage {STAGE_NAME} from HTTP API {api_id}: {error}"
-            );
-            eprintln!("  ⚠ {warning}");
-            warnings.push(warning);
+            Ok(_) => {}
+            Err(error) if error.code() == Some("NotFoundException") => {
+                eprintln!("  ✓ Ingress stage already absent: {STAGE_NAME}");
+            }
+            Err(error) => {
+                stage_removed = false;
+                let warning = format!(
+                    "failed to delete ingress stage {STAGE_NAME} from HTTP API {api_id}: {error}"
+                );
+                eprintln!("  ⚠ {warning}");
+                warnings.push(warning);
+            }
         }
 
         if warnings.is_empty() {
@@ -428,6 +430,20 @@ pub async fn teardown(
                 api_name(namespace, name),
                 warnings.len()
             );
+        }
+    }
+
+    if stage_removed {
+        let alarm_name = GatewayControlsPlan::alarm_name(namespace, name);
+        let access_log_group_name = GatewayControlsPlan::access_log_group_name(namespace, name);
+        if let Err(error) =
+            remove_exact_429_telemetry(config, &alarm_name, &access_log_group_name, &alarm_name)
+                .await
+        {
+            let warning =
+                format!("failed to delete guarded LINE 429 telemetry {alarm_name}: {error}");
+            eprintln!("  ⚠ {warning}");
+            warnings.push(warning);
         }
     }
 
@@ -1097,10 +1113,34 @@ fn route_settings(controls: &GatewayControlsPlan) -> aws_sdk_apigatewayv2::types
         .build()
 }
 
+fn access_log_settings(
+    destination_arn: &str,
+    format: &str,
+) -> aws_sdk_apigatewayv2::types::AccessLogSettings {
+    aws_sdk_apigatewayv2::types::AccessLogSettings::builder()
+        .destination_arn(destination_arn)
+        .format(format)
+        .build()
+}
+
+fn exact_429_metric_transformation(
+    metric_name: &str,
+    metric_namespace: &str,
+) -> Result<aws_sdk_cloudwatchlogs::types::MetricTransformation> {
+    aws_sdk_cloudwatchlogs::types::MetricTransformation::builder()
+        .metric_name(metric_name)
+        .metric_namespace(metric_namespace)
+        .metric_value("1")
+        .unit(aws_sdk_cloudwatchlogs::types::StandardUnit::Count)
+        .build()
+        .context("failed to build guarded LINE 429 metric transformation")
+}
+
 async fn ensure_stage(
     api: &aws_sdk_apigatewayv2::Client,
     api_id: &str,
     controls: Option<&GatewayControlsPlan>,
+    access_log_destination_arn: Option<&str>,
 ) -> Result<()> {
     let mut next: Option<String> = None;
     loop {
@@ -1112,10 +1152,16 @@ async fn ensure_stage(
         for s in resp.items() {
             if s.stage_name() == Some(STAGE_NAME) {
                 if let Some(controls) = controls {
+                    let destination_arn = access_log_destination_arn
+                        .context("guarded LINE stage requires an access-log destination ARN")?;
                     api.update_stage()
                         .api_id(api_id)
                         .stage_name(STAGE_NAME)
                         .route_settings(&controls.route_key, route_settings(controls))
+                        .access_log_settings(access_log_settings(
+                            destination_arn,
+                            controls.access_log_format,
+                        ))
                         .send()
                         .await
                         .context("failed to reconcile guarded LINE route settings")?;
@@ -1142,7 +1188,14 @@ async fn ensure_stage(
         .stage_name(STAGE_NAME)
         .auto_deploy(true);
     if let Some(controls) = controls {
-        create = create.route_settings(&controls.route_key, route_settings(controls));
+        let destination_arn = access_log_destination_arn
+            .context("guarded LINE stage requires an access-log destination ARN")?;
+        create = create
+            .route_settings(&controls.route_key, route_settings(controls))
+            .access_log_settings(access_log_settings(
+                destination_arn,
+                controls.access_log_format,
+            ));
     }
     create.send().await.context("failed to create stage")?;
     eprintln!("  ⊕ Created stage: {STAGE_NAME} (auto-deploy)");
@@ -1157,11 +1210,18 @@ async fn reconcile_gateway_controls(
 ) -> Result<()> {
     match controls {
         GatewayControlsTransition::Ensure(plan) => {
-            ensure_stage(api, api_id, Some(plan)).await?;
-            ensure_gateway_alarm(config, api_id, plan).await
+            let access_log_destination_arn = ensure_exact_429_metric_filter(config, plan).await?;
+            ensure_stage(api, api_id, Some(plan), Some(&access_log_destination_arn)).await?;
+            ensure_gateway_alarm(config, plan).await
         }
-        GatewayControlsTransition::Remove { alarm_name } => {
-            ensure_stage(api, api_id, None).await?;
+        GatewayControlsTransition::Remove {
+            alarm_name,
+            access_log_group_name,
+            metric_filter_name,
+        } => {
+            use aws_sdk_apigatewayv2::error::ProvideErrorMetadata;
+
+            ensure_stage(api, api_id, None, None).await?;
             api.update_stage()
                 .api_id(api_id)
                 .stage_name(STAGE_NAME)
@@ -1170,40 +1230,132 @@ async fn reconcile_gateway_controls(
                 .await
                 .context("failed to remove guarded LINE route settings")?;
             eprintln!("  ✓ Removed guarded LINE route settings from {STAGE_NAME}");
-            remove_gateway_alarm(config, alarm_name).await
+            match api
+                .delete_access_log_settings()
+                .api_id(api_id)
+                .stage_name(STAGE_NAME)
+                .send()
+                .await
+            {
+                Ok(_) => eprintln!("  ✓ Removed guarded LINE access logging from {STAGE_NAME}"),
+                Err(error) if error.code() == Some("NotFoundException") => {
+                    eprintln!("  ✓ Guarded LINE access logging already absent from {STAGE_NAME}")
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(error))
+                        .context("failed to remove guarded LINE access logging");
+                }
+            }
+            remove_exact_429_telemetry(
+                config,
+                alarm_name,
+                access_log_group_name,
+                metric_filter_name,
+            )
+            .await
         }
-        GatewayControlsTransition::Unchanged => ensure_stage(api, api_id, None).await,
+        GatewayControlsTransition::Unchanged => ensure_stage(api, api_id, None, None).await,
     }
+}
+
+async fn ensure_exact_429_metric_filter(
+    config: &aws_config::SdkConfig,
+    controls: &GatewayControlsPlan,
+) -> Result<String> {
+    use aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata;
+
+    let logs = aws_sdk_cloudwatchlogs::Client::new(config);
+    match logs
+        .create_log_group()
+        .log_group_name(&controls.access_log_group_name)
+        .send()
+        .await
+    {
+        Ok(_) => eprintln!(
+            "  ⊕ Created guarded LINE access log group: {}",
+            controls.access_log_group_name
+        ),
+        Err(error) if error.code() == Some("ResourceAlreadyExistsException") => eprintln!(
+            "  ✓ Guarded LINE access log group exists: {}",
+            controls.access_log_group_name
+        ),
+        Err(error) => {
+            return Err(anyhow::anyhow!(error))
+                .context("failed to create guarded LINE access log group");
+        }
+    }
+
+    logs.put_retention_policy()
+        .log_group_name(&controls.access_log_group_name)
+        .retention_in_days(controls.access_log_retention_days)
+        .send()
+        .await
+        .context("failed to reconcile guarded LINE access log retention")?;
+
+    let transformation =
+        exact_429_metric_transformation(&controls.metric_name, controls.metric_namespace)?;
+    logs.put_metric_filter()
+        .log_group_name(&controls.access_log_group_name)
+        .filter_name(&controls.metric_filter_name)
+        .filter_pattern(controls.metric_filter_pattern)
+        .metric_transformations(transformation)
+        .send()
+        .await
+        .context("failed to reconcile guarded LINE 429 metric filter")?;
+
+    let mut next_token: Option<String> = None;
+    loop {
+        let mut request = logs
+            .describe_log_groups()
+            .log_group_name_prefix(&controls.access_log_group_name);
+        if let Some(token) = &next_token {
+            request = request.next_token(token);
+        }
+        let response = request
+            .send()
+            .await
+            .context("failed to describe guarded LINE access log group")?;
+        if let Some(arn) = response
+            .log_groups()
+            .iter()
+            .find(|group| group.log_group_name() == Some(controls.access_log_group_name.as_str()))
+            .and_then(|group| group.log_group_arn())
+        {
+            eprintln!(
+                "  ✓ Exact guarded LINE 429 metric filter active: {}",
+                controls.metric_filter_name
+            );
+            return Ok(arn.to_string());
+        }
+        match response.next_token() {
+            Some(token) => next_token = Some(token.to_string()),
+            None => break,
+        }
+    }
+
+    anyhow::bail!(
+        "guarded LINE access log group {} was created but its ARN could not be resolved",
+        controls.access_log_group_name
+    )
 }
 
 async fn ensure_gateway_alarm(
     config: &aws_config::SdkConfig,
-    api_id: &str,
     controls: &GatewayControlsPlan,
 ) -> Result<()> {
-    use aws_sdk_cloudwatch::types::{ComparisonOperator, Dimension, Statistic};
+    use aws_sdk_cloudwatch::types::{ComparisonOperator, Statistic};
 
     let cloudwatch = aws_sdk_cloudwatch::Client::new(config);
-    let dimensions = [
-        ("ApiId", api_id),
-        ("Method", controls.method),
-        ("Resource", controls.resource),
-        ("Stage", controls.stage),
-    ]
-    .into_iter()
-    .map(|(name, value)| Dimension::builder().name(name).value(value).build())
-    .collect::<Vec<_>>();
 
     cloudwatch
         .put_metric_alarm()
         .alarm_name(&controls.alarm_name)
         .alarm_description(
-            "Pilot stop signal: guarded LINE route returned at least one API Gateway 4xx, including throttling 429",
+            "Pilot stop signal: guarded LINE route returned at least one HTTP 429 response",
         )
         .actions_enabled(true)
-        .namespace("AWS/ApiGateway")
-        .metric_name(controls.metric_name)
-        .set_dimensions(Some(dimensions))
+        .namespace(controls.metric_namespace)
+        .metric_name(&controls.metric_name)
         .statistic(Statistic::Sum)
         .period(60)
         .evaluation_periods(1)
@@ -1213,7 +1365,7 @@ async fn ensure_gateway_alarm(
         .treat_missing_data("notBreaching")
         .send()
         .await
-        .context("failed to reconcile guarded LINE 4xx alarm")?;
+        .context("failed to reconcile guarded LINE 429 alarm")?;
     eprintln!("  ✓ CloudWatch alarm active: {}", controls.alarm_name);
     Ok(())
 }
@@ -1224,8 +1376,54 @@ async fn remove_gateway_alarm(config: &aws_config::SdkConfig, alarm_name: &str) 
         .alarm_names(alarm_name)
         .send()
         .await
-        .context("failed to delete guarded LINE 4xx alarm")?;
+        .context("failed to delete guarded LINE 429 alarm")?;
     eprintln!("  ✓ CloudWatch alarm absent: {alarm_name}");
+    Ok(())
+}
+
+async fn remove_exact_429_telemetry(
+    config: &aws_config::SdkConfig,
+    alarm_name: &str,
+    access_log_group_name: &str,
+    metric_filter_name: &str,
+) -> Result<()> {
+    use aws_sdk_cloudwatchlogs::error::ProvideErrorMetadata;
+
+    remove_gateway_alarm(config, alarm_name).await?;
+
+    let logs = aws_sdk_cloudwatchlogs::Client::new(config);
+    match logs
+        .delete_metric_filter()
+        .log_group_name(access_log_group_name)
+        .filter_name(metric_filter_name)
+        .send()
+        .await
+    {
+        Ok(_) => eprintln!("  ✓ CloudWatch metric filter absent: {metric_filter_name}"),
+        Err(error) if error.code() == Some("ResourceNotFoundException") => {
+            eprintln!("  ✓ CloudWatch metric filter already absent: {metric_filter_name}")
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(error))
+                .context("failed to delete guarded LINE 429 metric filter");
+        }
+    }
+
+    match logs
+        .delete_log_group()
+        .log_group_name(access_log_group_name)
+        .send()
+        .await
+    {
+        Ok(_) => eprintln!("  ✓ CloudWatch access log group absent: {access_log_group_name}"),
+        Err(error) if error.code() == Some("ResourceNotFoundException") => {
+            eprintln!("  ✓ CloudWatch access log group already absent: {access_log_group_name}")
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(error))
+                .context("failed to delete guarded LINE access log group");
+        }
+    }
     Ok(())
 }
 
@@ -1237,6 +1435,38 @@ mod tests {
     fn route_key_is_post_prefixed() {
         assert_eq!(route_key("/webhook/telegram"), "POST /webhook/telegram");
         assert_eq!(route_key("/webhook/line"), "POST /webhook/line");
+    }
+
+    #[test]
+    fn exact_429_access_log_settings_use_the_reconciled_destination_and_format() {
+        let settings = access_log_settings(
+            "arn:aws:logs:ap-east-1:123456789012:log-group:/aws/apigateway/pilot",
+            r#"{"requestId":"$context.requestId","status":$context.status}"#,
+        );
+
+        assert_eq!(
+            settings.destination_arn(),
+            Some("arn:aws:logs:ap-east-1:123456789012:log-group:/aws/apigateway/pilot")
+        );
+        assert_eq!(
+            settings.format(),
+            Some(r#"{"requestId":"$context.requestId","status":$context.status}"#)
+        );
+    }
+
+    #[test]
+    fn exact_429_metric_transformation_emits_one_count() {
+        let transformation = exact_429_metric_transformation("line-pilot-429", "OAB/Pilot")
+            .expect("metric transformation");
+
+        assert_eq!(transformation.metric_name(), "line-pilot-429");
+        assert_eq!(transformation.metric_namespace(), "OAB/Pilot");
+        assert_eq!(transformation.metric_value(), "1");
+        assert_eq!(
+            transformation.unit(),
+            Some(&aws_sdk_cloudwatchlogs::types::StandardUnit::Count)
+        );
+        assert!(transformation.dimensions().is_none());
     }
 
     #[test]

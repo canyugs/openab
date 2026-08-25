@@ -34,17 +34,18 @@ Task:
 
 The operator also reconciles the exact API Gateway route
 `POST /webhook/line` at 5 requests per second with burst 10 and detailed
-metrics. A one-minute route-level `4xx >= 1` CloudWatch alarm is the bounded
-pilot stop signal. AWS HTTP APIs do not expose an exact native `429` metric, so
-this alarm is intentionally conservative: other 4xx responses can trigger it,
-and AWS documents that some excessive throttling responses might not emit
-metrics.
+metrics. Because AWS HTTP APIs expose a native aggregate `4xx` metric rather
+than a distinct `429` metric, the operator enables JSON access logs on the
+stage, retains them for seven days, and installs a CloudWatch Logs metric filter
+that matches only status `429` on `POST /webhook/line`. A one-minute
+`Sum >= 1` alarm on that per-bot custom metric is the bounded pilot stop signal.
 
 Removing the guard while retaining ingress clears the route settings and
-deletes the alarm. Removing ingress or deleting the service also deletes the
-alarm as part of best-effort ingress teardown. The ECS service-registry
-reconciler compares the ARN, container name, and container port so enabling or
-disabling the guard repoints an existing service correctly.
+stage access-log settings, then deletes the alarm, metric filter, and per-bot
+log group. Removing ingress or deleting the service performs the same telemetry
+cleanup after the stage is gone. The ECS service-registry reconciler compares
+the ARN, container name, and container port so enabling or disabling the guard
+repoints an existing service correctly.
 
 ## 3. Compatibility and Ownership
 
@@ -66,16 +67,18 @@ a fallback path.
 
 The public HTTP API does not add transport-level caller identity in this pilot.
 LINE signature validation, the exact-path guard, API Gateway throttling, and the
-stop-signal alarm are the approved bounded controls. Stronger edge identity and
-a dedicated exact-429 telemetry path remain future work before expanding the
-pilot.
+exact-429 stop-signal alarm are the approved bounded controls. The alarm is
+specific to the route and response status, but it does not distinguish an API
+Gateway-generated 429 from a backend 429. API Gateway throttling is also a
+best-effort target rather than a guaranteed request ceiling. Stronger edge
+identity remains future work before expanding the pilot.
 
 ## 5. Consequences
 
 - Existing deployments remain backwards compatible by default.
 - Enabling or disabling the guard causes an ECS rolling replacement because the
   Task definition and service-registry target change.
-- Operators need `cloudwatch:PutMetricAlarm` and
+- Operators need CloudWatch Logs access-log delivery, retention, metric-filter,
+  and cleanup permissions plus `cloudwatch:PutMetricAlarm` and
   `cloudwatch:DeleteAlarms` in addition to the existing ingress permissions.
-- The alarm favors early stopping over specificity and must not be interpreted
-  as proof that every observed 4xx was a throttle.
+- Each guarded bot creates one short-retention log group and one custom metric.
