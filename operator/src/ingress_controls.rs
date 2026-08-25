@@ -16,6 +16,10 @@ pub struct GatewayControlsPlan {
 }
 
 impl GatewayControlsPlan {
+    pub fn alarm_name(namespace: &str, name: &str) -> String {
+        format!("oab-webhook-{namespace}-{name}-line-4xx")
+    }
+
     pub fn from_manifest(manifest: &OABServiceManifest) -> Option<Self> {
         let ingress = manifest.spec.ingress.as_ref()?;
         ingress.task_ingress_guard.as_ref()?;
@@ -24,9 +28,9 @@ impl GatewayControlsPlan {
             throttling_rate_limit: 5.0,
             throttling_burst_limit: 10,
             detailed_metrics_enabled: true,
-            alarm_name: format!(
-                "oab-webhook-{}-{}-line-4xx",
-                manifest.metadata.namespace, manifest.metadata.name
+            alarm_name: Self::alarm_name(
+                &manifest.metadata.namespace,
+                &manifest.metadata.name,
             ),
             metric_name: "4xx",
             method: "POST",
@@ -34,5 +38,34 @@ impl GatewayControlsPlan {
             stage: "prod",
             alarm_threshold: 1.0,
         })
+    }
+}
+
+/// Desired reconciliation when a manifest adds, retains, or removes the
+/// guarded LINE ingress controls.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayControlsTransition {
+    Ensure(GatewayControlsPlan),
+    Remove { alarm_name: String },
+    Unchanged,
+}
+
+impl GatewayControlsTransition {
+    pub fn from_manifest(
+        previously_had_guard: bool,
+        manifest: &OABServiceManifest,
+    ) -> Self {
+        if let Some(plan) = GatewayControlsPlan::from_manifest(manifest) {
+            return Self::Ensure(plan);
+        }
+        if previously_had_guard {
+            return Self::Remove {
+                alarm_name: GatewayControlsPlan::alarm_name(
+                    &manifest.metadata.namespace,
+                    &manifest.metadata.name,
+                ),
+            };
+        }
+        Self::Unchanged
     }
 }

@@ -25,7 +25,7 @@
 //!      + security-group inbound rule. Runs AFTER the task is wired up.
 
 use crate::manifest::{Ingress, OABServiceManifest};
-use crate::GatewayControlsPlan;
+use crate::{GatewayControlsPlan, GatewayControlsTransition};
 use anyhow::{Context, Result};
 use aws_sdk_apigatewayv2::types::{ConnectionType, IntegrationType, ProtocolType};
 use aws_sdk_servicediscovery::types::{DnsConfig, DnsRecord, RecordType};
@@ -82,7 +82,7 @@ pub(crate) struct GatewayApply<'a> {
     pub subnets: &'a [String],
     pub security_groups: &'a [String],
     pub cloud_map_service_arn: &'a str,
-    pub controls: Option<&'a GatewayControlsPlan>,
+    pub controls: &'a GatewayControlsTransition,
 }
 
 /// Step 1: ensure the Cloud Map private DNS namespace and service exist.
@@ -169,8 +169,14 @@ pub async fn ensure_gateway(
 
     // ── Stage (auto-deploy) ────────────────────────────────────────────────
     ensure_stage(&api, &api_id, controls).await?;
-    if let Some(controls) = controls {
-        ensure_gateway_alarm(config, &api_id, controls).await?;
+    match controls {
+        GatewayControlsTransition::Ensure(controls) => {
+            ensure_gateway_alarm(config, &api_id, controls).await?;
+        }
+        GatewayControlsTransition::Remove { alarm_name } => {
+            remove_gateway_alarm(config, alarm_name).await?;
+        }
+        GatewayControlsTransition::Unchanged => {}
     }
 
     Ok(GatewayResult {
@@ -323,6 +329,13 @@ pub async fn teardown(
     let mut warnings = Vec::new();
     let service_name = format!("oab-{namespace}-{name}");
     let api = aws_sdk_apigatewayv2::Client::new(config);
+
+    let alarm_name = GatewayControlsPlan::alarm_name(namespace, name);
+    if let Err(error) = remove_gateway_alarm(config, &alarm_name).await {
+        let warning = format!("failed to delete guarded LINE alarm {alarm_name}: {error}");
+        eprintln!("  ⚠ {warning}");
+        warnings.push(warning);
+    }
 
     // ── API Gateway: strip routes + integration + stage, keep the API itself ─
     if let Some((api_id, _)) = find_api(&api, &api_name(namespace, name)).await? {
@@ -1096,7 +1109,7 @@ fn route_settings(controls: &GatewayControlsPlan) -> aws_sdk_apigatewayv2::types
 async fn ensure_stage(
     api: &aws_sdk_apigatewayv2::Client,
     api_id: &str,
-    controls: Option<&GatewayControlsPlan>,
+    controls: &GatewayControlsTransition,
 ) -> Result<()> {
     let mut next: Option<String> = None;
     loop {
@@ -1107,22 +1120,35 @@ async fn ensure_stage(
         let resp = req.send().await.context("failed to list stages")?;
         for s in resp.items() {
             if s.stage_name() == Some(STAGE_NAME) {
-                if let Some(controls) = controls {
-                    api.update_stage()
-                        .api_id(api_id)
-                        .stage_name(STAGE_NAME)
-                        .route_settings(&controls.route_key, route_settings(controls))
-                        .send()
-                        .await
-                        .context("failed to reconcile guarded LINE route settings")?;
-                    eprintln!(
-                        "  ✓ Stage exists: {STAGE_NAME} ({} rate {}/s, burst {})",
-                        controls.route_key,
-                        controls.throttling_rate_limit,
-                        controls.throttling_burst_limit
-                    );
-                } else {
-                    eprintln!("  ✓ Stage exists: {STAGE_NAME}");
+                match controls {
+                    GatewayControlsTransition::Ensure(controls) => {
+                        api.update_stage()
+                            .api_id(api_id)
+                            .stage_name(STAGE_NAME)
+                            .route_settings(&controls.route_key, route_settings(controls))
+                            .send()
+                            .await
+                            .context("failed to reconcile guarded LINE route settings")?;
+                        eprintln!(
+                            "  ✓ Stage exists: {STAGE_NAME} ({} rate {}/s, burst {})",
+                            controls.route_key,
+                            controls.throttling_rate_limit,
+                            controls.throttling_burst_limit
+                        );
+                    }
+                    GatewayControlsTransition::Remove { .. } => {
+                        api.update_stage()
+                            .api_id(api_id)
+                            .stage_name(STAGE_NAME)
+                            .set_route_settings(Some(HashMap::new()))
+                            .send()
+                            .await
+                            .context("failed to remove guarded LINE route settings")?;
+                        eprintln!("  ✓ Removed guarded LINE route settings from {STAGE_NAME}");
+                    }
+                    GatewayControlsTransition::Unchanged => {
+                        eprintln!("  ✓ Stage exists: {STAGE_NAME}");
+                    }
                 }
                 return Ok(());
             }
@@ -1137,7 +1163,7 @@ async fn ensure_stage(
         .api_id(api_id)
         .stage_name(STAGE_NAME)
         .auto_deploy(true);
-    if let Some(controls) = controls {
+    if let GatewayControlsTransition::Ensure(controls) = controls {
         create = create.route_settings(&controls.route_key, route_settings(controls));
     }
     create
@@ -1187,6 +1213,17 @@ async fn ensure_gateway_alarm(
         .await
         .context("failed to reconcile guarded LINE 4xx alarm")?;
     eprintln!("  ✓ CloudWatch alarm active: {}", controls.alarm_name);
+    Ok(())
+}
+
+async fn remove_gateway_alarm(config: &aws_config::SdkConfig, alarm_name: &str) -> Result<()> {
+    aws_sdk_cloudwatch::Client::new(config)
+        .delete_alarms()
+        .alarm_names(alarm_name)
+        .send()
+        .await
+        .context("failed to delete guarded LINE 4xx alarm")?;
+    eprintln!("  ✓ CloudWatch alarm absent: {alarm_name}");
     Ok(())
 }
 

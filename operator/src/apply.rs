@@ -1,6 +1,6 @@
 use crate::bootstrap::BootstrapState;
 use crate::manifest::{OABFleetManifest, OABServiceManifest, RawManifest, Runtime};
-use crate::{GatewayControlsPlan, TaskIngressPlan};
+use crate::{GatewayControlsTransition, TaskIngressPlan};
 use anyhow::{Context, Result};
 use aws_sdk_ecs::types::{
     AssignPublicIp, AwsVpcConfiguration, CapacityProviderStrategyItem, ContainerDefinition,
@@ -9,6 +9,26 @@ use aws_sdk_ecs::types::{
 use aws_sdk_s3::primitives::ByteStream;
 use std::fmt;
 use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExistingServiceRegistry {
+    registry_arn: String,
+    container_name: Option<String>,
+    container_port: Option<i32>,
+}
+
+fn service_registry_matches(
+    existing: &[ExistingServiceRegistry],
+    registry_arn: &str,
+    container_name: &str,
+    container_port: i32,
+) -> bool {
+    existing.iter().any(|registry| {
+        registry.registry_arn == registry_arn
+            && registry.container_name.as_deref() == Some(container_name)
+            && registry.container_port == Some(container_port)
+    })
+}
 
 // Progress rendering is scoped to the current async task. Library calls set it
 // to false, while CLI/delete callers retain the existing rendering behavior.
@@ -531,7 +551,7 @@ async fn apply_ecs(
         "manifests/{}/{}.yaml",
         m.metadata.namespace, m.metadata.name
     );
-    let (current_gen, previously_had_ingress) = match s3
+    let (current_gen, previously_had_ingress, previously_had_guard) = match s3
         .get_object()
         .bucket(bucket)
         .key(&manifest_key)
@@ -544,9 +564,15 @@ async fn apply_ecs(
             (
                 existing.metadata.generation,
                 existing.spec.ingress.is_some(),
+                existing
+                    .spec
+                    .ingress
+                    .as_ref()
+                    .and_then(|ingress| ingress.task_ingress_guard.as_ref())
+                    .is_some(),
             )
         }
-        Err(_) => (0, false),
+        Err(_) => (0, false, false),
     };
     let generation = current_gen + 1;
 
@@ -562,19 +588,24 @@ async fn apply_ecs(
         .send()
         .await
         .context("failed to describe ECS service")?;
-    let existing_registry_arns: Vec<String> = describe_resp
+    let existing_registries: Vec<ExistingServiceRegistry> = describe_resp
         .services()
         .first()
         .map(|service| {
             service
                 .service_registries()
                 .iter()
-                .filter_map(|registry| registry.registry_arn())
-                .map(str::to_owned)
+                .filter_map(|registry| {
+                    Some(ExistingServiceRegistry {
+                        registry_arn: registry.registry_arn()?.to_string(),
+                        container_name: registry.container_name().map(str::to_owned),
+                        container_port: registry.container_port(),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
-    let has_registries = !existing_registry_arns.is_empty();
+    let has_registries = !existing_registries.is_empty();
 
     // If ingress was configured before but is absent now, tear down the
     // orphaned per-bot ingress resources (best-effort, mirrors `oabctl delete`)
@@ -589,7 +620,9 @@ async fn apply_ecs(
             config,
             &m.metadata.namespace,
             &m.metadata.name,
-            existing_registry_arns.first().map(String::as_str),
+            existing_registries
+                .first()
+                .map(|registry| registry.registry_arn.as_str()),
         )
         .await
         {
@@ -676,6 +709,15 @@ async fn apply_ecs(
     }
 
     let task_ingress_plan = TaskIngressPlan::from_manifest(m);
+    let service_registry_target = m.spec.ingress.as_ref().map(|ingress| {
+        (
+            task_ingress_plan
+                .as_ref()
+                .map(TaskIngressPlan::external_container_name)
+                .unwrap_or("openab"),
+            ingress.container_port as i32,
+        )
+    });
     if let Some(plan) = &task_ingress_plan {
         for (name, value) in plan.openab_environment() {
             env_vars.push(KeyValuePair::builder().name(name).value(value).build());
@@ -915,9 +957,17 @@ async fn apply_ecs(
         // healthy, no downtime gap). It does require the AWSServiceRoleForECS
         // service-linked role, which ECS creates automatically the first time
         // any account uses ECS service discovery — no action needed here.
-        let registry_mismatch = cloud_map
-            .as_ref()
-            .is_some_and(|cm| has_registries && !existing_registry_arns.contains(&cm.registry_arn));
+        let registry_mismatch = cloud_map.as_ref().is_some_and(|cm| {
+            let (container_name, container_port) = service_registry_target
+                .expect("ingress Cloud Map must have a service registry target");
+            has_registries
+                && !service_registry_matches(
+                    &existing_registries,
+                    &cm.registry_arn,
+                    container_name,
+                    container_port,
+                )
+        });
         // `ingress` was removed from the manifest (cloud_map is None here)
         // but the ECS service still has a registry attached from a previous
         // apply — must explicitly detach it. `UpdateService` treats an
@@ -937,18 +987,12 @@ async fn apply_ecs(
 
         if let Some(cm) = &cloud_map {
             if !has_registries || registry_mismatch {
-                let mut registry =
-                    aws_sdk_ecs::types::ServiceRegistry::builder().registry_arn(&cm.registry_arn);
-                if let Some(ingress) = &m.spec.ingress {
-                    registry = registry
-                        .container_name(
-                            task_ingress_plan
-                                .as_ref()
-                                .map(TaskIngressPlan::external_container_name)
-                                .unwrap_or("openab"),
-                        )
-                        .container_port(ingress.container_port as i32);
-                }
+                let (container_name, container_port) = service_registry_target
+                    .expect("ingress Cloud Map must have a service registry target");
+                let registry = aws_sdk_ecs::types::ServiceRegistry::builder()
+                    .registry_arn(&cm.registry_arn)
+                    .container_name(container_name)
+                    .container_port(container_port);
                 update_req = update_req.service_registries(registry.build());
             }
         } else if needs_detach {
@@ -998,20 +1042,14 @@ async fn apply_ecs(
             .network_configuration(network_config);
 
         if let Some(cm) = &cloud_map {
-            let mut registry =
-                aws_sdk_ecs::types::ServiceRegistry::builder().registry_arn(&cm.registry_arn);
-            // SRV records require the container name + port so ECS registers the
-            // task's port alongside its IP.
-            if let Some(ingress) = &m.spec.ingress {
-                registry = registry
-                    .container_name(
-                        task_ingress_plan
-                            .as_ref()
-                            .map(TaskIngressPlan::external_container_name)
-                            .unwrap_or("openab"),
-                    )
-                    .container_port(ingress.container_port as i32);
-            }
+            let (container_name, container_port) = service_registry_target
+                .expect("ingress Cloud Map must have a service registry target");
+            // SRV records require the externally reachable container name +
+            // port so ECS registers the task's port alongside its IP.
+            let registry = aws_sdk_ecs::types::ServiceRegistry::builder()
+                .registry_arn(&cm.registry_arn)
+                .container_name(container_name)
+                .container_port(container_port);
             create_req = create_req.service_registries(registry.build());
         }
 
@@ -1077,7 +1115,8 @@ async fn apply_ecs(
     let mut webhook_urls = Vec::new();
     if let (Some(ingress), Some(cm)) = (&m.spec.ingress, &cloud_map) {
         eprintln!("  🌐 Reconciling ingress (VPC Link + API Gateway)...");
-        let gateway_controls = GatewayControlsPlan::from_manifest(m);
+        let gateway_controls =
+            GatewayControlsTransition::from_manifest(previously_had_guard, m);
         let gateway = crate::ingress::ensure_gateway(
             config,
             crate::ingress::GatewayApply {
@@ -1087,7 +1126,7 @@ async fn apply_ecs(
                 subnets: &ecs_rt.networking.subnets,
                 security_groups: &ecs_rt.networking.security_groups,
                 cloud_map_service_arn: &cm.registry_arn,
-                controls: gateway_controls.as_ref(),
+                controls: &gateway_controls,
             },
         )
         .await?;
@@ -1446,5 +1485,33 @@ spec:
         let bootstrap: Option<&str> = None;
         let result = resolve_task_role_arn(&manifest, bootstrap);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn service_registry_arn_match_does_not_hide_container_change() {
+        let existing = vec![ExistingServiceRegistry {
+            registry_arn: "arn:aws:servicediscovery:ap-east-1:123:service/srv-123".to_string(),
+            container_name: Some("openab".to_string()),
+            container_port: Some(8080),
+        }];
+
+        assert!(!service_registry_matches(
+            &existing,
+            "arn:aws:servicediscovery:ap-east-1:123:service/srv-123",
+            "task-ingress-guard",
+            8080,
+        ));
+        assert!(service_registry_matches(
+            &existing,
+            "arn:aws:servicediscovery:ap-east-1:123:service/srv-123",
+            "openab",
+            8080,
+        ));
+        assert!(!service_registry_matches(
+            &existing,
+            "arn:aws:servicediscovery:ap-east-1:123:service/srv-123",
+            "openab",
+            8081,
+        ));
     }
 }

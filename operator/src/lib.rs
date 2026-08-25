@@ -65,7 +65,7 @@ pub use apply::{
     apply_manifests, AppliedService, ApplyAction, ApplyError, ApplyErrorKind, ApplyOptions,
     ApplyReport, ServiceTarget,
 };
-pub use ingress_controls::GatewayControlsPlan;
+pub use ingress_controls::{GatewayControlsPlan, GatewayControlsTransition};
 pub use manifest::{
     AgentOverride, EcsNetworking, EcsRuntime, FleetMetadata, FleetSpec, FleetTemplate, Ingress,
     KubernetesRuntime, Metadata, OABFleetManifest, OABServiceManifest, RawManifest, Resources,

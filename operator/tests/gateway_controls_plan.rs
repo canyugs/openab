@@ -1,4 +1,31 @@
-use oabctl::{GatewayControlsPlan, OABServiceManifest};
+use oabctl::{GatewayControlsPlan, GatewayControlsTransition, OABServiceManifest};
+
+fn unguarded_manifest() -> OABServiceManifest {
+    serde_yaml::from_str(
+        r#"
+apiVersion: oab.dev/v2
+kind: OABService
+metadata:
+  name: line-pilot
+  namespace: prod
+spec:
+  image: public.ecr.aws/oab/openab@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  resources:
+    cpu: "256"
+    memory: "512"
+  configFrom: s3://bucket/config.toml
+  runtime:
+    type: ecs
+    capacityProvider: FARGATE_SPOT
+    networking:
+      subnets: ["subnet-a"]
+      securityGroups: ["sg-1"]
+  ingress:
+    paths: ["/webhook/line"]
+"#,
+    )
+    .expect("parse unguarded manifest")
+}
 
 #[test]
 fn guarded_line_manifest_plans_route_throttle_and_conservative_429_alarm() {
@@ -42,4 +69,28 @@ spec:
     assert_eq!(plan.resource, "/webhook/line");
     assert_eq!(plan.stage, "prod");
     assert_eq!(plan.alarm_threshold, 1.0);
+
+    assert_eq!(
+        GatewayControlsTransition::from_manifest(false, &manifest),
+        GatewayControlsTransition::Ensure(plan)
+    );
+}
+
+#[test]
+fn removing_guard_plans_route_control_and_alarm_cleanup() {
+    let transition = GatewayControlsTransition::from_manifest(true, &unguarded_manifest());
+
+    assert_eq!(
+        transition,
+        GatewayControlsTransition::Remove {
+            alarm_name: "oab-webhook-prod-line-pilot-line-4xx".to_string(),
+        }
+    );
+}
+
+#[test]
+fn manifest_that_never_had_guard_leaves_gateway_controls_unchanged() {
+    let transition = GatewayControlsTransition::from_manifest(false, &unguarded_manifest());
+
+    assert_eq!(transition, GatewayControlsTransition::Unchanged);
 }

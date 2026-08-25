@@ -278,7 +278,9 @@ For guarded LINE ingress, `apply` also reconciles the exact
 detailed metrics. It creates a one-minute CloudWatch alarm on any route-level
 `4xx`. HTTP APIs do not publish a distinct native `429` metric, so this is a
 conservative pilot-stop signal: every reported throttling `429` triggers it,
-and another client-side error on that exact route can trigger it too.
+and another client-side error on that exact route can trigger it too. Removing
+the guard clears these route settings and deletes the alarm; removing ingress
+or deleting the service also removes the alarm during ingress teardown.
 
 #### Minimal working manifest: Telegram on AWS
 
@@ -716,7 +718,7 @@ any manifest sets `spec.ingress`, the **caller of `oabctl apply`/`delete`**
 |---------|---------|
 | Cloud Map | `servicediscovery:CreatePrivateDnsNamespace`, `CreateService`, `DeleteService`, `ListNamespaces`, `ListServices`, `GetOperation` |
 | API Gateway | `apigateway:CreateVpcLink`, `CreateApi`, `CreateIntegration`, `CreateRoute`, `CreateStage`, `UpdateStage`, `DeleteRoute`, `DeleteIntegration`, `DeleteStage`, `DeleteApi`, `GetVpcLinks`, `GetVpcLink`, `GetApis`, `GetIntegrations`, `GetRoutes`, `GetStages` |
-| CloudWatch | `cloudwatch:PutMetricAlarm` for guarded LINE ingress |
+| CloudWatch | `cloudwatch:PutMetricAlarm`, `cloudwatch:DeleteAlarms` for guarded LINE ingress and its cleanup |
 | EC2 | `ec2:DescribeSubnets`, `AuthorizeSecurityGroupIngress` |
 | ECS | `ecs:UpdateService` with `serviceRegistries` (requires the `AWSServiceRoleForECS` service-linked role, which ECS creates automatically the first time any service in the account uses service discovery) |
 
