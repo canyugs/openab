@@ -382,6 +382,7 @@ Session pool settings for managing concurrent agent sessions.
 |-----|------|---------|-------------|
 | `max_sessions` | usize | `10` | Maximum number of concurrent agent sessions. When full, the oldest idle session is suspended (recoverable); if all sessions are busy, new requests are rejected. |
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
+| `preload_persisted_sessions` | bool | `false` | Restore every session from `.openab/thread_map.json` before the unified webhook listener publishes `/health`. Startup fails if the mapping is unreadable or corrupt, the persisted count exceeds `max_sessions`, or a session cannot be restored. No prompt or platform message is sent. |
 | `hung_grace_secs` | u64 | `120` | Grace period after `prompt_hard_timeout_secs` before a session stuck with its connection mutex held (in-flight prompt) is force-evicted from the pool. Eviction threshold: `prompt_hard_timeout_secs + hung_grace_secs`. |
 | `default_config_options` | map | `{}` | Config options to set automatically after session creation. Keys are config option IDs (e.g. `mode`, `model`), values are the desired values (e.g. `bypass`, `swe-1-6`). Sent via ACP `session/set_config_option` after each `session/new`. |
 
@@ -392,6 +393,14 @@ Session pool settings for managing concurrent agent sessions.
 max_sessions = 3
 session_ttl_hours = 1
 default_config_options = { mode = "bypass", model = "swe-1-6" }
+```
+
+For a restored runtime whose health must include Agent/session readiness:
+
+```toml
+[pool]
+max_sessions = 3
+preload_persisted_sessions = true
 ```
 
 ---

@@ -47,6 +47,10 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
+    /// Whether the persisted thread mapping was absent or loaded successfully.
+    /// Lazy session creation keeps the historical start-fresh behavior, while
+    /// operator-requested preload uses this bit to fail readiness closed.
+    persisted_mapping_valid: bool,
     /// Force-evict sessions stuck in-flight longer than this threshold
     /// (`prompt_hard_timeout_secs + hung_grace_secs`, wired in main.rs).
     hung_threshold_secs: u64,
@@ -58,6 +62,12 @@ pub struct SessionPool {
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumePolicy {
+    BestEffort,
+    Required,
+}
 
 fn remove_if_same_handle<T>(
     map: &mut HashMap<String, Arc<Mutex<T>>>,
@@ -175,10 +185,28 @@ impl SessionPool {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
             .join(".openab");
+        Self::new_with_openab_dir(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            openab_dir,
+        )
+    }
+
+    fn new_with_openab_dir(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        openab_dir: PathBuf,
+    ) -> Self {
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
         let meta_path = openab_dir.join("session_meta.json");
-        let suspended = Self::load_mapping(&mapping_path);
+        let persisted_mapping = Self::read_mapping(&mapping_path);
+        let persisted_mapping_valid = persisted_mapping.is_ok();
+        let suspended = Self::mapping_or_fresh(&mapping_path, persisted_mapping);
         let session_workdirs = Self::load_mapping(&meta_path);
         Self {
             state: RwLock::new(PoolState {
@@ -193,6 +221,7 @@ impl SessionPool {
             }),
             config,
             max_sessions,
+            persisted_mapping_valid,
             hung_threshold_secs,
             mapping_path,
             meta_path,
@@ -201,13 +230,27 @@ impl SessionPool {
     }
 
     fn load_mapping(path: &Path) -> HashMap<String, String> {
+        let result = Self::read_mapping(path);
+        Self::mapping_or_fresh(path, result)
+    }
+
+    fn read_mapping(path: &Path) -> Result<HashMap<String, String>> {
         match std::fs::read_to_string(path) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-                warn!(path = %path.display(), error = %e, "corrupt mapping file, starting fresh");
-                HashMap::new()
-            }),
-            Err(_) => HashMap::new(),
+            Ok(data) => serde_json::from_str(&data)
+                .map_err(|e| anyhow!("mapping file is not valid JSON: {e}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(e) => Err(anyhow!("mapping file could not be read: {e}")),
         }
+    }
+
+    fn mapping_or_fresh(
+        path: &Path,
+        result: Result<HashMap<String, String>>,
+    ) -> HashMap<String, String> {
+        result.unwrap_or_else(|e| {
+            warn!(path = %path.display(), error = %e, "failed to load mapping file, starting fresh");
+            HashMap::new()
+        })
     }
 
     fn save_mapping(&self, persisted: &HashMap<String, String>) {
@@ -259,10 +302,51 @@ impl SessionPool {
         false
     }
 
+    /// Restore every persisted ACP session into a live connection without
+    /// sending a prompt. Callers use successful completion as a readiness gate.
+    pub async fn preload_persisted_sessions(&self) -> Result<usize> {
+        if !self.persisted_mapping_valid {
+            return Err(anyhow!(
+                "cannot preload persisted sessions: thread mapping could not be loaded"
+            ));
+        }
+
+        let mut thread_ids = {
+            let state = self.state.read().await;
+            state.persisted.keys().cloned().collect::<Vec<_>>()
+        };
+        thread_ids.sort();
+
+        if thread_ids.len() > self.max_sessions {
+            return Err(anyhow!(
+                "cannot preload {} persisted sessions with pool max_sessions {}",
+                thread_ids.len(),
+                self.max_sessions
+            ));
+        }
+
+        for thread_id in &thread_ids {
+            self.get_or_create_inner(thread_id, None, ResumePolicy::Required)
+                .await?;
+        }
+
+        Ok(thread_ids.len())
+    }
+
     pub async fn get_or_create(
         &self,
         thread_id: &str,
         working_dir_override: Option<&str>,
+    ) -> Result<bool> {
+        self.get_or_create_inner(thread_id, working_dir_override, ResumePolicy::BestEffort)
+            .await
+    }
+
+    async fn get_or_create_inner(
+        &self,
+        thread_id: &str,
+        working_dir_override: Option<&str>,
+        resume_policy: ResumePolicy,
     ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
@@ -370,6 +454,9 @@ impl SessionPool {
                         resumed = true;
                     }
                     Err(e) => {
+                        if resume_policy == ResumePolicy::Required {
+                            return Err(anyhow!("persisted session preload failed: {e}"));
+                        }
                         let err_str = e.to_string();
                         let is_transient =
                             TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
@@ -387,6 +474,10 @@ impl SessionPool {
                         }
                     }
                 }
+            } else if resume_policy == ResumePolicy::Required {
+                return Err(anyhow!(
+                    "persisted session preload failed: agent does not support session/load"
+                ));
             }
         }
 
@@ -401,6 +492,11 @@ impl SessionPool {
         }
 
         if !resumed {
+            if resume_policy == ResumePolicy::Required {
+                return Err(anyhow!(
+                    "persisted session preload failed: no persisted session was restored"
+                ));
+            }
             new_conn.session_new(&effective_workdir).await?;
 
             // Apply default config options (e.g. mode=bypass, model=swe-1-6)
@@ -810,9 +906,10 @@ impl SessionPool {
 mod tests {
     use super::{
         better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        remove_if_same_handle, PoolState, SessionPool,
     };
     use crate::acp::connection::SessionActivity;
+    use crate::config::AgentConfig;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -996,6 +1093,181 @@ mod tests {
         assert_eq!(
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operator_can_preload_a_persisted_session_without_a_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join(".openab");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("thread_map.json"),
+            r#"{"line:test-user":"saved-session"}"#,
+        )
+        .unwrap();
+
+        let agent = temp.path().join("fake-acp-agent.sh");
+        std::fs::write(
+            &agent,
+            r#"#!/bin/sh
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"fixture"},"agentCapabilities":{"loadSession":true}}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"saved-session"}}'
+      ;;
+    *)
+      exit 64
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+
+        let pool = SessionPool::new_with_openab_dir(
+            AgentConfig {
+                command: "/bin/sh".to_string(),
+                args: vec![agent.display().to_string()],
+                working_dir: temp.path().display().to_string(),
+                command_explicit: true,
+                ..AgentConfig::default()
+            },
+            1,
+            120,
+            HashMap::new(),
+            state_dir,
+        );
+
+        let preloaded = pool.preload_persisted_sessions().await.unwrap();
+
+        assert_eq!(preloaded, 1);
+        pool.with_connection("line:test-user", |_| {
+            Box::pin(async { Ok::<(), anyhow::Error>(()) })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn preload_refuses_to_publish_partial_readiness_when_pool_is_too_small() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join(".openab");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("thread_map.json"),
+            r#"{"line:first":"session-1","line:second":"session-2"}"#,
+        )
+        .unwrap();
+
+        let pool = SessionPool::new_with_openab_dir(
+            AgentConfig {
+                command: "/agent-must-not-start".to_string(),
+                working_dir: temp.path().display().to_string(),
+                command_explicit: true,
+                ..AgentConfig::default()
+            },
+            1,
+            120,
+            HashMap::new(),
+            state_dir,
+        );
+
+        let error = pool.preload_persisted_sessions().await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "cannot preload 2 persisted sessions with pool max_sessions 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn preload_fails_closed_when_persisted_mapping_is_corrupt() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join(".openab");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("thread_map.json"), "{not-json").unwrap();
+
+        let pool = SessionPool::new_with_openab_dir(
+            AgentConfig {
+                command: "/agent-must-not-start".to_string(),
+                working_dir: temp.path().display().to_string(),
+                command_explicit: true,
+                ..AgentConfig::default()
+            },
+            1,
+            120,
+            HashMap::new(),
+            state_dir,
+        );
+
+        let error = pool.preload_persisted_sessions().await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "cannot preload persisted sessions: thread mapping could not be loaded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preload_fails_closed_when_the_persisted_session_cannot_be_restored() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join(".openab");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("thread_map.json"),
+            r#"{"line:test-user":"saved-session"}"#,
+        )
+        .unwrap();
+
+        let agent = temp.path().join("rejecting-acp-agent.sh");
+        std::fs::write(
+            &agent,
+            r#"#!/bin/sh
+while IFS= read -r request; do
+  case "$request" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"fixture"},"agentCapabilities":{"loadSession":true}}}'
+      ;;
+    *'"method":"session/load"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"fixture refused restore"}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"new-session"}}'
+      ;;
+    *)
+      exit 64
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+
+        let pool = SessionPool::new_with_openab_dir(
+            AgentConfig {
+                command: "/bin/sh".to_string(),
+                args: vec![agent.display().to_string()],
+                working_dir: temp.path().display().to_string(),
+                command_explicit: true,
+                ..AgentConfig::default()
+            },
+            1,
+            120,
+            HashMap::new(),
+            state_dir,
+        );
+
+        let error = pool.preload_persisted_sessions().await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "persisted session preload failed: JSON-RPC error -32000: fixture refused restore"
         );
     }
 }
