@@ -11,6 +11,7 @@ const CLUSTER_NAME: &str = "oab";
 const EXECUTION_ROLE: &str = "oab-task-execution";
 const TASK_ROLE: &str = "oab-task-role";
 const SG_NAME: &str = "oab-agents";
+const SG_DESCRIPTION: &str = "OAB agent containers - managed by oabctl bootstrap";
 const LOG_GROUP: &str = "/oab/agents";
 const STATE_KEY: &str = "bootstrap/state.json";
 
@@ -370,7 +371,7 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
             _ => {
                 let resp = ec2.create_security_group()
                     .group_name(SG_NAME)
-                    .description("OAB agent containers — managed by oabctl bootstrap")
+                    .description(SG_DESCRIPTION)
                     .vpc_id(&vid)
                     .send().await
                     .context("failed to create security group")?;
@@ -585,4 +586,17 @@ fn plan_line(resource: &str, name: &str, exists: bool, will_manage: bool) {
         "⊕ CREATE"
     };
     eprintln!("  {:<24} {} ({})", resource, action, name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SG_DESCRIPTION;
+
+    #[test]
+    fn security_group_description_is_ascii_for_ec2() {
+        assert!(
+            SG_DESCRIPTION.is_ascii(),
+            "EC2 rejects non-ASCII security group descriptions"
+        );
+    }
 }
