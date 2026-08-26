@@ -373,6 +373,13 @@ async fn main() -> anyhow::Result<()> {
             .saturating_add(cfg.pool.hung_grace_secs),
         cfg.pool.default_config_options,
     ));
+
+    if cfg.pool.preload_persisted_sessions {
+        info!("preloading persisted sessions before publishing readiness");
+        let preloaded = pool.preload_persisted_sessions().await?;
+        info!(preloaded, "persisted-session readiness gate complete");
+    }
+
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)

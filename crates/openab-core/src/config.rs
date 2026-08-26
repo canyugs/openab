@@ -1504,6 +1504,10 @@ pub struct PoolConfig {
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
     pub session_ttl_hours: u64,
+    /// Restore persisted ACP sessions before the unified webhook listener publishes health.
+    /// Disabled by default so existing deployments retain lazy session loading.
+    #[serde(default)]
+    pub preload_persisted_sessions: bool,
     /// Hard ceiling for a single prompt (#732). Once exceeded, the broker
     /// abandons the in-flight request, sends `session/cancel` to the agent,
     /// and clears the pending entry so late responses cannot leak into the
@@ -1756,6 +1760,7 @@ impl Default for PoolConfig {
         Self {
             max_sessions: default_max_sessions(),
             session_ttl_hours: default_ttl_hours(),
+            preload_persisted_sessions: false,
             prompt_hard_timeout_secs: default_prompt_hard_timeout_secs(),
             liveness_check_secs: default_liveness_check_secs(),
             hung_grace_secs: default_hung_grace_secs(),
@@ -3112,7 +3117,25 @@ command = "echo"
         assert_eq!(cfg.discord.unwrap().bot_token, "test-token");
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
+        assert!(!cfg.pool.preload_persisted_sessions);
         assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn persisted_session_preload_is_operator_opt_in() {
+        let cfg = parse_config(
+            r#"
+[discord]
+bot_token = "test-token"
+
+[pool]
+preload_persisted_sessions = true
+"#,
+            "test",
+        )
+        .unwrap();
+
+        assert!(cfg.pool.preload_persisted_sessions);
     }
 
     #[test]
