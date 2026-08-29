@@ -11,6 +11,9 @@ ARG CLAUDE_AGENT_SDK_VERSION=0.3.251
 COPY claude-latest-runtime/package.json claude-latest-runtime/package-lock.json \
      /opt/claude-latest-runtime/
 
+COPY --chmod=755 claude-latest-runtime/canary-entrypoint.sh \
+     /usr/local/bin/claude-latest-canary
+
 RUN cd /opt/claude-latest-runtime \
  && npm ci --omit=dev --ignore-scripts \
  && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" --retry 3 \
@@ -24,3 +27,5 @@ ENV PATH="/opt/claude-latest-runtime/node_modules/.bin:${PATH}"
 ENV CLAUDE_CODE_EXECUTABLE=/usr/local/bin/claude
 
 USER node
+
+CMD ["claude-latest-canary"]
